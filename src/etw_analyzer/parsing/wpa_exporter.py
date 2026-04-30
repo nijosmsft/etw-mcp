@@ -68,6 +68,7 @@ def _run_xperf(
     cmd.extend(["-a", action])
     if action_args:
         cmd.extend(action_args)
+
     env = os.environ.copy()
     if symbol_path:
         env["_NT_SYMBOL_PATH"] = symbol_path
