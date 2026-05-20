@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from etw_analyzer.app import mcp
-from etw_analyzer.trace_state import require_trace
+from etw_analyzer.trace_state import TraceData, require_trace
 from etw_analyzer.parsing.aggregator import apply_filters, group_and_sum
 from etw_analyzer.parsing.csv_loader import normalize_duration_column
 from etw_analyzer.formatting.markdown import format_table, format_pct
@@ -13,6 +13,7 @@ import pandas as pd
 
 
 def _get_cswitch_df(
+    trace: TraceData,
     start_time: float | None = None,
     end_time: float | None = None,
 ) -> pd.DataFrame:
@@ -22,42 +23,42 @@ def _get_cswitch_df(
     Falls back to running ``xperf -a readythread -stacks -symbols`` on-demand,
     caching the result for future calls.
     """
-    trace = require_trace()
-
     # Check for pre-loaded data
-    for key in ["readythread", "cswitch", "CSwitch", "CPU Usage (Precise)", "context_switch"]:
-        if key in trace.raw_csv:
-            df = trace.raw_csv[key]
-            # Skip raw-text wrapper DataFrames (single "raw_text" column)
-            if "raw_text" not in df.columns:
-                return df.copy()
+    with trace.lock:
+        for key in ["readythread", "cswitch", "CSwitch", "CPU Usage (Precise)", "context_switch"]:
+            if key in trace.raw_csv:
+                df = trace.raw_csv[key]
+                # Skip raw-text wrapper DataFrames (single "raw_text" column)
+                if "raw_text" not in df.columns:
+                    return df.copy()
 
-    # On-demand: run xperf -a readythread -stacks -symbols
-    from etw_analyzer.parsing.wpa_exporter import run_readythread
+        # On-demand: run xperf -a readythread -stacks -symbols
+        from etw_analyzer.parsing.wpa_exporter import run_readythread
 
-    df = run_readythread(
-        trace.etl_path,
-        symbol_path=trace.symbol_path,
-        start_time=start_time,
-        end_time=end_time,
-        timeout_seconds=300,
-    )
-    if df.empty:
-        raise ValueError(
-            "No ReadyThread data found. The trace was likely collected with "
-            "`wpr -start CPU` which only captures CPU sampling.\n\n"
-            "To capture context switch and ReadyThread data, use:\n"
-            "  wpr -start GeneralProfile    (includes CSwitch + ReadyThread)\n\n"
-            "ReadyThread stacks are needed for lock contention analysis."
+        df = run_readythread(
+            trace.etl_path,
+            symbol_path=trace.symbol_path,
+            start_time=start_time,
+            end_time=end_time,
+            timeout_seconds=300,
         )
+        if df.empty:
+            raise ValueError(
+                "No ReadyThread data found. The trace was likely collected with "
+                "`wpr -start CPU` which only captures CPU sampling.\n\n"
+                "To capture context switch and ReadyThread data, use:\n"
+                "  wpr -start GeneralProfile    (includes CSwitch + ReadyThread)\n\n"
+                "ReadyThread stacks are needed for lock contention analysis."
+            )
 
-    # Cache for future calls
-    trace.raw_csv["readythread"] = df
-    return df.copy()
+        # Cache for future calls
+        trace.raw_csv["readythread"] = df
+        return df.copy()
 
 
 @mcp.tool()
 def get_lock_contention(
+    trace_id: str,
     module_filter: str | None = None,
     function_filter: str | None = None,
     cpu_filter: str | None = None,
@@ -74,6 +75,7 @@ def get_lock_contention(
     Requires CpuCswitchSample WPR profile (includes ReadyThread stacks).
 
     Args:
+        trace_id: ID returned by load_trace.
         module_filter: Filter by module in the readying stack, e.g. 'xdp.sys'.
         function_filter: Filter by function in the readying stack.
         cpu_filter: CPU range filter, e.g. '18-39'.
@@ -81,7 +83,8 @@ def get_lock_contention(
         end_time: End of analysis window (seconds from trace start).
         max_rows: Maximum rows to return. Default: 30.
     """
-    df = _get_cswitch_df(start_time=start_time, end_time=end_time)
+    trace = require_trace(trace_id)
+    df = _get_cswitch_df(trace, start_time=start_time, end_time=end_time)
 
     # Find relevant columns
     cpu_col = _find_col(df, ["CPU", "Cpu", "New CPU"]) or "CPU"

@@ -17,6 +17,7 @@ from etw_analyzer.parsing.aggregator import group_and_sum
 
 @mcp.tool()
 def analyze(
+    trace_id: str,
     start_time: float | None = None,
     end_time: float | None = None,
 ) -> str:
@@ -27,10 +28,11 @@ def analyze(
     load_trace for a quick overview.
 
     Args:
+        trace_id: ID returned by load_trace.
         start_time: Start of analysis window (seconds from trace start).
         end_time: End of analysis window (seconds from trace start).
     """
-    trace = require_trace()
+    trace = require_trace(trace_id)
     sections: list[str] = []
 
     # 1. Trace overview
@@ -187,6 +189,7 @@ def analyze(
 
 @mcp.tool()
 def export_analysis(
+    trace_id: str,
     output_path: str,
     start_time: float | None = None,
     end_time: float | None = None,
@@ -198,14 +201,15 @@ def export_analysis(
     and symbol status.
 
     Args:
+        trace_id: ID returned by load_trace.
         output_path: Path for the output .md file (e.g. 'C:\\traces\\analysis.md').
         start_time: Start of analysis window (seconds from trace start).
         end_time: End of analysis window (seconds from trace start).
     """
-    trace = require_trace()
+    trace = require_trace(trace_id)
 
     # Generate the analysis
-    content = analyze(start_time=start_time, end_time=end_time)
+    content = analyze(trace_id=trace_id, start_time=start_time, end_time=end_time)
 
     # Add metadata header
     now = datetime.now().strftime("%Y-%m-%d %H:%M")

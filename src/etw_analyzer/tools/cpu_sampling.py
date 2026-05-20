@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 from etw_analyzer.app import mcp
-from etw_analyzer.trace_state import require_trace
+from etw_analyzer.trace_state import TraceData, require_trace
 from etw_analyzer.parsing.aggregator import apply_filters, group_and_sum, parse_cpu_filter
 from etw_analyzer.formatting.markdown import format_table, format_pct
+
+import re
 
 import pandas as pd
 
@@ -33,9 +35,8 @@ _KERNEL_MODULES = [
 _DEFAULT_HOT_MODULES = _XDP_MODULES + _NETWORKING_MODULES + _NIC_DRIVER_MODULES + _KERNEL_MODULES
 
 
-def _get_sampling_df() -> pd.DataFrame:
+def _get_sampling_df(trace: TraceData) -> pd.DataFrame:
     """Get the CPU sampling DataFrame, trying known profile names."""
-    trace = require_trace()
     for key in ["cpu_sampling", "CpuSampling", "CPU Usage (Sampled)"]:
         if key in trace.raw_csv:
             return trace.raw_csv[key].copy()
@@ -62,7 +63,74 @@ def _find_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
     return None
 
 
+def _cpu_denominator_info(
+    trace: TraceData,
+    cpu_filter: str | None,
+) -> tuple[int | None, int | None, float | None, float | None]:
+    timeline = trace.raw_csv.get("cpu_timeline")
+    if timeline is None or timeline.empty:
+        return None, None, None, trace.duration_seconds
+
+    cpu_cols: dict[int, str] = {}
+    for col in timeline.columns:
+        m = re.match(r"Cpu\s+(\d+)", str(col), re.IGNORECASE)
+        if m:
+            cpu_cols[int(m.group(1))] = col
+    if not cpu_cols:
+        return None, None, None, trace.duration_seconds
+
+    requested = set(parse_cpu_filter(cpu_filter) or cpu_cols.keys())
+    avg_utils = []
+    for cpu_id, col in cpu_cols.items():
+        if cpu_id not in requested:
+            continue
+        vals = pd.to_numeric(timeline[col], errors="coerce").dropna()
+        if vals.empty:
+            continue
+        avg = float(vals.mean())
+        if cpu_filter or avg >= 2.0:
+            avg_utils.append(avg)
+
+    active_lps = len(avg_utils)
+    active_avg = float(pd.Series(avg_utils).mean()) if avg_utils else None
+    return len(cpu_cols), active_lps, active_avg, trace.duration_seconds
+
+
+def _denominator_weight(
+    trace: TraceData,
+    base_weight: float,
+    denominator: str,
+    cpu_filter: str | None,
+    denominator_lps: int | None,
+    denominator_seconds: float | None,
+) -> tuple[float, str]:
+    denominator = (denominator or "trace").lower()
+    if denominator == "trace":
+        return base_weight, "% trace"
+
+    total_lps, active_lps, active_avg, duration = _cpu_denominator_info(trace, cpu_filter)
+    if denominator == "active_cpus":
+        if total_lps and active_lps:
+            return base_weight * active_lps / total_lps, "% active_cpus"
+        return base_weight, "% active_cpus"
+
+    if denominator == "active_busy":
+        if total_lps and active_lps and active_avg:
+            return base_weight * active_lps / total_lps * active_avg / 100.0, "% active_busy"
+        return base_weight, "% active_busy"
+
+    if denominator == "custom":
+        if not denominator_lps or not denominator_seconds:
+            raise ValueError("denominator='custom' requires denominator_lps and denominator_seconds.")
+        if total_lps and duration and duration > 0:
+            return base_weight * denominator_lps * denominator_seconds / (total_lps * duration), "% custom"
+        return base_weight, "% custom"
+
+    raise ValueError("denominator must be one of: trace, active_cpus, active_busy, custom")
+
+
 def _get_per_cpu_sampling_df(
+    trace: TraceData,
     cpu_filter: str,
     start_time: float | None = None,
     end_time: float | None = None,
@@ -74,29 +142,30 @@ def _get_per_cpu_sampling_df(
     in-memory. If background extraction hasn't started, falls back to
     synchronous extraction.
     """
-    trace = require_trace()
-
     # Wait for background extraction (started by load_trace)
     # If already done or parquet was loaded, this returns immediately.
     dumper_df = trace.wait_for_dumper()
 
     # Fallback: if background extraction didn't run (e.g. old trace state)
     if dumper_df is None:
-        from etw_analyzer.parsing.wpa_exporter import parse_sampled_profile_events
+        with trace.lock:
+            dumper_df = trace.dumper_df
+            if dumper_df is None:
+                from etw_analyzer.parsing.wpa_exporter import parse_sampled_profile_events
 
-        trace.dumper_df = parse_sampled_profile_events(
-            etl_path=trace.etl_path,
-            symbol_path=trace.symbol_path,
-            cpu_filter=None,
-            start_time=None,
-            end_time=None,
-            timeout_seconds=300,
-        )
-        dumper_df = trace.dumper_df
+                trace.dumper_df = parse_sampled_profile_events(
+                    etl_path=trace.etl_path,
+                    symbol_path=trace.symbol_path,
+                    cpu_filter=None,
+                    start_time=None,
+                    end_time=None,
+                    timeout_seconds=300,
+                )
+                dumper_df = trace.dumper_df
 
-        if not dumper_df.empty:
-            trace.export_dir.mkdir(parents=True, exist_ok=True)
-            dumper_df.to_parquet(trace.export_dir / "sampled_profile.parquet", index=False)
+                if dumper_df is not None and not dumper_df.empty:
+                    trace.export_dir.mkdir(parents=True, exist_ok=True)
+                    dumper_df.to_parquet(trace.export_dir / "sampled_profile.parquet", index=False)
 
     if dumper_df is None or dumper_df.empty:
         return pd.DataFrame()
@@ -117,6 +186,7 @@ def _get_per_cpu_sampling_df(
 
 @mcp.tool()
 def get_cpu_samples(
+    trace_id: str,
     group_by: str = "module",
     cpu_filter: str | None = None,
     module_filter: str | None = None,
@@ -138,6 +208,7 @@ def get_cpu_samples(
     sample counts per CPU — useful for finding which CPUs run a specific process.
 
     Args:
+        trace_id: ID returned by load_trace.
         group_by: Grouping level — 'process', 'module', 'function', 'process+module', or 'cpu'. Default: 'module'.
         cpu_filter: CPU range filter, e.g. '0' or '18-39'. Enables per-CPU extraction.
         module_filter: Filter to specific module (substring match), e.g. 'xdp.sys'.
@@ -147,9 +218,11 @@ def get_cpu_samples(
         end_time: End of analysis window in seconds from trace start.
         max_rows: Maximum rows to return. Default: 50.
     """
+    trace = require_trace(trace_id)
+
     # When cpu_filter is specified, use per-CPU extraction from raw dumper events
     if cpu_filter:
-        df = _get_per_cpu_sampling_df(cpu_filter, start_time, end_time)
+        df = _get_per_cpu_sampling_df(trace, cpu_filter, start_time, end_time)
         if df.empty:
             return f"*No SampledProfile events found for CPUs {cpu_filter}. Ensure trace has CPU sampling data.*"
 
@@ -164,7 +237,7 @@ def get_cpu_samples(
             function_filter=function_filter, function_col=function_col,
         )
     else:
-        df = _get_sampling_df()
+        df = _get_sampling_df(trace)
 
         # Identify columns by trying common WPA export names
         weight_col = _find_col(df, ["Weight", "Count", "Sample Count", "Samples"]) or "Weight"
@@ -227,11 +300,15 @@ def get_cpu_samples(
 
 @mcp.tool()
 def get_hot_functions(
+    trace_id: str,
     modules: str | None = None,
     cpu_filter: str | None = None,
     start_time: float | None = None,
     end_time: float | None = None,
     max_rows: int = 30,
+    denominator: str = "trace",
+    denominator_lps: int | None = None,
+    denominator_seconds: float | None = None,
 ) -> str:
     """Get hot functions filtered to specific modules.
 
@@ -245,20 +322,26 @@ def get_hot_functions(
     analysis (clone cost, spinlock contention, DPC drain overhead).
 
     Args:
+        trace_id: ID returned by load_trace.
         modules: Comma-separated module names to include, e.g. 'tcpip.sys,ndis.sys,http.sys'.
                  Use 'all' to skip module filtering. Default: networking stack modules.
         cpu_filter: CPU range filter, e.g. '0' or '18-39'. Enables per-CPU extraction.
         start_time: Start of analysis window (seconds from trace start).
         end_time: End of analysis window (seconds from trace start).
         max_rows: Maximum rows to return. Default: 30.
+        denominator: Percentage denominator: 'trace', 'active_cpus', 'active_busy', or 'custom'.
+        denominator_lps: Logical processor count for denominator='custom'.
+        denominator_seconds: Duration for denominator='custom'.
     """
+    trace = require_trace(trace_id)
+
     if cpu_filter:
-        df = _get_per_cpu_sampling_df(cpu_filter, start_time, end_time)
+        df = _get_per_cpu_sampling_df(trace, cpu_filter, start_time, end_time)
         if df.empty:
             return f"*No SampledProfile events found for CPUs {cpu_filter}.*"
         weight_col, module_col, function_col = "Weight", "Module", "Function"
     else:
-        df = _get_sampling_df()
+        df = _get_sampling_df(trace)
         weight_col = _find_col(df, ["Weight", "Count", "Sample Count"]) or "Weight"
         module_col = _find_col(df, ["Module", "Image"]) or "Module"
         function_col = _find_col(df, ["Function", "Function Name", "Symbol"]) or "Function"
@@ -302,7 +385,10 @@ def get_hot_functions(
 
     # Compute % relative to ALL samples (not just filtered modules)
     total_all = df[weight_col].sum() if weight_col in df.columns else 1
-    result["% of Total"] = (result[weight_col] / total_all * 100).apply(format_pct)
+    denominator_weight, pct_label = _denominator_weight(
+        trace, float(total_all), denominator, cpu_filter, denominator_lps, denominator_seconds
+    )
+    result[pct_label] = (result[weight_col] / denominator_weight * 100).apply(format_pct)
 
     # Run CPUMAP-specific analysis only when XDP modules are present
     analysis_lines: list[str] = []
@@ -322,6 +408,7 @@ def get_hot_functions(
     filters_desc = _describe_filters(cpu_filter, None, None, start_time, end_time)
     if filters_desc:
         header += f"\n{filters_desc}"
+    header += f"\nDenominator ({denominator}): {denominator_weight:,.0f}"
 
     output = f"{header}\n\n{format_table(result, max_rows=max_rows)}"
 

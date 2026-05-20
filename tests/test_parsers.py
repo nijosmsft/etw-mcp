@@ -181,6 +181,26 @@ class TestParseStackButterfly:
         weights = df["Inclusive"].tolist()
         assert weights == sorted(weights, reverse=True)
 
+    def test_real_butterfly_inclusive_exclusive_columns(self):
+        html = """\
+<html><body>
+<h2>Functions by UniInclusive Hits</h2>
+<table id='TblSI'>
+<tr class='ff'><td>tcpip.sys!IppResolveNeighbor</td><td>3,631</td><td>2.14%</td><td>279</td><td>0</td><td>0</td><td>0</td></tr>
+<tr class='ff'><td>ntoskrnl.exe!KeAcquireInStackQueuedSpinLock</td><td>3,633</td><td>2.14%</td><td>0</td><td>0</td><td>0</td><td>0</td></tr>
+</table>
+<h2>Functions by Exclusive Hits</h2>
+<table id='TblSE'>
+<tr class='ff'><td>tcpip.sys!IppResolveNeighbor</td><td>279</td><td>0.16%</td><td>3,631</td><td>0</td><td>0</td><td>0</td></tr>
+</table>
+</body></html>
+"""
+        df = _parse_stack_butterfly_html(html)
+        row = df[df["Function"] == "IppResolveNeighbor"].iloc[0]
+        assert row["Inclusive"] == 3631
+        assert row["Exclusive"] == 279
+        assert row["Total %"] == pytest.approx(2.14)
+
     def test_empty_html(self):
         df = _parse_stack_butterfly_html("")
         assert df.empty
@@ -227,6 +247,24 @@ class TestParseStackButterflyCallers:
             (df["Direction"] == "caller")
         ]
         assert len(first_callers) >= 1
+
+    def test_real_butterfly_parent_percent_and_self_rows(self):
+        html = """\
+<html><body>
+<h2>Functions by Multi-Inclusive Hits with Callers and Callees</h2>
+<table id='TblSN'>
+<tr class='ff'><td>ntoskrnl.exe!KeAcquireInStackQueuedSpinLock</td><td>3,633</td><td>2.14%</td><td>2.14%</td><td>0</td><td>0</td><td>0</td><td>0</td></tr>
+<tr class='ff'><td>***itself***</td><td>3,633</td><td>2.14%</td><td>100.00%</td><td>0</td><td>0</td><td>0</td><td>0</td></tr>
+<tr class='ff'><td>&lt;-- tcpip.sys!IppResolveNeighbor</td><td>2,722</td><td>1.60%</td><td>74.93%</td><td>279</td><td>0</td><td>0</td><td>0</td></tr>
+</table>
+</body></html>
+"""
+        df = parse_stack_butterfly_callers(html)
+        caller = df[df["Direction"] == "caller"].iloc[0]
+        assert caller["Weight"] == 2722
+        assert caller["Parent %"] == pytest.approx(74.93)
+        assert caller["Exclusive"] == 279
+        assert not df[df["Direction"] == "self"].empty
 
     def test_empty_html(self):
         df = parse_stack_butterfly_callers("")

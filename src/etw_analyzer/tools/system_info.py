@@ -9,14 +9,17 @@ from etw_analyzer.trace_state import require_trace
 
 
 @mcp.tool()
-def get_sysconfig() -> str:
+def get_sysconfig(trace_id: str) -> str:
     """Show system configuration embedded in the trace.
 
     Extracts CPU model, core count, memory size, NIC details, and disk
     configuration from the trace metadata. Essential context for any
     performance analysis.
+
+    Args:
+        trace_id: ID returned by load_trace.
     """
-    trace = require_trace()
+    trace = require_trace(trace_id)
     raw = trace.raw_csv.get("sysconfig")
     if raw is None or "raw_text" not in raw.columns:
         return (
@@ -55,6 +58,7 @@ def get_sysconfig() -> str:
 
 @mcp.tool()
 def get_process_info(
+    trace_id: str,
     process_filter: str | None = None,
 ) -> str:
     """Show processes, threads, and loaded images from the trace.
@@ -63,9 +67,10 @@ def get_process_info(
     and loaded module versions. Use to verify test configuration.
 
     Args:
+        trace_id: ID returned by load_trace.
         process_filter: Filter by process name (substring match).
     """
-    trace = require_trace()
+    trace = require_trace(trace_id)
     raw = trace.raw_csv.get("process_info")
     if raw is None or "raw_text" not in raw.columns:
         return (
@@ -103,13 +108,16 @@ def get_process_info(
 
 
 @mcp.tool()
-def get_diskio_summary() -> str:
+def get_diskio_summary(trace_id: str) -> str:
     """Show disk I/O summary from the trace.
 
     Shows per-file I/O counts, bytes, and latency. Use to rule out
     storage as a performance bottleneck.
+
+    Args:
+        trace_id: ID returned by load_trace.
     """
-    trace = require_trace()
+    trace = require_trace(trace_id)
     raw = trace.raw_csv.get("diskio")
     if raw is None or "raw_text" not in raw.columns:
         return (
@@ -133,14 +141,17 @@ def get_diskio_summary() -> str:
 
 
 @mcp.tool()
-def get_trace_stats() -> str:
+def get_trace_stats(trace_id: str) -> str:
     """Show trace statistics — which providers and events are in the trace.
 
     Use this to diagnose missing data: if DPC/ISR analysis fails, check
     whether DPC events were actually recorded. Shows event counts per
     provider and storage details.
+
+    Args:
+        trace_id: ID returned by load_trace.
     """
-    trace = require_trace()
+    trace = require_trace(trace_id)
     raw = trace.raw_csv.get("tracestats")
     if raw is None or "raw_text" not in raw.columns:
         return "*No trace statistics available.*"

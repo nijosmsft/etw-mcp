@@ -3,44 +3,42 @@
 from __future__ import annotations
 
 from etw_analyzer.app import mcp
-from etw_analyzer.trace_state import require_trace
+from etw_analyzer.trace_state import TraceData, require_trace
 from etw_analyzer.formatting.markdown import format_table, format_pct
 
 import pandas as pd
 
 
-def _get_pool_df() -> pd.DataFrame:
+def _get_pool_df(trace: TraceData) -> pd.DataFrame:
     """Get the pool allocation DataFrame, extracting on-demand if needed."""
     import os
     from etw_analyzer.parsing.wpa_exporter import _run_xperf, _parse_pool
-    from etw_analyzer.parsing.csv_loader import load_csv
 
-    trace = require_trace()
+    with trace.lock:
+        # Return cached data if already extracted
+        for key in ["pool", "Pool"]:
+            if key in trace.raw_csv:
+                df = trace.raw_csv[key]
+                if not df.empty and "Tag" in df.columns:
+                    return df.copy()
 
-    # Return cached data if already extracted
-    for key in ["pool", "Pool"]:
-        if key in trace.raw_csv:
-            df = trace.raw_csv[key]
-            if not df.empty and "Tag" in df.columns:
+        # Extract on-demand from the trace
+        sym_path = trace.symbol_path or os.environ.get("_NT_SYMBOL_PATH", "")
+        try:
+            text = _run_xperf(
+                trace.etl_path, "pool",
+                ["-pooltags", "-images", "so", "-top", "500"],
+                symbol_path=sym_path or None,
+                symbols=True,
+                timeout_seconds=300,
+            )
+            df = _parse_pool(text)
+            if not df.empty:
+                # Cache for future calls
+                trace.raw_csv["pool"] = df
                 return df.copy()
-
-    # Extract on-demand from the trace
-    sym_path = trace.symbol_path or os.environ.get("_NT_SYMBOL_PATH", "")
-    try:
-        text = _run_xperf(
-            trace.etl_path, "pool",
-            ["-pooltags", "-images", "so", "-top", "500"],
-            symbol_path=sym_path or None,
-            symbols=True,
-            timeout_seconds=300,
-        )
-        df = _parse_pool(text)
-        if not df.empty:
-            # Cache for future calls
-            trace.raw_csv["pool"] = df
-            return df.copy()
-    except Exception:
-        pass
+        except Exception:
+            pass
 
     raise ValueError(
         "No pool allocation data available. The trace must be collected with "
@@ -54,6 +52,7 @@ def _get_pool_df() -> pd.DataFrame:
 
 @mcp.tool()
 def get_memory_pools(
+    trace_id: str,
     tag_filter: str | None = None,
     module_filter: str | None = None,
     pool_type: str | None = None,
@@ -67,6 +66,7 @@ def get_memory_pools(
     outstanding, and the pool tags used.
 
     Args:
+        trace_id: ID returned by load_trace.
         tag_filter: Filter by pool tag substring (e.g. 'Ndis', 'Xdp', 'Mdl', 'NBL').
         module_filter: Filter by module name (e.g. 'ndis.sys', 'xdp.sys').
         pool_type: Filter by pool type: 'paged', 'nonpaged', 'nx'. Default: all.
@@ -74,7 +74,8 @@ def get_memory_pools(
                  or 'total' (total allocated KB). Default: 'bytes'.
         max_rows: Maximum rows to return. Default: 50.
     """
-    df = _get_pool_df()
+    trace = require_trace(trace_id)
+    df = _get_pool_df(trace)
 
     # Apply filters
     if tag_filter:

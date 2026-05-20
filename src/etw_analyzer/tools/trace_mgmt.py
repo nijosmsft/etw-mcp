@@ -1,4 +1,4 @@
-"""Trace management tools: list_traces, load_trace, trace_info."""
+"""Trace management tools: list_traces, load_trace, trace_info, loaded trace registry."""
 
 from __future__ import annotations
 
@@ -7,8 +7,16 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from etw_analyzer.app import mcp
-from etw_analyzer.trace_state import TraceData, get_trace, set_trace, require_trace
+from etw_analyzer.trace_state import (
+    TraceData,
+    list_loaded_traces as get_loaded_traces,
+    make_trace_id,
+    register_trace,
+    require_trace,
+    unregister_trace,
+)
 from etw_analyzer.parsing.wpa_exporter import (
+    _parse_stack_butterfly_html,
     export_all_profiles,
     find_xperf,
     parse_stack_butterfly_callers,
@@ -102,14 +110,18 @@ def load_trace(
     # Check if we can skip re-export (cached parquet/csv files exist and are newer than ETL)
     cached = _load_from_cache(export_dir, path)
     if cached is not None:
+        errors: list[str] = []
+        _refresh_stack_cache_from_html(export_dir, cached, errors)
         trace = TraceData(
+            trace_id=make_trace_id(path),
             etl_path=path,
             export_dir=export_dir,
             symbol_path=sym_path,
             raw_csv=cached,
+            export_errors=errors,
         )
         _populate_metadata(trace)
-        set_trace(trace)
+        register_trace(trace)
         _start_background_dumper(trace)
         summary = _format_load_summary(trace)
         return summary.replace("**Trace loaded:**", "**Trace loaded (from cache):**")
@@ -145,21 +157,10 @@ def load_trace(
         except Exception as e:
             errors.append(f"{profile_name}: {e}")
 
-    # If stacks_callers wasn't exported (old export), parse from cached HTML
-    if "stacks_callers" not in results:
-        butterfly_html = export_dir / "stack-butterfly.html"
-        if butterfly_html.exists():
-            try:
-                callers_df = parse_stack_butterfly_callers(
-                    butterfly_html.read_text(encoding="utf-8")
-                )
-                if not callers_df.empty:
-                    callers_df.to_parquet(export_dir / "stacks_callers.parquet", index=False)
-                    results["stacks_callers"] = callers_df
-            except Exception as e:
-                errors.append(f"stacks_callers: {e}")
+    _refresh_stack_cache_from_html(export_dir, results, errors)
 
     trace = TraceData(
+        trace_id=make_trace_id(path),
         etl_path=path,
         export_dir=export_dir,
         symbol_path=sym_path,
@@ -168,10 +169,43 @@ def load_trace(
     )
 
     _populate_metadata(trace)
-    set_trace(trace)
+    register_trace(trace)
     _start_background_dumper(trace)
 
     return _format_load_summary(trace)
+
+
+def _refresh_stack_cache_from_html(
+    export_dir: Path,
+    results: dict[str, pd.DataFrame],
+    errors: list[str],
+) -> None:
+    """Refresh stack parquet data from the richer xperf butterfly HTML."""
+    butterfly_html = export_dir / "stack-butterfly.html"
+    if not butterfly_html.exists():
+        return
+
+    try:
+        html_text = butterfly_html.read_text(encoding="utf-8")
+    except Exception as e:
+        errors.append(f"stack-butterfly.html: {e}")
+        return
+
+    try:
+        stacks_df = _parse_stack_butterfly_html(html_text)
+        if not stacks_df.empty:
+            stacks_df.to_parquet(export_dir / "stacks.parquet", index=False)
+            results["stacks"] = stacks_df
+    except Exception as e:
+        errors.append(f"stacks: {e}")
+
+    try:
+        callers_df = parse_stack_butterfly_callers(html_text)
+        if not callers_df.empty:
+            callers_df.to_parquet(export_dir / "stacks_callers.parquet", index=False)
+            results["stacks_callers"] = callers_df
+    except Exception as e:
+        errors.append(f"stacks_callers: {e}")
 
 
 def _start_background_dumper(trace: TraceData) -> None:
@@ -186,14 +220,18 @@ def _start_background_dumper(trace: TraceData) -> None:
 
     parquet_path = trace.export_dir / "sampled_profile.parquet"
 
-    # If parquet cache exists, load it directly (fast)
-    if parquet_path.exists():
-        try:
-            trace.dumper_df = pd.read_parquet(parquet_path)
-            trace._dumper_ready.set()
+    with trace.lock:
+        if trace.dumper_df is not None or trace._dumper_future is not None:
             return
-        except Exception:
-            pass  # Fall through to background extraction
+
+        # If parquet cache exists, load it directly (fast)
+        if parquet_path.exists():
+            try:
+                trace.dumper_df = pd.read_parquet(parquet_path)
+                trace._dumper_ready.set()
+                return
+            except Exception:
+                pass  # Fall through to background extraction
 
     def _extract():
         try:
@@ -206,18 +244,23 @@ def _start_background_dumper(trace: TraceData) -> None:
                 end_time=None,
                 timeout_seconds=300,
             )
-            trace.dumper_df = df
-            if not df.empty:
-                trace.export_dir.mkdir(parents=True, exist_ok=True)
-                df.to_parquet(parquet_path, index=False)
+            with trace.lock:
+                trace.dumper_df = df
+                if not df.empty:
+                    trace.export_dir.mkdir(parents=True, exist_ok=True)
+                    df.to_parquet(parquet_path, index=False)
         except Exception as e:
-            trace._dumper_error = str(e)
+            with trace.lock:
+                trace._dumper_error = str(e)
         finally:
             trace._dumper_ready.set()
 
     thread = threading.Thread(target=_extract, daemon=True, name="dumper-extract")
-    trace._dumper_future = thread
-    thread.start()
+    with trace.lock:
+        if trace.dumper_df is not None or trace._dumper_future is not None:
+            return
+        trace._dumper_future = thread
+        thread.start()
 
 
 def _load_file(file_path: Path) -> pd.DataFrame:
@@ -326,6 +369,7 @@ def _format_load_summary(trace: TraceData) -> str:
     """Format a summary of the loaded trace."""
     lines = [
         f"**Trace loaded:** `{trace.etl_path.name}`",
+        f"**Trace ID:** `{trace.trace_id}`",
         "",
     ]
 
@@ -351,26 +395,64 @@ def _format_load_summary(trace: TraceData) -> str:
             lines.append(f"- {err}")
 
     lines.append("")
-    lines.append("Ready for analysis. Try: `get_cpu_samples`, `get_hot_functions`, `get_dpc_summary`")
+    lines.append(
+        f"Ready for analysis. Pass `trace_id=\"{trace.trace_id}\"` to analysis tools "
+        "such as `get_cpu_samples`, `get_hot_functions`, and `get_dpc_summary`."
+    )
 
     return "\n".join(lines)
 
 
 @mcp.tool()
-def trace_info() -> str:
-    """Show metadata about the currently loaded trace.
+def trace_info(trace_id: str) -> str:
+    """Show metadata about a loaded trace.
 
     Returns duration, CPU count, event counts, symbol status, and available datasets.
+
+    Args:
+        trace_id: ID returned by load_trace.
     """
-    trace = require_trace()
+    trace = require_trace(trace_id)
     return _format_load_summary(trace)
 
 
 @mcp.tool()
-def check_symbols(etl_path: str | None = None) -> str:
-    """Check symbol resolution status for a trace.
+def list_loaded_traces() -> str:
+    """Show traces currently loaded in this MCP server process."""
+    traces = get_loaded_traces()
+    if not traces:
+        return "*No traces loaded. Call `load_trace` first.*"
 
-    Loads the trace automatically if not already loaded.
+    rows = []
+    for trace in traces:
+        rows.append({
+            "Trace ID": trace.trace_id,
+            "Name": trace.etl_path.name,
+            "Path": str(trace.etl_path),
+            "Datasets": len(trace.raw_csv),
+            "CPUs": trace.cpu_count if trace.cpu_count is not None else "",
+            "Duration (s)": f"{trace.duration_seconds:.1f}" if trace.duration_seconds is not None else "",
+        })
+
+    return f"**Loaded Traces** ({len(rows)})\n\n{format_table(pd.DataFrame(rows))}"
+
+
+@mcp.tool()
+def unload_trace(trace_id: str) -> str:
+    """Remove a loaded trace from memory.
+
+    Args:
+        trace_id: ID returned by load_trace.
+    """
+    trace = require_trace(trace_id)
+    if unregister_trace(trace_id):
+        return f"Unloaded trace `{trace.trace_id}` (`{trace.etl_path.name}`)"
+    return f"Trace `{trace_id}` was not loaded."
+
+
+@mcp.tool()
+def check_symbols(trace_id: str) -> str:
+    """Check symbol resolution status for a trace.
 
     Reports:
     - Each path in _NT_SYMBOL_PATH: exists/accessible, contains PDBs
@@ -379,14 +461,9 @@ def check_symbols(etl_path: str | None = None) -> str:
     - Recommendations for fixing symbol issues
 
     Args:
-        etl_path: Path to .etl file. If omitted, uses the currently loaded trace.
+        trace_id: ID returned by load_trace.
     """
-    if etl_path:
-        result = load_trace(etl_path)
-        if "File not found" in result or "not found" in result.lower():
-            return result
-
-    trace = require_trace()
+    trace = require_trace(trace_id)
     lines: list[str] = ["**Symbol Resolution Check**", ""]
 
     # 1. Symbol path analysis
@@ -499,7 +576,7 @@ def check_symbols(etl_path: str | None = None) -> str:
 
 
 @mcp.tool()
-def resolve_symbols(etl_path: str | None = None, modules: str | None = None) -> str:
+def resolve_symbols(trace_id: str, modules: str | None = None) -> str:
     """Build symbol cache for a trace using xperf.
 
     Runs xperf -a symcache -build which uses dbghelp.dll to download PDBs
@@ -507,33 +584,30 @@ def resolve_symbols(etl_path: str | None = None, modules: str | None = None) -> 
     IDs for any modules that fail to resolve.
 
     Args:
-        etl_path: Path to .etl file. If omitted, uses the currently loaded trace.
+        trace_id: ID returned by load_trace.
         modules: Comma-separated module names to focus on (e.g. 'ntoskrnl.exe,ndis.sys').
                  Default: all modules in the trace.
     """
     try:
-        return _resolve_symbols_impl(etl_path, modules)
+        return _resolve_symbols_impl(trace_id, modules)
     except Exception as e:
         return f"Symbol resolution failed: {e}"
 
 
-def _resolve_symbols_impl(etl_path: str | None, modules: str | None) -> str:
+def _resolve_symbols_impl(trace_id: str, modules: str | None) -> str:
     import re
     from etw_analyzer.parsing.wpa_exporter import find_xperf, _run_xperf
 
-    # Resolve trace path
-    if etl_path:
-        path = Path(etl_path).resolve()
-    else:
-        trace = require_trace()
-        path = trace.etl_path
+    trace = require_trace(trace_id)
+    path = trace.etl_path
 
     if not path.exists():
         return f"File not found: {path}"
 
-    sym_path = os.environ.get("_NT_SYMBOL_PATH", "")
+    sym_path = trace.symbol_path or os.environ.get("_NT_SYMBOL_PATH", "")
     lines = ["**Symbol Resolver**", ""]
     lines.append(f"Trace: `{path.name}`")
+    lines.append(f"Trace ID: `{trace.trace_id}`")
     lines.append(f"Symbol path: `{sym_path[:120]}{'...' if len(sym_path) > 120 else ''}`")
     lines.append("")
 
@@ -613,7 +687,7 @@ def _resolve_symbols_impl(etl_path: str | None, modules: str | None) -> str:
         export_dir = path.parent / f".etw-export-{path.stem}"
         if export_dir.exists():
             shutil.rmtree(export_dir)
-        reload_result = load_trace(str(path))
+        reload_result = load_trace(str(path), symbol_path=trace.symbol_path)
         lines.append(reload_result)
     except Exception as e:
         lines.append(f"Re-load failed: {e}")

@@ -28,7 +28,7 @@ Install the WPR trace analyzer MCP server on this Windows machine:
 - **DPC/ISR analysis** — duration histograms, per-CPU distribution, watchdog risk detection
 - **Lock contention** — spinlock contention from ReadyThread/context switch stacks
 - **Symbol resolution** — automatic PDB download from symbol servers
-- **Call stacks** — butterfly stacks with caller/callee relationships
+- **Call stacks** — butterfly stacks with caller/callee relationships, recursive stack walks, and WPA-style chain exports
 - **System info** — CPU model, NIC details, memory, disk config from trace metadata
 - **Process info** — running processes, command lines, loaded driver versions
 - **Disk I/O** — per-file I/O summary to rule out storage bottlenecks
@@ -105,11 +105,14 @@ You don't need to know tool names. Just describe what you want:
 
 ```
 "Load the trace at C:\traces\mytrace.etl"
+"Use the returned trace_id for the next questions"
 "Give me a summary of this trace"
 "Where is CPU time being spent?"
 "What's running on CPU 0?"
 "Which CPUs have echo_server active?"
 "Show me the hottest functions in tcpip.sys"
+"Walk the caller chain for KeAcquireInStackQueuedSpinLock"
+"Count stacks containing KxWaitForSpinLockAndAcquire and IppResolveNeighbor"
 "What are the DPC durations for the NIC driver?"
 "Which CPUs are active and which are idle?"
 "Is there lock contention in the networking stack?"
@@ -122,11 +125,13 @@ You don't need to know tool names. Just describe what you want:
 ### Workflow
 
 ```
-load_trace(path)     → Parse ETL via xperf, cache as parquet (30-180s first time, instant after)
-analyze()            → One-call comprehensive report
-detailed tools       → Drill into specific areas
-export_analysis()    → Save to .md for sharing
+load_trace(path)          → Parse ETL via xperf, cache as parquet, return trace_id
+analyze(trace_id)         → One-call comprehensive report
+detailed tools(trace_id)  → Drill into specific areas
+export_analysis(trace_id) → Save to .md for sharing
 ```
+
+Every analysis tool requires the `trace_id` returned by `load_trace`. This allows multiple traces to be analyzed concurrently in the same MCP server process without cross-trace contamination.
 
 ### Available Tools
 
@@ -136,9 +141,11 @@ export_analysis()    → Save to .md for sharing
 |------|---------|
 | `list_traces` | Find `.etl` files in a directory |
 | `load_trace` | Load an ETL file. Runs xperf in parallel, caches as parquet. Set `force=True` to re-export. |
-| `trace_info` | Show loaded trace metadata |
-| `check_symbols` | Check symbol resolution status, identify missing PDBs |
-| `resolve_symbols` | Download PDBs from symbol servers and reload trace |
+| `list_loaded_traces` | Show trace IDs currently loaded in memory |
+| `unload_trace` | Remove a loaded trace from memory |
+| `trace_info` | Show loaded trace metadata by `trace_id` |
+| `check_symbols` | Check symbol resolution status by `trace_id`, identify missing PDBs |
+| `resolve_symbols` | Download PDBs from symbol servers and reload trace by `trace_id` |
 
 #### Analysis
 
@@ -146,11 +153,14 @@ export_analysis()    → Save to .md for sharing
 |------|---------|
 | `analyze` | One-call comprehensive report: sysconfig, per-CPU, hot functions, symbols, DPC health |
 | `get_cpu_samples` | CPU sampling grouped by process, module, function, or CPU. Per-CPU filtering supported. |
-| `get_hot_functions` | Hot functions filtered to networking modules (customizable). Per-CPU filtering supported. |
+| `get_hot_functions` | Hot functions filtered to networking modules (customizable). Per-CPU filtering and denominator modes supported. |
 | `get_per_cpu_summary` | Per-CPU utilization with role classification (saturated/active/idle) |
 | `get_cpu_timeline` | Per-CPU utilization over time with hot CPU identification |
-| `get_hot_stacks` | Call stack tree with inclusive/exclusive weights |
-| `get_function_callers` | Who calls a function and what it calls |
+| `get_hot_stacks` | Hot stack functions with true inclusive/exclusive weights and selectable denominator |
+| `get_function_callers` | Who calls a function and what it calls, with parent and denominator percentages |
+| `walk_stack` | Recursively walk caller/callee butterfly edges with dominant/all/threshold branch policy |
+| `count_stacks` | Estimate aggregate butterfly sample counts for stack predicates |
+| `butterfly_chain` | One-shot WPA-style chain export around a target function (`table`, `csv`, or `wpa_csv`) |
 | `get_dpc_summary` | DPC/ISR duration histogram per module with watchdog risk assessment |
 | `get_dpc_per_cpu` | Per-CPU DPC breakdown |
 | `get_lock_contention` | Spinlock contention from ReadyThread stacks |
@@ -176,11 +186,21 @@ export_analysis()    → Save to .md for sharing
 
 Most analysis tools accept:
 
+- `trace_id` — required ID returned by `load_trace`
 - `cpu_filter` — CPU range, e.g. `"0"` or `"18-39"`. Enables per-CPU extraction from raw events.
 - `start_time` / `end_time` — seconds from trace start
 - `module_filter` — substring match, e.g. `"tcpip.sys"`
 - `process_filter` — substring match, e.g. `"echo_server"`
 - `max_rows` — limit output rows
+- `denominator` — percentage basis for hot stack/function tools: `"trace"`, `"active_cpus"`, `"active_busy"`, or `"custom"`
+
+### Stack Analysis Notes
+
+`get_hot_stacks` uses xperf's butterfly `Functions by UniInclusive Hits` table, so inclusive and exclusive hit counts are kept separate. `walk_stack` and `butterfly_chain` use the butterfly caller/callee table and require the `trace_id` returned by `load_trace`. `count_stacks` currently works from aggregate butterfly edges, so it estimates matching sample counts rather than counting distinct raw stack instances.
+
+### Parallel Analysis
+
+The server supports multiple loaded traces in one MCP server process when callers pass `trace_id` explicitly. Each analysis tool resolves data from the requested trace ID instead of using shared "current trace" state, so parallel agents can safely analyze different ETLs at the same time.
 
 ## Architecture
 
@@ -221,13 +241,13 @@ wpr-mcp-server/
 ├── pyproject.toml
 ├── README.md
 ├── LICENSE
-├── tests/                           ← 71 tests (synthetic data, no xperf needed)
+├── tests/                           ← synthetic data, no xperf needed
 └── src/etw_analyzer/
     ├── server.py                    ← MCP server entry point
     ├── app.py                       ← FastMCP instance
-    ├── trace_state.py               ← Global trace cache + dumper cache
+    ├── trace_state.py               ← Loaded trace registry + dumper cache
     ├── tools/
-    │   ├── trace_mgmt.py            ← load_trace, list_traces, check/resolve_symbols
+    │   ├── trace_mgmt.py            ← load_trace, list_traces, list_loaded_traces, check/resolve_symbols
     │   ├── cpu_sampling.py          ← get_cpu_samples, get_hot_functions
     │   ├── per_cpu.py               ← get_per_cpu_summary, get_cpu_timeline
     │   ├── stack_analysis.py        ← get_hot_stacks, get_function_callers

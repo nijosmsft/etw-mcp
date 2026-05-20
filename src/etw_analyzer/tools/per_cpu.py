@@ -7,7 +7,7 @@ import re
 import numpy as np
 
 from etw_analyzer.app import mcp
-from etw_analyzer.trace_state import require_trace
+from etw_analyzer.trace_state import TraceData, require_trace
 from etw_analyzer.parsing.aggregator import apply_filters, time_bucket
 from etw_analyzer.tools.cpu_sampling import _get_sampling_df, _find_col
 from etw_analyzer.formatting.markdown import format_table, format_pct
@@ -15,14 +15,13 @@ from etw_analyzer.formatting.markdown import format_table, format_pct
 import pandas as pd
 
 
-def _get_cpu_timeline_df() -> pd.DataFrame | None:
+def _get_cpu_timeline_df(trace: TraceData) -> pd.DataFrame | None:
     """Get the cpu_timeline DataFrame (from xperf -a profile -util).
 
     This dataset has columns: StartTime, EndTime, Cpu 0, Cpu 1, ..., Cpu N
     where each Cpu column contains utilization % for that time bucket.
     Returns None if not available.
     """
-    trace = require_trace()
     return trace.raw_csv.get("cpu_timeline")
 
 
@@ -41,6 +40,7 @@ def _parse_cpu_range(cpu_filter: str) -> set[int]:
 
 @mcp.tool()
 def get_per_cpu_summary(
+    trace_id: str,
     start_time: float | None = None,
     end_time: float | None = None,
     max_rows: int = 80,
@@ -52,17 +52,19 @@ def get_per_cpu_summary(
     vs idle CPUs.
 
     Args:
+        trace_id: ID returned by load_trace.
         start_time: Start of analysis window (seconds from trace start).
         end_time: End of analysis window (seconds from trace start).
         max_rows: Maximum CPUs to show. Default: 80.
     """
-    timeline_df = _get_cpu_timeline_df()
+    trace = require_trace(trace_id)
+    timeline_df = _get_cpu_timeline_df(trace)
 
     if timeline_df is not None and not timeline_df.empty:
         return _per_cpu_from_timeline(timeline_df, start_time, end_time, max_rows)
 
     # Fall back to cpu_sampling if cpu_timeline not available
-    return _per_cpu_from_sampling(start_time, end_time, max_rows)
+    return _per_cpu_from_sampling(trace, start_time, end_time, max_rows)
 
 
 def _per_cpu_from_timeline(
@@ -153,12 +155,13 @@ def _per_cpu_from_timeline(
 
 
 def _per_cpu_from_sampling(
+    trace: TraceData,
     start_time: float | None,
     end_time: float | None,
     max_rows: int,
 ) -> str:
     """Fallback: build per-CPU summary from cpu_sampling data (less precise)."""
-    df = _get_sampling_df()
+    df = _get_sampling_df(trace)
 
     weight_col = _find_col(df, ["Weight", "Count", "Sample Count"]) or "Weight"
     cpu_col = _find_col(df, ["CPU", "Cpu"]) or "CPU"
@@ -190,6 +193,7 @@ def _per_cpu_from_sampling(
 
 @mcp.tool()
 def get_cpu_timeline(
+    trace_id: str,
     cpu_filter: str | None = None,
     bucket_seconds: float = 1.0,
     start_time: float | None = None,
@@ -203,19 +207,21 @@ def get_cpu_timeline(
     steady-state windows.
 
     Args:
+        trace_id: ID returned by load_trace.
         cpu_filter: CPU range filter, e.g. '0-15' for RSS CPUs only.
         bucket_seconds: Not used (xperf buckets are fixed at trace granularity). Kept for API compat.
         start_time: Start of analysis window (seconds from trace start).
         end_time: End of analysis window (seconds from trace start).
         max_rows: Maximum time buckets to show. Default: 60.
     """
-    timeline_df = _get_cpu_timeline_df()
+    trace = require_trace(trace_id)
+    timeline_df = _get_cpu_timeline_df(trace)
 
     if timeline_df is not None and not timeline_df.empty:
         return _timeline_from_util(timeline_df, cpu_filter, start_time, end_time, max_rows)
 
     # Fall back to sampling-based timeline
-    return _timeline_from_sampling(cpu_filter, bucket_seconds, start_time, end_time, max_rows)
+    return _timeline_from_sampling(trace, cpu_filter, bucket_seconds, start_time, end_time, max_rows)
 
 
 def _timeline_from_util(
@@ -305,6 +311,7 @@ def _timeline_from_util(
 
 
 def _timeline_from_sampling(
+    trace: TraceData,
     cpu_filter: str | None,
     bucket_seconds: float,
     start_time: float | None,
@@ -312,7 +319,7 @@ def _timeline_from_sampling(
     max_rows: int,
 ) -> str:
     """Fallback: build timeline from cpu_sampling data."""
-    df = _get_sampling_df()
+    df = _get_sampling_df(trace)
 
     weight_col = _find_col(df, ["Weight", "Count", "Sample Count"]) or "Weight"
     cpu_col = _find_col(df, ["CPU", "Cpu"]) or "CPU"

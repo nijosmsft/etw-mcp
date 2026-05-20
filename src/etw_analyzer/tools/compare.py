@@ -7,7 +7,7 @@ from pathlib import Path
 import pandas as pd
 
 from etw_analyzer.app import mcp
-from etw_analyzer.trace_state import require_trace, TraceData
+from etw_analyzer.trace_state import TraceData, make_trace_id
 from etw_analyzer.tools.trace_mgmt import _load_from_cache, _load_file
 from etw_analyzer.parsing.wpa_exporter import export_all_profiles, find_xperf, _run_xperf
 from etw_analyzer.parsing.csv_loader import load_csv
@@ -28,7 +28,13 @@ def _load_trace_data(etl_path: str) -> TraceData:
     # Try cache first
     cached = _load_from_cache(export_dir, path)
     if cached is not None:
-        return TraceData(etl_path=path, export_dir=export_dir, symbol_path=sym_path, raw_csv=cached)
+        return TraceData(
+            trace_id=make_trace_id(path),
+            etl_path=path,
+            export_dir=export_dir,
+            symbol_path=sym_path,
+            raw_csv=cached,
+        )
 
     # Export
     try:
@@ -44,7 +50,13 @@ def _load_trace_data(etl_path: str) -> TraceData:
         except Exception:
             pass
 
-    return TraceData(etl_path=path, export_dir=export_dir, symbol_path=sym_path, raw_csv=results)
+    return TraceData(
+        trace_id=make_trace_id(path),
+        etl_path=path,
+        export_dir=export_dir,
+        symbol_path=sym_path,
+        raw_csv=results,
+    )
 
 
 @mcp.tool()
@@ -61,8 +73,8 @@ def compare_traces(
     per-function CPU weight, and shows the delta between them. Positive
     delta means the test trace uses MORE CPU than baseline.
 
-    The currently loaded trace is NOT affected — comparison uses separate
-    state.
+    The loaded trace registry is NOT affected — comparison uses separate
+    TraceData objects.
 
     Args:
         baseline_etl: Path to baseline .etl file.

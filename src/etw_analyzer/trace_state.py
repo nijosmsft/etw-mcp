@@ -1,10 +1,12 @@
-"""Global trace state — one loaded trace at a time."""
+"""Loaded trace registry."""
 
 from __future__ import annotations
 
+import hashlib
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 
@@ -13,6 +15,7 @@ import pandas as pd
 class TraceData:
     """Cached data from a loaded ETL trace."""
 
+    trace_id: str
     etl_path: Path
     export_dir: Path
     symbol_path: str | None = None
@@ -35,6 +38,9 @@ class TraceData:
     event_counts: dict[str, int] = field(default_factory=dict)
     export_errors: list[str] = field(default_factory=list)
 
+    # Protect lazy per-trace cache population.
+    lock: Any = field(default_factory=threading.RLock, repr=False)
+
     def wait_for_dumper(self) -> pd.DataFrame | None:
         """Block until the background dumper extraction completes, then return the DataFrame."""
         if self.dumper_df is not None:
@@ -56,24 +62,72 @@ class TraceData:
         return self.raw_csv.get("cswitch")
 
 
-# Global singleton — replaced on each load_trace call
-_current_trace: TraceData | None = None
+_traces: dict[str, TraceData] = {}
+_registry_lock = threading.RLock()
 
 
-def get_trace() -> TraceData | None:
-    return _current_trace
+def make_trace_id(etl_path: Path) -> str:
+    """Create a stable ID for the current version of an ETL file."""
+    path = etl_path.resolve()
+    stat = path.stat()
+    key = f"{str(path).lower()}|{stat.st_size}|{stat.st_mtime_ns}"
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:12]
+    return f"trace_{digest}"
 
 
-def set_trace(trace: TraceData) -> None:
-    global _current_trace
-    _current_trace = trace
+def register_trace(trace: TraceData) -> str:
+    """Register a loaded trace and return its trace ID."""
+    with _registry_lock:
+        _traces[trace.trace_id] = trace
+    return trace.trace_id
 
 
-def require_trace() -> TraceData:
-    """Get loaded trace or raise a helpful error."""
-    t = get_trace()
-    if t is None:
+def get_trace(trace_id: str) -> TraceData | None:
+    """Return a loaded trace by ID."""
+    with _registry_lock:
+        return _traces.get(trace_id)
+
+
+def require_trace(trace_id: str) -> TraceData:
+    """Get a loaded trace by ID or raise a helpful error."""
+    if not trace_id:
         raise ValueError(
-            "No trace loaded. Call load_trace first with a path to an .etl file."
+            "trace_id is required. Call load_trace first and pass the returned trace_id."
         )
-    return t
+
+    trace = get_trace(trace_id)
+    if trace is None:
+        loaded = list_loaded_trace_ids()
+        if loaded:
+            loaded_msg = ", ".join(f"`{tid}`" for tid in loaded)
+            raise ValueError(
+                f"Unknown trace_id `{trace_id}`. Loaded trace IDs: {loaded_msg}"
+            )
+        raise ValueError(
+            f"Unknown trace_id `{trace_id}`. No traces are loaded. Call load_trace first."
+        )
+    return trace
+
+
+def list_loaded_traces() -> list[TraceData]:
+    """Return all loaded traces."""
+    with _registry_lock:
+        return list(_traces.values())
+
+
+def list_loaded_trace_ids() -> list[str]:
+    """Return loaded trace IDs."""
+    with _registry_lock:
+        return sorted(_traces)
+
+
+def unregister_trace(trace_id: str) -> bool:
+    """Remove a loaded trace from the registry."""
+    with _registry_lock:
+        return _traces.pop(trace_id, None) is not None
+
+
+def clear_traces() -> None:
+    """Clear all loaded traces. Intended for tests."""
+    with _registry_lock:
+        _traces.clear()

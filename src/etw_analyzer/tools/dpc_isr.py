@@ -3,19 +3,17 @@
 from __future__ import annotations
 
 from etw_analyzer.app import mcp
-from etw_analyzer.trace_state import require_trace
+from etw_analyzer.trace_state import TraceData, require_trace
 from etw_analyzer.formatting.markdown import format_table, format_pct
 
 import pandas as pd
 
 
-def _get_dpc_df() -> pd.DataFrame:
+def _get_dpc_df(trace: TraceData) -> pd.DataFrame:
     """Get the DPC/ISR histogram DataFrame.
 
     Expected columns: Module, Bucket_Low_us, Bucket_High_us, Count, Pct
     """
-    trace = require_trace()
-
     # Try parsed histogram data
     for key in ["dpc_isr", "DpcIsr", "DPC/ISR", "dpc"]:
         if key in trace.raw_csv:
@@ -35,6 +33,7 @@ def _get_dpc_df() -> pd.DataFrame:
 
 @mcp.tool()
 def get_dpc_summary(
+    trace_id: str,
     module_filter: str | None = None,
     max_rows: int = 30,
 ) -> str:
@@ -44,10 +43,12 @@ def get_dpc_summary(
     Critical for detecting DPC watchdog timeout risk (>20us is concerning).
 
     Args:
+        trace_id: ID returned by load_trace.
         module_filter: Filter by module, e.g. 'xdp.sys'.
         max_rows: Maximum rows to return. Default: 30.
     """
-    df = _get_dpc_df()
+    trace = require_trace(trace_id)
+    df = _get_dpc_df(trace)
 
     if df.empty:
         return "*No DPC/ISR events in this trace.*"
@@ -127,6 +128,7 @@ def get_dpc_summary(
 
 @mcp.tool()
 def get_dpc_per_cpu(
+    trace_id: str,
     module_filter: str | None = None,
     max_rows: int = 80,
 ) -> str:
@@ -137,10 +139,11 @@ def get_dpc_per_cpu(
     otherwise falls back to CPU sampling data filtered to DPC context.
 
     Args:
+        trace_id: ID returned by load_trace.
         module_filter: Filter by module, e.g. 'xdp.sys'. Default: all.
         max_rows: Maximum rows (one per CPU). Default: 80.
     """
-    trace = require_trace()
+    trace = require_trace(trace_id)
 
     # Try to get per-CPU data from the raw dpcisr text
     raw_df = trace.raw_csv.get("dpc_isr_raw")

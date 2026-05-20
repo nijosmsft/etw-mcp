@@ -350,6 +350,65 @@ def _parse_profile_utilization(text: str) -> pd.DataFrame:
     return pd.read_csv(io.StringIO(csv_text), skipinitialspace=True)
 
 
+def _strip_html_cell(cell: str) -> str:
+    """Strip tags/entities from a small HTML table cell."""
+    import html as html_mod
+
+    return html_mod.unescape(re.sub(r"<[^>]+>", "", cell)).strip().lstrip("\xa0").strip()
+
+
+def _parse_int_cell(value: str) -> int:
+    """Parse an integer-like HTML table cell."""
+    cleaned = value.replace(",", "").replace("%", "").strip()
+    if not cleaned:
+        return 0
+    try:
+        return int(float(cleaned))
+    except ValueError:
+        return 0
+
+
+def _parse_pct_cell(value: str) -> float:
+    """Parse a percent-like HTML table cell."""
+    cleaned = value.replace(",", "").replace("%", "").strip()
+    if not cleaned:
+        return 0.0
+    try:
+        return float(cleaned)
+    except ValueError:
+        return 0.0
+
+
+def _html_section_by_heading(html_text: str, heading: str) -> str:
+    """Return the HTML section that starts at a specific h2 heading."""
+    start = html_text.find(f"<h2>{heading}</h2>")
+    if start == -1:
+        return ""
+    end = html_text.find("<h2>", start + 1)
+    return html_text[start:end if end != -1 else len(html_text)]
+
+
+def _html_table_rows(section: str) -> list[list[str]]:
+    """Return stripped table cells for every row in an HTML section."""
+    rows: list[list[str]] = []
+    for tr_match in re.finditer(r"<tr[^>]*>(.*?)</tr>", section, re.DOTALL):
+        cells = re.findall(r"<t[dh][^>]*>(.*?)</t[dh]>", tr_match.group(1), re.DOTALL)
+        rows.append([_strip_html_cell(cell) for cell in cells])
+    return rows
+
+
+def _split_module_function(value: str) -> tuple[str, str] | None:
+    """Split a module!function cell."""
+    if "!" not in value:
+        return None
+    module, function = value.split("!", 1)
+    module = module.strip()
+    function = re.sub(r"\s*\(trimmed\)\s*$", "", function.strip())
+    if not module or not function:
+        return None
+    return module, function
+
+
 def _parse_stack_butterfly_html(html_text: str) -> pd.DataFrame:
     """Parse xperf -a stack -butterfly HTML output into a DataFrame.
 
@@ -363,77 +422,79 @@ def _parse_stack_butterfly_html(html_text: str) -> pd.DataFrame:
     Or without links:
       <tr class='pf'><td>&nbsp;module!function</td><td></td><td>123</td><td>0.05%</td></tr>
     """
-    import html as html_mod
+    records: dict[tuple[str, str], dict] = {}
 
-    rows = []
-    seen = set()
-
-    # Extract all <tr> elements
-    for tr_match in re.finditer(r"<tr[^>]*>(.*?)</tr>", html_text, re.DOTALL):
-        tr_content = tr_match.group(1)
-
-        # Extract <td> cells
-        cells = re.findall(r"<td[^>]*>(.*?)</td>", tr_content, re.DOTALL)
-        if len(cells) < 3:
-            continue
-
-        # Strip HTML tags from first cell to get module!function
-        func_cell = re.sub(r"<[^>]+>", "", cells[0])
-        func_cell = html_mod.unescape(func_cell).strip().lstrip("\xa0").strip()
-
-        if "!" not in func_cell:
-            continue
-
-        # Skip caller/callee rows (prefixed with --> or <--)
-        if func_cell.startswith("-->") or func_cell.startswith("<--"):
-            continue
-
-        module, function = func_cell.split("!", 1)
-        module = module.strip()
-        function = function.strip()
-
-        if not module or not function:
-            continue
-
-        # Extract numeric values from remaining cells
-        nums = []
-        for cell in cells[1:]:
-            cleaned = re.sub(r"<[^>]+>", "", cell).strip()
-            cleaned = cleaned.replace(",", "").replace("%", "").strip()
-            if not cleaned:
-                continue
-            try:
-                nums.append(float(cleaned))
-            except ValueError:
-                pass
-
-        if not nums:
-            continue
-
-        # Determine which table we're in by column count:
-        # Exclusive Hits table: module!func, exclusive, pct
-        # UniInclusive table: module!func, uni-inclusive, pct
-        # Multi-Inclusive (butterfly): module!func, multi-incl, multi-excl, uni-incl, uni-excl, pct
+    def ensure_record(module: str, function: str) -> dict:
         key = (module, function)
-        exclusive = int(nums[0])
-
-        if key not in seen:
-            seen.add(key)
-            rows.append({
+        if key not in records:
+            records[key] = {
                 "Module": module,
                 "Function": function,
-                "Exclusive": exclusive,
-                "Inclusive": exclusive,  # Will be updated if we find inclusive data
-                "Weight": exclusive,
-            })
-        else:
-            # Update existing entry with higher values
-            for r in rows:
-                if (r["Module"], r["Function"]) == key:
-                    r["Inclusive"] = max(r["Inclusive"], exclusive)
-                    r["Exclusive"] = max(r["Exclusive"], exclusive)
-                    r["Weight"] = max(r["Weight"], exclusive)
-                    break
+                "Inclusive": 0,
+                "Exclusive": 0,
+                "Weight": 0,
+                "Total %": 0.0,
+            }
+        return records[key]
+
+    # xperf's "Functions by UniInclusive Hits" table has the accurate
+    # function-level inclusive/exclusive pair:
+    # function, inclusive hits, total percent, exclusive hits, ...
+    si_section = _html_section_by_heading(html_text, "Functions by UniInclusive Hits")
+    if si_section:
+        for cells in _html_table_rows(si_section):
+            if len(cells) < 4 or cells[0].lower().startswith("function name"):
+                continue
+            split = _split_module_function(cells[0])
+            if split is None:
+                continue
+            module, function = split
+            rec = ensure_record(module, function)
+            rec["Inclusive"] = max(rec["Inclusive"], _parse_int_cell(cells[1]))
+            rec["Total %"] = max(rec["Total %"], _parse_pct_cell(cells[2]))
+            rec["Exclusive"] = max(rec["Exclusive"], _parse_int_cell(cells[3]))
+
+    # The exclusive table repeats the same pair in a different sort order and
+    # is useful for older/corrupt SI sections:
+    # function, exclusive hits, total percent, inclusive hits, ...
+    se_section = _html_section_by_heading(html_text, "Functions by Exclusive Hits")
+    if se_section:
+        for cells in _html_table_rows(se_section):
+            if len(cells) < 4 or cells[0].lower().startswith("function name"):
+                continue
+            split = _split_module_function(cells[0])
+            if split is None:
+                continue
+            module, function = split
+            rec = ensure_record(module, function)
+            rec["Exclusive"] = max(rec["Exclusive"], _parse_int_cell(cells[1]))
+            rec["Total %"] = max(rec["Total %"], _parse_pct_cell(cells[2]))
+            rec["Inclusive"] = max(rec["Inclusive"], _parse_int_cell(cells[3]))
+
+    # Unit-test and older-export fallback: parse any simple module!function row
+    # with at least one numeric cell as a flat sample.
+    if not records:
+        for cells in _html_table_rows(html_text):
+            if len(cells) < 2 or cells[0].lower().startswith("function name"):
+                continue
+            func_cell = cells[0]
+            if func_cell.startswith("-->") or func_cell.startswith("<--"):
+                continue
+            split = _split_module_function(func_cell)
+            if split is None:
+                continue
+            module, function = split
+            weight = _parse_int_cell(cells[1])
+            if weight <= 0:
+                continue
+            rec = ensure_record(module, function)
+            rec["Inclusive"] = max(rec["Inclusive"], weight)
+            rec["Exclusive"] = max(rec["Exclusive"], weight)
+
+    rows = []
+    for rec in records.values():
+        rec["Weight"] = rec["Inclusive"]
+        rows.append(rec)
 
     df = pd.DataFrame(rows)
     if not df.empty:
@@ -453,73 +514,90 @@ def parse_stack_butterfly_callers(html_text: str) -> pd.DataFrame:
         Target_Module, Target_Function, Direction, Caller_Module, Caller_Function, Weight
     where Direction is 'caller' (<--) or 'callee' (-->).
     """
-    import html as html_mod
-
-    # Focus on TblSN section only
-    sn_start = html_text.find("id='TblSN'")
-    if sn_start == -1:
-        return pd.DataFrame()
-    sn_end = html_text.find("id='TblSE'", sn_start)
-    if sn_end == -1:
-        sn_end = len(html_text)
-    section = html_text[sn_start:sn_end]
+    # Focus on the multi-inclusive caller/callee section.
+    section = _html_section_by_heading(
+        html_text,
+        "Functions by Multi-Inclusive Hits with Callers and Callees",
+    )
+    if not section:
+        sn_start = html_text.find("id='TblSN'")
+        if sn_start == -1:
+            return pd.DataFrame()
+        sn_end = html_text.find("id='TblSE'", sn_start)
+        if sn_end == -1:
+            sn_end = len(html_text)
+        section = html_text[sn_start:sn_end]
 
     rows: list[dict] = []
     center_func: str | None = None
     center_mod: str | None = None
 
-    for tr_match in re.finditer(r"<tr[^>]*>(.*?)</tr>", section, re.DOTALL):
-        cells = re.findall(r"<td[^>]*>(.*?)</td>", tr_match.group(1), re.DOTALL)
+    for cells in _html_table_rows(section):
         if len(cells) < 2:
             continue
 
-        func_cell = re.sub(r"<[^>]+>", "", cells[0])
-        func_cell = html_mod.unescape(func_cell).strip().lstrip("\xa0").strip()
-
-        if "!" not in func_cell:
+        func_cell = cells[0]
+        if not func_cell or func_cell.lower().startswith("function name"):
+            continue
+        if "!" not in func_cell and "***itself***" not in func_cell:
             continue
 
-        # Extract inclusive hits (first numeric cell)
-        hits = 0
-        for cell in cells[1:]:
-            cleaned = re.sub(r"<[^>]+>", "", cell).strip().replace(",", "").replace("%", "").strip()
-            if cleaned:
-                try:
-                    hits = int(float(cleaned))
-                    break
-                except ValueError:
-                    pass
+        hits = _parse_int_cell(cells[1]) if len(cells) > 1 else 0
+        total_pct = _parse_pct_cell(cells[2]) if len(cells) > 2 else 0.0
+        parent_pct = _parse_pct_cell(cells[3]) if len(cells) > 3 else 0.0
+        exclusive = _parse_int_cell(cells[4]) if len(cells) > 4 else 0
 
         if func_cell.startswith("-->"):
             raw = func_cell[3:].strip()
-            if "!" in raw and center_func is not None:
-                mod, func = raw.split("!", 1)
+            split = _split_module_function(raw)
+            if split is not None and center_func is not None:
+                mod, func = split
                 rows.append({
                     "Target_Module": center_mod,
                     "Target_Function": center_func,
                     "Direction": "callee",
-                    "Caller_Module": mod.strip(),
-                    "Caller_Function": re.sub(r"\s*\(trimmed\)\s*$", "", func.strip()),
+                    "Caller_Module": mod,
+                    "Caller_Function": func,
                     "Weight": hits,
+                    "Total %": total_pct,
+                    "Parent %": parent_pct,
+                    "Exclusive": exclusive,
                 })
         elif func_cell.startswith("<--"):
             raw = func_cell[3:].strip()
-            if "!" in raw and center_func is not None:
-                mod, func = raw.split("!", 1)
+            split = _split_module_function(raw)
+            if split is not None and center_func is not None:
+                mod, func = split
                 rows.append({
                     "Target_Module": center_mod,
                     "Target_Function": center_func,
                     "Direction": "caller",
-                    "Caller_Module": mod.strip(),
-                    "Caller_Function": re.sub(r"\s*\(trimmed\)\s*$", "", func.strip()),
+                    "Caller_Module": mod,
+                    "Caller_Function": func,
                     "Weight": hits,
+                    "Total %": total_pct,
+                    "Parent %": parent_pct,
+                    "Exclusive": exclusive,
                 })
         elif "***itself***" in func_cell:
             pass
         else:
-            mod, func = func_cell.split("!", 1)
-            center_mod = mod.strip()
-            center_func = func.strip()
+            split = _split_module_function(func_cell)
+            if split is None:
+                continue
+            center_mod, center_func = split
+            # Keep center stats as node metadata rows for stack-walk tools.
+            rows.append({
+                "Target_Module": center_mod,
+                "Target_Function": center_func,
+                "Direction": "self",
+                "Caller_Module": center_mod,
+                "Caller_Function": center_func,
+                "Weight": hits,
+                "Total %": total_pct,
+                "Parent %": 100.0,
+                "Exclusive": exclusive,
+            })
 
     df = pd.DataFrame(rows)
     if not df.empty:
