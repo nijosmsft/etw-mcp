@@ -27,6 +27,13 @@ class TraceData:
     # Populated lazily by background thread after load_trace, or on first per-CPU query.
     dumper_df: pd.DataFrame | None = None
 
+    # Cached parsed CSwitch events (also from xperf -a dumper, single pass).
+    # Populated by the same background thread that fills ``dumper_df``. Each
+    # row has TimeStamp, NewProcessName/PID/TID, OldProcessName/PID/TID,
+    # WaitReason, OldState, CPU, NewPriority, OldPriority. None until the
+    # extraction completes (use ``wait_for_dumper`` to block).
+    cswitch_events_df: pd.DataFrame | None = None
+
     # Background extraction state
     _dumper_future: threading.Thread | None = field(default=None, repr=False)
     _dumper_ready: threading.Event = field(default_factory=threading.Event, repr=False)

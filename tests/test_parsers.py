@@ -1,15 +1,21 @@
 """Tests for xperf output parsers."""
 
+from unittest.mock import patch
+
 import pandas as pd
 import pytest
 
 from etw_analyzer.parsing.wpa_exporter import (
+    EVENT_HANDLERS,
+    _handle_cswitch,
+    _handle_sampled_profile,
     _parse_profile_detail,
     _parse_profile_utilization,
     _parse_dpcisr,
     _parse_stack_butterfly_html,
-    parse_stack_butterfly_callers,
+    parse_dumper_events,
     parse_sampled_profile_events,
+    parse_stack_butterfly_callers,
 )
 
 
@@ -269,3 +275,192 @@ class TestParseStackButterflyCallers:
     def test_empty_html(self):
         df = parse_stack_butterfly_callers("")
         assert df.empty
+
+
+# ---------------------------------------------------------------------------
+# parse_dumper_events: multi-class dispatch parser
+# ---------------------------------------------------------------------------
+
+
+# Synthetic dumper text. Two SampledProfile rows, three CSwitch rows, one
+# bogus row to confirm graceful handling, and a SampledProfileNmi line that
+# must be ignored.
+_DUMPER_TEXT = """\
+SampledProfile, TimeStamp, Process Name ( PID), ThreadID, PrgrmCtr, CPU, ThreadStartImage!Function, Image!Function, Count, Type
+    SampledProfile, 1000, echo_server.exe (1234), 5678, 0x7fff00000000, 0, ntdll.dll!Start, ntoskrnl.exe!KiIdleLoop, 1, Profile
+    SampledProfile, 1100, echo_server.exe (1234), 5678, 0x7fff00000010, 7, ntdll.dll!Start, tcpip.sys!UdpReceiveDatagrams, 1, Profile
+    SampledProfileNmi, 1200, ignored.exe (9), 9, 0x0, 0, x!y, x!y, 1, Profile
+CSwitch, TimeStamp, New Process Name ( PID), New TID, NPri, NQnt, NWaitTime, OldProcess ( PID), OldTID, OPri, OQnt, OldState, WaitReason, Swapable, InSwitchTime, CPU, IdealProc, OldRemQnt, NewPriDecr, PrevCState
+    CSwitch, 2000, echo_server.exe (1234), 5678, 9, 0, 100, Idle (   0), 0, 0, 0, Waiting, WrQueue, 1, 12345, 3, 0, 0, 0, 0
+    CSwitch, 2100, echo_server.exe (1234), 5678, 9, 0, 50, dwm.exe (4321), 9999, 8, 0, Waiting, WrDispatchInt, 1, 200, 5, 0, 0, 0, 0
+    CSwitch, 2200, Idle (   0), 0, 0, 0, 0, echo_server.exe (1234), 5678, 9, 0, Standby, WrPreempted, 1, 100, 3, 0, 0, 0, 0
+    CSwitch, malformed, this row has, way too few, fields
+"""
+
+
+class TestParseDumperEvents:
+    """Tests for the multi-event-class dispatch parser."""
+
+    def _patch_xperf_lines(self, text: str):
+        """Patch ``_run_xperf_lines`` to yield ``text`` line-by-line."""
+        def _fake_lines(*_args, **_kwargs):
+            for line in text.splitlines():
+                yield line
+        return patch(
+            "etw_analyzer.parsing.wpa_exporter._run_xperf_lines",
+            side_effect=_fake_lines,
+        )
+
+    def test_parses_both_event_classes_by_default(self, tmp_path):
+        with self._patch_xperf_lines(_DUMPER_TEXT):
+            results = parse_dumper_events(tmp_path / "fake.etl")
+
+        assert set(results.keys()) == {"SampledProfile", "CSwitch"}
+        assert len(results["SampledProfile"]) == 2
+        assert len(results["CSwitch"]) == 3
+
+    def test_sampled_profile_columns(self, tmp_path):
+        with self._patch_xperf_lines(_DUMPER_TEXT):
+            results = parse_dumper_events(tmp_path / "fake.etl")
+        sp = results["SampledProfile"]
+        assert {"TimeStamp", "Process Name", "PID", "CPU", "Module", "Function", "Weight"} <= set(sp.columns)
+        assert sp.iloc[0]["Module"] == "ntoskrnl.exe"
+        assert sp.iloc[0]["Function"] == "KiIdleLoop"
+        assert sp.iloc[1]["Module"] == "tcpip.sys"
+
+    def test_cswitch_columns(self, tmp_path):
+        with self._patch_xperf_lines(_DUMPER_TEXT):
+            results = parse_dumper_events(tmp_path / "fake.etl")
+        cs = results["CSwitch"]
+        expected = {
+            "TimeStamp", "NewProcessName", "NewPID", "NewTID",
+            "OldProcessName", "OldPID", "OldTID", "WaitReason",
+            "OldState", "CPU", "NewPriority", "OldPriority",
+        }
+        assert expected <= set(cs.columns)
+
+        # Wait reasons in order
+        reasons = cs["WaitReason"].tolist()
+        assert reasons == ["WrQueue", "WrDispatchInt", "WrPreempted"]
+
+        # First row: echo_server → idle, NewTID = 5678
+        first = cs.iloc[0]
+        assert first["NewProcessName"] == "echo_server.exe"
+        assert first["NewTID"] == 5678
+        assert first["OldProcessName"] == "Idle"
+        assert first["OldTID"] == 0
+        # CPU column was at position 15 in our layout (value 3).
+        assert first["CPU"] == 3
+
+    def test_event_classes_filter_skips_cswitch(self, tmp_path):
+        with self._patch_xperf_lines(_DUMPER_TEXT):
+            results = parse_dumper_events(
+                tmp_path / "fake.etl",
+                event_classes={"SampledProfile"},
+            )
+        # Only the requested class is returned.
+        assert "SampledProfile" in results
+        assert "CSwitch" not in results
+        assert len(results["SampledProfile"]) == 2
+
+    def test_sampled_profile_nmi_ignored(self, tmp_path):
+        with self._patch_xperf_lines(_DUMPER_TEXT):
+            results = parse_dumper_events(tmp_path / "fake.etl")
+        sp = results["SampledProfile"]
+        # No SampledProfileNmi row leaked in (it has different prefix).
+        assert (sp["TimeStamp"] != 1200).all()
+
+    def test_malformed_cswitch_lines_skipped(self, tmp_path):
+        bad_text = (
+            "CSwitch, TimeStamp, New Process Name ( PID), New TID, ...header...\n"
+            "    CSwitch, abc, not, a, valid, row\n"  # non-numeric timestamp via header gate
+            "    CSwitch, 100, echo_server.exe (1), notanint, 0, 0, 0, Idle (0), 0, 0, 0, Waiting, WrQueue, 1, 1, 0, 0, 0, 0, 0\n"
+            "    CSwitch, 200, echo_server.exe (1), 5, 9, 0, 0, Idle (0), 0, 0, 0, Waiting, WrQueue, 1, 1, 0, 0, 0, 0, 0\n"
+        )
+        with self._patch_xperf_lines(bad_text):
+            results = parse_dumper_events(tmp_path / "fake.etl")
+        # Only the one well-formed row should survive.
+        assert len(results["CSwitch"]) == 1
+        assert results["CSwitch"].iloc[0]["NewTID"] == 5
+
+    def test_too_few_commas_skipped(self, tmp_path):
+        """CSwitch rows with not enough fields must not crash the parser."""
+        short_text = (
+            "    CSwitch, 100, only, three, four, five, six\n"  # < 13 fields
+        )
+        with self._patch_xperf_lines(short_text):
+            results = parse_dumper_events(tmp_path / "fake.etl")
+        assert results["CSwitch"].empty
+
+    def test_event_handlers_registry_contains_both(self):
+        # Phase 3 will add more entries; Phase 2 ships with these two.
+        assert "SampledProfile" in EVENT_HANDLERS
+        assert "CSwitch" in EVENT_HANDLERS
+
+
+class TestSampledProfileBackwardCompat:
+    """The wrapper signature must remain unchanged after the refactor."""
+
+    SIMPLE = """\
+SampledProfile, TimeStamp, Process Name ( PID), ThreadID, PrgrmCtr, CPU, ThreadStartImage!Function, Image!Function, Count, Type
+    SampledProfile, 1000, foo.exe (1), 2, 0x0, 0, x!y, mod.dll!Func, 1, Profile
+    SampledProfile, 1100, foo.exe (1), 2, 0x0, 5, x!y, mod.dll!Func, 1, Profile
+"""
+
+    def test_wrapper_returns_dataframe(self, tmp_path):
+        def _fake_lines(*_args, **_kwargs):
+            for line in self.SIMPLE.splitlines():
+                yield line
+        with patch(
+            "etw_analyzer.parsing.wpa_exporter._run_xperf_lines",
+            side_effect=_fake_lines,
+        ):
+            df = parse_sampled_profile_events(tmp_path / "fake.etl")
+        assert isinstance(df, pd.DataFrame)
+        assert len(df) == 2
+        assert df.iloc[0]["Function"] == "Func"
+
+    def test_wrapper_respects_cpu_filter(self, tmp_path):
+        def _fake_lines(*_args, **_kwargs):
+            for line in self.SIMPLE.splitlines():
+                yield line
+        with patch(
+            "etw_analyzer.parsing.wpa_exporter._run_xperf_lines",
+            side_effect=_fake_lines,
+        ):
+            df = parse_sampled_profile_events(
+                tmp_path / "fake.etl",
+                cpu_filter={5},
+            )
+        assert len(df) == 1
+        assert df.iloc[0]["CPU"] == 5
+
+
+class TestCswitchHandlerDirect:
+    """Direct unit tests for the CSwitch handler — easier to debug schema drift."""
+
+    def test_standard_layout(self):
+        parts = (
+            "CSwitch, 1000, echo_server.exe (1234), 5678, 9, 0, 100, "
+            "Idle (   0), 0, 0, 0, Waiting, WrQueue, 1, 12345, 3, 0, 0, 0, 0"
+        ).split(",")
+        row = _handle_cswitch(parts)
+        assert row is not None
+        assert row["TimeStamp"] == 1000
+        assert row["NewTID"] == 5678
+        assert row["OldTID"] == 0
+        assert row["WaitReason"] == "WrQueue"
+        assert row["OldState"] == "Waiting"
+        assert row["CPU"] == 3
+
+    def test_short_row_returns_none(self):
+        row = _handle_cswitch(["CSwitch", "1000", "foo"])
+        assert row is None
+
+    def test_non_numeric_tid_returns_none(self):
+        parts = (
+            "CSwitch, 1000, echo_server.exe (1234), notanint, 9, 0, 100, "
+            "Idle (   0), 0, 0, 0, Waiting, WrQueue, 1, 12345, 3, 0, 0, 0, 0"
+        ).split(",")
+        row = _handle_cswitch(parts)
+        assert row is None

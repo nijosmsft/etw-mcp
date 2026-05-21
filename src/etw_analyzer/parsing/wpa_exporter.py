@@ -729,6 +729,293 @@ def parse_stack_butterfly_callers(html_text: str) -> pd.DataFrame:
     return df
 
 
+def _parse_proc_field(field: str) -> tuple[str, int]:
+    """Parse a "Process Name ( PID)" field into (name, pid).
+
+    Returns ("", 0) if unparseable so callers can still emit a row.
+    """
+    field = field.strip()
+    m = re.match(r'"?([^"]*)"?\s*\(\s*(-?\d+)\s*\)', field)
+    if m:
+        return m.group(1).strip(), int(m.group(2))
+    return field, 0
+
+
+def _handle_sampled_profile(
+    parts: list[str],
+    *,
+    cpu_filter: set[int] | None,
+) -> dict | None:
+    """Handler for ``SampledProfile`` dumper lines.
+
+    Layout (column positions, 0-indexed; broadly stable across builds):
+        0: "SampledProfile"
+        1: TimeStamp
+        2: "Process Name ( PID)"
+        3: ThreadID
+        4: PrgrmCtr
+        5: CPU
+        6: ThreadStartImage!Function
+        7: Image!Function
+        8: Count
+        9+: Type/extras (ignored)
+    """
+    if len(parts) < 8:
+        return None
+    try:
+        timestamp = int(parts[1].strip())
+        cpu = int(parts[5].strip())
+    except (ValueError, IndexError):
+        return None
+
+    if cpu_filter is not None and cpu not in cpu_filter:
+        return None
+
+    process_name, pid = _parse_proc_field(parts[2])
+
+    img_func = parts[7].strip()
+    if "!" in img_func:
+        module, function = img_func.split("!", 1)
+        module = module.strip()
+        function = function.strip()
+    else:
+        module = img_func
+        function = "Unknown"
+
+    try:
+        count = int(parts[8].strip())
+    except (ValueError, IndexError):
+        count = 1
+
+    return {
+        "TimeStamp": timestamp,
+        "Process Name": process_name,
+        "PID": pid,
+        "CPU": cpu,
+        "Module": module,
+        "Function": function,
+        "Weight": count,
+    }
+
+
+def _handle_cswitch(parts: list[str], **_kwargs) -> dict | None:
+    """Handler for ``CSwitch`` dumper lines.
+
+    Stable column layout used here (varies across Windows builds — be
+    defensive, skip on parse failure):
+
+        0:  "CSwitch"
+        1:  TimeStamp
+        2:  "New Process Name ( PID)"
+        3:  New TID
+        4:  NPri (new priority)
+        5:  NQnt (new quantum)
+        6:  NWaitTime (irrelevant)
+        7:  "Old Process Name ( PID)"
+        8:  Old TID
+        9:  OPri (old priority)
+        10: OQnt
+        11: OldState
+        12: WaitReason
+        13+: Swapable, InSwitchTime, CPU, IdealProc, OldRemQnt, NewPriDecr, PrevCState
+
+    Newer builds add columns after position 12; older may have fewer. We
+    only require the columns up through WaitReason and try to find CPU near
+    the tail. Anything we can't parse → return None to drop the row.
+
+    Emits columns: TimeStamp, NewProcessName, NewPID, NewTID, OldProcessName,
+    OldPID, OldTID, WaitReason, OldState, CPU, NewPriority, OldPriority.
+    """
+    if len(parts) < 13:
+        return None
+
+    try:
+        timestamp = int(parts[1].strip())
+        new_tid = int(parts[3].strip())
+        old_tid = int(parts[8].strip())
+    except (ValueError, IndexError):
+        return None
+
+    new_name, new_pid = _parse_proc_field(parts[2])
+    old_name, old_pid = _parse_proc_field(parts[7])
+
+    # Priorities (best-effort)
+    try:
+        new_pri = int(parts[4].strip())
+    except (ValueError, IndexError):
+        new_pri = -1
+    try:
+        old_pri = int(parts[9].strip())
+    except (ValueError, IndexError):
+        old_pri = -1
+
+    old_state = parts[11].strip()
+    wait_reason = parts[12].strip()
+
+    # CPU is at position 15 in the standard recent-build layout:
+    #   13:Swapable, 14:InSwitchTime, 15:CPU, 16:IdealProc, ...
+    # If position 15 isn't a valid CPU number, fall back to scanning a wider
+    # window for the first small non-negative integer that looks like a CPU
+    # number (skip very large values which are timing fields).
+    cpu = -1
+    if len(parts) > 15:
+        try:
+            cpu = int(parts[15].strip())
+        except (ValueError, IndexError):
+            cpu = -1
+    if cpu < 0 or cpu >= 4096:
+        # Layout drift fallback. Skip Swapable (small boolean) and
+        # InSwitchTime (potentially large timestamp) by looking past them.
+        cpu = -1
+        for idx in range(14, min(len(parts), 19)):
+            candidate = parts[idx].strip()
+            try:
+                value = int(candidate)
+            except ValueError:
+                continue
+            # CPU numbers are 0..4095 in practice. Also exclude obvious
+            # InSwitchTime values (typically much larger).
+            if 0 <= value < 4096:
+                cpu = value
+                break
+
+    return {
+        "TimeStamp": timestamp,
+        "NewProcessName": new_name,
+        "NewPID": new_pid,
+        "NewTID": new_tid,
+        "OldProcessName": old_name,
+        "OldPID": old_pid,
+        "OldTID": old_tid,
+        "WaitReason": wait_reason,
+        "OldState": old_state,
+        "CPU": cpu,
+        "NewPriority": new_pri,
+        "OldPriority": old_pri,
+    }
+
+
+# Dispatch table — Phase 3 will extend this with TCPIP/UDP/AFD handlers.
+# Each entry maps an event-class prefix (the first comma-separated token on
+# a dumper line) to a handler returning a row dict, or None to skip the row.
+EVENT_HANDLERS = {
+    "SampledProfile": _handle_sampled_profile,
+    "CSwitch": _handle_cswitch,
+}
+
+# Event names we explicitly want to ignore (similar prefix to wanted classes).
+_EVENT_SKIP_PREFIXES = frozenset({
+    "SampledProfileNmi",
+})
+
+
+def parse_dumper_events(
+    etl_path: Path,
+    symbol_path: str | None = None,
+    cpu_filter: set[int] | None = None,
+    start_time: float | None = None,
+    end_time: float | None = None,
+    timeout_seconds: int = 300,
+    event_classes: set[str] | None = None,
+) -> dict[str, pd.DataFrame]:
+    """Single-pass dumper extraction with multi-event dispatch.
+
+    Streams ``xperf -a dumper`` stdout line-by-line and dispatches each line
+    by its event-class prefix to a handler in :data:`EVENT_HANDLERS`. Each
+    handler produces row dicts, which are collected per class and turned into
+    DataFrames at the end.
+
+    Args:
+        etl_path: Path to the .etl file.
+        symbol_path: Optional ``_NT_SYMBOL_PATH`` override.
+        cpu_filter: Restrict ``SampledProfile`` rows to these CPUs.
+        start_time: Window start (seconds from trace start).
+        end_time: Window end (seconds from trace start).
+        timeout_seconds: xperf timeout.
+        event_classes: Which classes to extract. Default
+            ``{"SampledProfile", "CSwitch"}``. Pass a subset to skip work.
+
+    Returns:
+        ``{class_name: DataFrame}`` for every requested class. DataFrames
+        are empty if no matching rows were found.
+
+    Notes:
+        - Dumper output can reach multiple GB on a CPU-sampling trace.
+          Streaming is mandatory; we never buffer the full text.
+        - The handler dispatch table is the Phase-3 keystone refactor —
+          adding TCPIP/UDP/AFD/NDIS extraction is just one new handler per
+          event class, no parser surgery required.
+    """
+    requested = event_classes if event_classes is not None else {"SampledProfile", "CSwitch"}
+    # Only dispatch to handlers we know about AND that were requested.
+    active_handlers = {
+        name: handler
+        for name, handler in EVENT_HANDLERS.items()
+        if name in requested
+    }
+    if not active_handlers:
+        return {name: pd.DataFrame() for name in requested}
+
+    # Build range args (times in microseconds)
+    action_args: list[str] = []
+    if start_time is not None or end_time is not None:
+        t1 = int((start_time or 0) * 1_000_000)
+        t2 = int((end_time or 999999) * 1_000_000)
+        action_args.extend(["-range", str(t1), str(t2)])
+
+    # Cheap line prefilter to avoid splitting every line. Build a tuple of
+    # "<class>," — fast `startswith` check after stripping.
+    wanted_prefixes = tuple(f"{name}," for name in active_handlers)
+    skip_prefixes = tuple(f"{name}," for name in _EVENT_SKIP_PREFIXES)
+
+    line_iter = _run_xperf_lines(
+        etl_path, "dumper", action_args,
+        symbol_path=symbol_path,
+        symbols=True,
+        timeout_seconds=timeout_seconds,
+    )
+
+    rows_by_class: dict[str, list[dict]] = {name: [] for name in active_handlers}
+
+    for line in line_iter:
+        # Strip leading whitespace once — many dumper lines have variable
+        # indentation depending on event class.
+        stripped = line.lstrip()
+        if not stripped:
+            continue
+
+        # Skip explicitly-ignored event classes (e.g. SampledProfileNmi).
+        if stripped.startswith(skip_prefixes):
+            continue
+
+        # Find the matching class prefix. tuple-startswith is O(prefixes)
+        # but our prefix list is tiny (2-10 entries).
+        matched = None
+        for prefix, name in zip(wanted_prefixes, active_handlers.keys()):
+            if stripped.startswith(prefix):
+                matched = name
+                break
+        if matched is None:
+            continue
+
+        # Skip xperf's header lines for this event class. xperf emits one
+        # header per class with column names (e.g. "TimeStamp" in field 1).
+        # The real timestamp is always numeric.
+        parts = stripped.split(",")
+        if len(parts) >= 2 and not parts[1].strip().lstrip("-").isdigit():
+            continue
+
+        try:
+            row = active_handlers[matched](parts, cpu_filter=cpu_filter)
+        except Exception:
+            # Defensive: a malformed line should never crash the parser.
+            continue
+        if row is not None:
+            rows_by_class[matched].append(row)
+
+    return {name: pd.DataFrame(rows) for name, rows in rows_by_class.items()}
+
+
 def parse_sampled_profile_events(
     etl_path: Path,
     symbol_path: str | None = None,
@@ -739,92 +1026,25 @@ def parse_sampled_profile_events(
 ) -> pd.DataFrame:
     """Extract per-CPU SampledProfile events via xperf -a dumper.
 
-    Parses raw dumper output for SampledProfile lines which have the format:
-        SampledProfile, TimeStamp, Process Name (PID), ThreadID, PrgrmCtr, CPU,
-            ThreadStartImage!Function, Image!Function, Count, Type
+    Thin backward-compat wrapper around :func:`parse_dumper_events`. Returns
+    only the SampledProfile DataFrame — preserves the original single-class
+    signature used by the existing background-dumper code path. New callers
+    that need other event classes should use :func:`parse_dumper_events`
+    directly.
 
-    Returns DataFrame with columns: TimeStamp, Process Name, PID, CPU, Module, Function, Count
+    Returns DataFrame with columns: TimeStamp, Process Name, PID, CPU,
+    Module, Function, Weight.
     """
-    # Build range args (times in microseconds)
-    action_args: list[str] = []
-    if start_time is not None or end_time is not None:
-        t1 = int((start_time or 0) * 1_000_000)
-        t2 = int((end_time or 999999) * 1_000_000)
-        action_args.extend(["-range", str(t1), str(t2)])
-
-    # Stream xperf stdout line-by-line — dumper output for cpu-sampling traces
-    # can reach gigabytes (1.3 GB seen for 18s of sampling). Buffering the full
-    # string would OOM the server. We filter aggressively here and only retain
-    # parsed rows.
-    line_iter = _run_xperf_lines(
-        etl_path, "dumper", action_args,
+    results = parse_dumper_events(
+        etl_path=etl_path,
         symbol_path=symbol_path,
-        symbols=True,
+        cpu_filter=cpu_filter,
+        start_time=start_time,
+        end_time=end_time,
         timeout_seconds=timeout_seconds,
+        event_classes={"SampledProfile"},
     )
-
-    rows = []
-    for line in line_iter:
-        # Match: "         SampledProfile,  timestamp, ..."
-        if "SampledProfile," not in line or "SampledProfileNmi," in line:
-            continue
-
-        # Skip header lines
-        stripped = line.strip()
-        if stripped.startswith("SampledProfile,") and "TimeStamp" in stripped:
-            continue
-
-        parts = stripped.split(",")
-        if len(parts) < 8:
-            continue
-
-        try:
-            timestamp = int(parts[1].strip())
-            cpu = int(parts[5].strip())
-        except (ValueError, IndexError):
-            continue
-
-        # Apply CPU filter early to avoid building huge DataFrames
-        if cpu_filter is not None and cpu not in cpu_filter:
-            continue
-
-        # Parse process name and PID: "Process Name ( PID)"
-        proc_raw = parts[2].strip()
-        m = re.match(r"(.+?)\(\s*(\d+)\s*\)", proc_raw)
-        if m:
-            process_name = m.group(1).strip()
-            pid = int(m.group(2))
-        else:
-            process_name = proc_raw
-            pid = 0
-
-        # Parse Image!Function (field 7, 0-indexed)
-        img_func = parts[7].strip()
-        if "!" in img_func:
-            module, function = img_func.split("!", 1)
-            module = module.strip()
-            function = function.strip()
-        else:
-            module = img_func
-            function = "Unknown"
-
-        # Count field (field 8)
-        try:
-            count = int(parts[8].strip())
-        except (ValueError, IndexError):
-            count = 1
-
-        rows.append({
-            "TimeStamp": timestamp,
-            "Process Name": process_name,
-            "PID": pid,
-            "CPU": cpu,
-            "Module": module,
-            "Function": function,
-            "Weight": count,
-        })
-
-    return pd.DataFrame(rows)
+    return results.get("SampledProfile", pd.DataFrame())
 
 
 def _parse_pool(text: str) -> pd.DataFrame:

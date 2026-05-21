@@ -14,7 +14,7 @@ mcp = FastMCP(
         "get_lock_contention, get_network_hot_functions, get_network_dpcs, "
         "get_network_lock_contention, get_network_hot_stacks, "
         "get_rss_dispatch_quality, get_per_nic_queue_arrivals, "
-        "get_udp_dispatch_quality. "
+        "get_udp_dispatch_quality, get_network_wait_chain. "
         "Use trace_id explicitly for parallel trace analysis."
     ),
 )
