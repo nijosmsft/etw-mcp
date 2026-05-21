@@ -208,55 +208,81 @@ def _refresh_stack_cache_from_html(
         errors.append(f"stacks_callers: {e}")
 
 
+# Background-extracted dumper event classes. Each entry maps the canonical
+# event-class name (the key in :data:`parsing.wpa_exporter.EVENT_HANDLERS`)
+# to the (a) trace attribute that holds the DataFrame and (b) the parquet
+# filename stem used for cache rehydration. Adding a new event class is
+# done here, not in extraction code.
+#
+# Every parquet stem listed here MUST also appear in ``_PARQUET_EXCLUDED``
+# below so the glob-based ``_load_from_cache`` does not load it into
+# ``raw_csv`` (these DataFrames live on dedicated trace attributes).
+_DUMPER_EVENT_CLASSES: dict[str, tuple[str, str]] = {
+    "SampledProfile":   ("dumper_df",            "sampled_profile"),
+    "CSwitch":          ("cswitch_events_df",    "cswitch_events"),
+    "TcpIp/Recv":       ("tcpip_recv_df",        "tcpip_recv"),
+    "TcpIp/Send":       ("tcpip_send_df",        "tcpip_send"),
+    "TcpIp/Retransmit": ("tcpip_retransmit_df",  "tcpip_retransmit"),
+    "TcpIp/Connect":    ("tcpip_connect_df",     "tcpip_connect"),
+    "TcpIp/Accept":     ("tcpip_accept_df",      "tcpip_accept"),
+    "UdpIp/Recv":       ("udp_recv_df",          "udp_recv"),
+    "UdpIp/Send":       ("udp_send_df",          "udp_send"),
+}
+
+
 def _start_background_dumper(trace: TraceData) -> None:
-    """Start background extraction of dumper events (SampledProfile + CSwitch).
+    """Start background extraction of dumper events (single xperf pass).
 
     Runs ``xperf -a dumper`` once and dispatches each line to the appropriate
-    handler in :data:`parsing.wpa_exporter.EVENT_HANDLERS`. Two DataFrames are
-    populated together:
+    handler in :data:`parsing.wpa_exporter.EVENT_HANDLERS`. One DataFrame per
+    canonical event class listed in :data:`_DUMPER_EVENT_CLASSES` is populated
+    and cached to parquet.
 
-    - ``trace.dumper_df`` ← SampledProfile
-    - ``trace.cswitch_events_df`` ← CSwitch
+    Cache policy: if every parquet already exists, the trace is fully
+    rehydrated synchronously (fast path). Otherwise a background thread is
+    launched that extracts *only the missing classes* — already-cached
+    classes are not re-extracted.
 
-    Both are cached to parquet under the trace's export directory. If both
-    parquets already exist they are loaded synchronously (fast path). If
-    only one exists, a background extraction is kicked off to fill in the
-    missing piece.
+    Trace attributes touched (currently):
+      - ``dumper_df`` ← SampledProfile
+      - ``cswitch_events_df`` ← CSwitch
+      - ``tcpip_recv_df`` / ``tcpip_send_df`` / ``tcpip_retransmit_df``
+      - ``tcpip_connect_df`` / ``tcpip_accept_df``
+      - ``udp_recv_df`` / ``udp_send_df``
+
+    The mapping is data-driven via :data:`_DUMPER_EVENT_CLASSES`; this
+    function stays generic.
     """
     import threading
 
-    sampled_parquet = trace.export_dir / "sampled_profile.parquet"
-    cswitch_parquet = trace.export_dir / "cswitch_events.parquet"
+    def _parquet_for(stem: str) -> Path:
+        return trace.export_dir / f"{stem}.parquet"
 
     with trace.lock:
-        if (
-            trace.dumper_df is not None
-            and trace.cswitch_events_df is not None
-        ) or trace._dumper_future is not None:
+        # Already fully populated, or a background thread is already running.
+        all_loaded = all(
+            getattr(trace, attr) is not None
+            for attr, _ in _DUMPER_EVENT_CLASSES.values()
+        )
+        if all_loaded or trace._dumper_future is not None:
             return
 
-        # Fast path: rehydrate from parquet cache. Mirrors the SampledProfile
-        # cache check that pre-dated the CSwitch addition. Phase 0.4's
-        # glob-based ``_load_from_cache`` deliberately excludes both files
-        # (see ``_PARQUET_EXCLUDED``) because they live on dedicated trace
-        # attributes, not in ``raw_csv``.
-        loaded_sampled = False
-        loaded_cswitch = False
-        if sampled_parquet.exists():
-            try:
-                trace.dumper_df = pd.read_parquet(sampled_parquet)
-                loaded_sampled = True
-            except Exception:
-                pass
-        if cswitch_parquet.exists():
-            try:
-                trace.cswitch_events_df = pd.read_parquet(cswitch_parquet)
-                loaded_cswitch = True
-            except Exception:
-                pass
+        # Fast path: rehydrate any class whose parquet is already on disk.
+        # Glob-based ``_load_from_cache`` excludes these stems so they don't
+        # leak into ``raw_csv``.
+        for canonical, (attr, stem) in _DUMPER_EVENT_CLASSES.items():
+            parquet = _parquet_for(stem)
+            if getattr(trace, attr) is None and parquet.exists():
+                try:
+                    setattr(trace, attr, pd.read_parquet(parquet))
+                except Exception:
+                    pass
 
-        # If both caches loaded, we're done.
-        if loaded_sampled and loaded_cswitch:
+        # If everything is cached now, signal ready and return.
+        if all(
+            getattr(trace, attr) is not None
+            for attr, _ in _DUMPER_EVENT_CLASSES.values()
+        ):
             trace._dumper_ready.set()
             return
 
@@ -264,14 +290,13 @@ def _start_background_dumper(trace: TraceData) -> None:
         try:
             from etw_analyzer.parsing.wpa_exporter import parse_dumper_events
 
-            # Only re-extract classes that weren't cached. parse_dumper_events
-            # is keyed on event_classes, so skipping one halves the post-
-            # processing for that class.
-            wanted: set[str] = set()
-            if trace.dumper_df is None:
-                wanted.add("SampledProfile")
-            if trace.cswitch_events_df is None:
-                wanted.add("CSwitch")
+            # Only re-extract classes that weren't cached. A single xperf
+            # pass services all of them.
+            wanted: set[str] = {
+                canonical
+                for canonical, (attr, _) in _DUMPER_EVENT_CLASSES.items()
+                if getattr(trace, attr) is None
+            }
 
             if not wanted:
                 return
@@ -286,18 +311,19 @@ def _start_background_dumper(trace: TraceData) -> None:
                 event_classes=wanted,
             )
             with trace.lock:
-                if "SampledProfile" in results:
-                    df = results["SampledProfile"]
-                    trace.dumper_df = df
+                for canonical, (attr, stem) in _DUMPER_EVENT_CLASSES.items():
+                    if canonical not in results:
+                        continue
+                    df = results[canonical]
+                    setattr(trace, attr, df)
                     if not df.empty:
                         trace.export_dir.mkdir(parents=True, exist_ok=True)
-                        df.to_parquet(sampled_parquet, index=False)
-                if "CSwitch" in results:
-                    cs_df = results["CSwitch"]
-                    trace.cswitch_events_df = cs_df
-                    if not cs_df.empty:
-                        trace.export_dir.mkdir(parents=True, exist_ok=True)
-                        cs_df.to_parquet(cswitch_parquet, index=False)
+                        try:
+                            df.to_parquet(_parquet_for(stem), index=False)
+                        except Exception:
+                            # Non-fatal: keep the in-memory DataFrame even if
+                            # we can't persist (e.g. disk full, readonly).
+                            pass
         except Exception as e:
             with trace.lock:
                 trace._dumper_error = str(e)
@@ -306,9 +332,11 @@ def _start_background_dumper(trace: TraceData) -> None:
 
     thread = threading.Thread(target=_extract, daemon=True, name="dumper-extract")
     with trace.lock:
-        if (
-            trace.dumper_df is not None
-            and trace.cswitch_events_df is not None
+        # Re-check after thread construction — another caller may have
+        # raced us in.
+        if all(
+            getattr(trace, attr) is not None
+            for attr, _ in _DUMPER_EVENT_CLASSES.values()
         ) or trace._dumper_future is not None:
             return
         trace._dumper_future = thread
@@ -346,6 +374,15 @@ def _load_file(file_path: Path) -> pd.DataFrame:
 _PARQUET_EXCLUDED = frozenset({
     "sampled_profile",   # Loaded into trace.dumper_df by _start_background_dumper
     "cswitch_events",    # Loaded into trace.cswitch_events_df by _start_background_dumper
+    # Phase 3a networking event-class parquets. Loaded into dedicated
+    # trace attributes (tcpip_recv_df, ...) by _start_background_dumper.
+    "tcpip_recv",
+    "tcpip_send",
+    "tcpip_retransmit",
+    "tcpip_connect",
+    "tcpip_accept",
+    "udp_recv",
+    "udp_send",
 })
 
 # Datasets that MUST be present (and load successfully) for the cache to be

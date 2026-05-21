@@ -34,6 +34,21 @@ class TraceData:
     # extraction completes (use ``wait_for_dumper`` to block).
     cswitch_events_df: pd.DataFrame | None = None
 
+    # Phase 3a: per-event-class networking DataFrames populated by the same
+    # background dumper extraction. Schema notes in
+    # :mod:`parsing.wpa_exporter` (search for "Phase 3a"). All are ``None``
+    # until extraction completes; an empty DataFrame means extraction ran
+    # but the trace had no events of that class (likely because the trace
+    # was not collected with the TCPIP/UDP providers — see
+    # ``udp-perf/scripts/networking.wprp``).
+    tcpip_recv_df: pd.DataFrame | None = None
+    tcpip_send_df: pd.DataFrame | None = None
+    tcpip_retransmit_df: pd.DataFrame | None = None
+    tcpip_connect_df: pd.DataFrame | None = None
+    tcpip_accept_df: pd.DataFrame | None = None
+    udp_recv_df: pd.DataFrame | None = None
+    udp_send_df: pd.DataFrame | None = None
+
     # Background extraction state
     _dumper_future: threading.Thread | None = field(default=None, repr=False)
     _dumper_ready: threading.Event = field(default_factory=threading.Event, repr=False)

@@ -20,6 +20,7 @@ import etw_analyzer.tools.summary  # noqa: F401, E402
 import etw_analyzer.tools.network_lenses  # noqa: F401, E402
 import etw_analyzer.tools.network_dispatch  # noqa: F401, E402
 import etw_analyzer.tools.network_wait_chain  # noqa: F401, E402
+import etw_analyzer.tools.network_events  # noqa: F401, E402
 
 
 def main():

@@ -895,13 +895,333 @@ def _handle_cswitch(parts: list[str], **_kwargs) -> dict | None:
     }
 
 
-# Dispatch table — Phase 3 will extend this with TCPIP/UDP/AFD handlers.
-# Each entry maps an event-class prefix (the first comma-separated token on
-# a dumper line) to a handler returning a row dict, or None to skip the row.
+# ---------------------------------------------------------------------------
+# TCPIP / UDP handlers — Phase 3a
+# ---------------------------------------------------------------------------
+#
+# xperf's dumper format for kernel TcpIp/UdpIp events is not well documented.
+# What we know from the MOF schemas (Microsoft-Windows-Kernel-Network /
+# Microsoft-Windows-TCPIP) — see TcpIp_TypeGroup1 / UdpIp_TypeGroup1 /
+# TcpIp_TypeGroup2 docs:
+#
+#   TcpIp_TypeGroup1 (Recv, Retransmit, Disconnect):
+#     PID, size, daddr, saddr, dport, sport, seqnum, connid
+#   TcpIp_TypeGroup2 (Connect, Accept):
+#     PID, size, daddr, saddr, dport, sport, mss, sackopt, tsopt, wsopt,
+#     rcvwin, rcvwinscale, sndwinscale, seqnum, connid
+#   UdpIp_TypeGroup1 (Send, Recv):
+#     PID, size, daddr, saddr, dport, sport, seqnum, connid
+#
+# xperf's dumper prepends its standard event header to every line: event
+# name, TimeStamp, Process Name (PID), ThreadID, CPU. After that the
+# event-specific fields appear in MOF-defined order.
+#
+# Our handlers parse by *position* (best-effort) but are defensive:
+#   - Return None on any parse failure rather than crashing
+#   - Tolerate variable column counts (older builds, IPv6 variants)
+#   - Accept addresses as opaque strings (xperf renders dotted-quad/IPv6
+#     literals)
+#
+# The exact column count for each event class will need to be validated
+# against a real .wprp-collected trace. Until then, treat this code as
+# best-effort and prefer skipping malformed rows over guessing.
+
+# Layout assumption shared by every TCPIP/UDP handler. The first 5 columns
+# come from xperf's standard event header (event name, TimeStamp,
+# Process Name ( PID), ThreadID, CPU); the remainder are event-specific.
+_TCPIP_HEADER_COLS = 5  # event_name, TimeStamp, Process(PID), ThreadID, CPU
+
+
+def _parse_int_or_none(value: str) -> int | None:
+    """Parse an integer, returning None on failure."""
+    value = value.strip()
+    if not value:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return None
+
+
+def _parse_tcpip_header(parts: list[str]) -> dict | None:
+    """Parse the leading 5-column header common to every TCPIP/UDP dumper line.
+
+    Layout (best-effort; will need validation against a real trace):
+        0: event name (e.g. "TcpIp/Recv" or "TcpIp_Recv")
+        1: TimeStamp (uint)
+        2: "Process Name ( PID)"
+        3: ThreadID (uint, may be -1 if not attributable)
+        4: CPU (uint)
+
+    Returns dict with TimeStamp/Process Name/PID/ThreadID/CPU, or None on
+    parse failure.
+    """
+    if len(parts) < _TCPIP_HEADER_COLS:
+        return None
+    timestamp = _parse_int_or_none(parts[1])
+    if timestamp is None:
+        return None
+    process_name, pid = _parse_proc_field(parts[2])
+    tid = _parse_int_or_none(parts[3])
+    cpu = _parse_int_or_none(parts[4])
+    return {
+        "TimeStamp": timestamp,
+        "Process Name": process_name,
+        "PID": pid,
+        "ThreadID": tid if tid is not None else -1,
+        "CPU": cpu if cpu is not None else -1,
+    }
+
+
+def _handle_tcpip_recv_or_send(parts: list[str], **_kwargs) -> dict | None:
+    """Handler for TcpIp/Recv and TcpIp/Send dumper lines.
+
+    Best-effort layout (MOF TcpIp_TypeGroup1, prefixed with xperf header):
+
+        0: event name (TcpIp/Recv | TcpIp_Recv | TcpIp/Send | TcpIp_Send)
+        1: TimeStamp
+        2: Process Name ( PID)
+        3: ThreadID
+        4: CPU
+        5: size           (uint32)
+        6: daddr          (IPv4/IPv6 string)
+        7: saddr          (IPv4/IPv6 string)
+        8: dport          (uint16)
+        9: sport          (uint16)
+        10: seqnum        (uint32)
+        11: connid        (uint32, optional)
+
+    The Phase 3 plan column schema asks for: TimeStamp, Process Name, PID,
+    ThreadID, CPU, LocalAddr, LocalPort, RemoteAddr, RemotePort, Size, SeqNo.
+    For Recv: source = remote, dest = local. For Send: source = local,
+    dest = remote.
+
+    Returns None if the header doesn't parse. Missing event-specific fields
+    are filled with sensible defaults so downstream code can rely on the
+    schema.
+    """
+    header = _parse_tcpip_header(parts)
+    if header is None:
+        return None
+
+    event_name = parts[0].strip()
+    is_recv = "recv" in event_name.lower() or "receive" in event_name.lower()
+
+    size = _parse_int_or_none(parts[5]) if len(parts) > 5 else None
+    daddr = parts[6].strip() if len(parts) > 6 else ""
+    saddr = parts[7].strip() if len(parts) > 7 else ""
+    dport = _parse_int_or_none(parts[8]) if len(parts) > 8 else None
+    sport = _parse_int_or_none(parts[9]) if len(parts) > 9 else None
+    seqnum = _parse_int_or_none(parts[10]) if len(parts) > 10 else None
+    connid = _parse_int_or_none(parts[11]) if len(parts) > 11 else None
+
+    # On Recv: daddr/dport = local (our side), saddr/sport = remote.
+    # On Send: daddr/dport = remote, saddr/sport = local.
+    if is_recv:
+        local_addr, local_port = daddr, dport
+        remote_addr, remote_port = saddr, sport
+    else:
+        local_addr, local_port = saddr, sport
+        remote_addr, remote_port = daddr, dport
+
+    return {
+        **header,
+        "LocalAddr": local_addr,
+        "LocalPort": local_port if local_port is not None else 0,
+        "RemoteAddr": remote_addr,
+        "RemotePort": remote_port if remote_port is not None else 0,
+        "Size": size if size is not None else 0,
+        "SeqNo": seqnum if seqnum is not None else 0,
+        "ConnId": connid if connid is not None else 0,
+    }
+
+
+def _handle_tcpip_retransmit(parts: list[str], **_kwargs) -> dict | None:
+    """Handler for TcpIp/Retransmit dumper lines.
+
+    Best-effort layout (MOF TcpIp_TypeGroup1):
+
+        Same as recv/send + an optional ``RetransmitCount`` field that some
+        xperf builds emit after the connid column. If absent we treat each
+        retransmit event as a single retransmission (count = 1) — the
+        per-connection aggregator sums these.
+
+    Treated as send-direction (local → remote) for the addr columns.
+    """
+    base = _handle_tcpip_recv_or_send(parts, **_kwargs)
+    if base is None:
+        return None
+
+    # Retransmit fields beyond the standard tuple are inconsistent across
+    # builds. If a 12th field is present and integer-ish, treat it as the
+    # retransmit count.
+    rtx_count = 1
+    if len(parts) > 12:
+        parsed = _parse_int_or_none(parts[12])
+        if parsed is not None and parsed > 0:
+            rtx_count = parsed
+
+    base["RetransmitCount"] = rtx_count
+    return base
+
+
+def _handle_tcpip_connect_or_accept(parts: list[str], **_kwargs) -> dict | None:
+    """Handler for TcpIp/Connect and TcpIp/Accept dumper lines.
+
+    Best-effort layout (MOF TcpIp_TypeGroup2). The schema is wider than
+    TypeGroup1 because it includes handshake-establishment options. xperf
+    typically emits:
+
+        0-4: event header (name, TimeStamp, Process(PID), ThreadID, CPU)
+        5:   size
+        6:   daddr
+        7:   saddr
+        8:   dport
+        9:   sport
+        10:  mss          (handshake)
+        11:  sackopt
+        12:  tsopt
+        13:  wsopt
+        14:  rcvwin
+        15:  rcvwinscale
+        16:  sndwinscale
+        17:  seqnum
+        18:  connid
+
+    Accept = inbound (our side is the destination = local).
+    Connect = outbound (our side is the source = local).
+    """
+    header = _parse_tcpip_header(parts)
+    if header is None:
+        return None
+
+    event_name = parts[0].strip()
+    is_accept = "accept" in event_name.lower()
+
+    size = _parse_int_or_none(parts[5]) if len(parts) > 5 else None
+    daddr = parts[6].strip() if len(parts) > 6 else ""
+    saddr = parts[7].strip() if len(parts) > 7 else ""
+    dport = _parse_int_or_none(parts[8]) if len(parts) > 8 else None
+    sport = _parse_int_or_none(parts[9]) if len(parts) > 9 else None
+    mss = _parse_int_or_none(parts[10]) if len(parts) > 10 else None
+    rcvwin = _parse_int_or_none(parts[14]) if len(parts) > 14 else None
+    seqnum = _parse_int_or_none(parts[17]) if len(parts) > 17 else None
+    connid = _parse_int_or_none(parts[18]) if len(parts) > 18 else None
+
+    if is_accept:
+        local_addr, local_port = daddr, dport
+        remote_addr, remote_port = saddr, sport
+    else:
+        local_addr, local_port = saddr, sport
+        remote_addr, remote_port = daddr, dport
+
+    return {
+        **header,
+        "LocalAddr": local_addr,
+        "LocalPort": local_port if local_port is not None else 0,
+        "RemoteAddr": remote_addr,
+        "RemotePort": remote_port if remote_port is not None else 0,
+        "Size": size if size is not None else 0,
+        "MSS": mss if mss is not None else 0,
+        "RcvWin": rcvwin if rcvwin is not None else 0,
+        "SeqNo": seqnum if seqnum is not None else 0,
+        "ConnId": connid if connid is not None else 0,
+    }
+
+
+def _handle_udp_recv_or_send(parts: list[str], **_kwargs) -> dict | None:
+    """Handler for UdpIp/Recv and UdpIp/Send dumper lines.
+
+    Best-effort layout (MOF UdpIp_TypeGroup1) — identical to TcpIp_TypeGroup1
+    minus the seqnum/connid (UDP has no sequence numbers semantically, but
+    the MOF still defines fields for them; we accept any value).
+
+        0-4: header
+        5:   size
+        6:   daddr
+        7:   saddr
+        8:   dport
+        9:   sport
+        10:  seqnum (may be 0 — UDP has no real sequence)
+        11:  connid (may be 0)
+
+    Recv: dest = local. Send: source = local.
+    """
+    header = _parse_tcpip_header(parts)
+    if header is None:
+        return None
+
+    event_name = parts[0].strip()
+    is_recv = "recv" in event_name.lower() or "receive" in event_name.lower()
+
+    size = _parse_int_or_none(parts[5]) if len(parts) > 5 else None
+    daddr = parts[6].strip() if len(parts) > 6 else ""
+    saddr = parts[7].strip() if len(parts) > 7 else ""
+    dport = _parse_int_or_none(parts[8]) if len(parts) > 8 else None
+    sport = _parse_int_or_none(parts[9]) if len(parts) > 9 else None
+
+    if is_recv:
+        local_addr, local_port = daddr, dport
+        remote_addr, remote_port = saddr, sport
+    else:
+        local_addr, local_port = saddr, sport
+        remote_addr, remote_port = daddr, dport
+
+    return {
+        **header,
+        "LocalAddr": local_addr,
+        "LocalPort": local_port if local_port is not None else 0,
+        "RemoteAddr": remote_addr,
+        "RemotePort": remote_port if remote_port is not None else 0,
+        "Size": size if size is not None else 0,
+    }
+
+
+# Dispatch table. Each entry maps a *canonical* event-class name to a
+# handler. The canonical name is what callers pass in ``event_classes``,
+# what gets used as a DataFrame key, and what the cache parquet stem is
+# derived from in :func:`tools.trace_mgmt._start_background_dumper`.
+#
+# The canonical names use the slash form (e.g. "TcpIp/Recv"). Real xperf
+# dumper output may emit either slash or underscore separators (e.g.
+# "TcpIp_Recv" or "TcpIpRecv"). The prefix set used at parse time is
+# defined separately in :data:`_EVENT_PREFIX_ALIASES` so the dispatch
+# tolerates all observed forms.
 EVENT_HANDLERS = {
     "SampledProfile": _handle_sampled_profile,
     "CSwitch": _handle_cswitch,
+    "TcpIp/Recv": _handle_tcpip_recv_or_send,
+    "TcpIp/Send": _handle_tcpip_recv_or_send,
+    "TcpIp/Retransmit": _handle_tcpip_retransmit,
+    "TcpIp/Connect": _handle_tcpip_connect_or_accept,
+    "TcpIp/Accept": _handle_tcpip_connect_or_accept,
+    "UdpIp/Recv": _handle_udp_recv_or_send,
+    "UdpIp/Send": _handle_udp_recv_or_send,
 }
+
+
+def _alias_set(*aliases: str) -> frozenset[str]:
+    return frozenset(aliases)
+
+
+# Map canonical class name → set of dumper line prefixes that should
+# dispatch to it. Built conservatively from observed xperf behavior:
+# slash form, underscore form, and squashed form (e.g. "TcpIpRecv"). Keep
+# this in sync with EVENT_HANDLERS — every canonical class needs an entry.
+_EVENT_PREFIX_ALIASES: dict[str, frozenset[str]] = {
+    "SampledProfile":   _alias_set("SampledProfile"),
+    "CSwitch":          _alias_set("CSwitch"),
+    "TcpIp/Recv":       _alias_set("TcpIp/Recv", "TcpIp_Recv", "TcpIpRecv"),
+    "TcpIp/Send":       _alias_set("TcpIp/Send", "TcpIp_Send", "TcpIpSend"),
+    "TcpIp/Retransmit": _alias_set(
+        "TcpIp/Retransmit", "TcpIp_Retransmit", "TcpIpRetransmit"
+    ),
+    "TcpIp/Connect":    _alias_set("TcpIp/Connect", "TcpIp_Connect", "TcpIpConnect"),
+    "TcpIp/Accept":     _alias_set("TcpIp/Accept", "TcpIp_Accept", "TcpIpAccept"),
+    "UdpIp/Recv":       _alias_set("UdpIp/Recv", "UdpIp_Recv", "UdpIpRecv"),
+    "UdpIp/Send":       _alias_set("UdpIp/Send", "UdpIp_Send", "UdpIpSend"),
+}
+
 
 # Event names we explicitly want to ignore (similar prefix to wanted classes).
 _EVENT_SKIP_PREFIXES = frozenset({
@@ -963,9 +1283,16 @@ def parse_dumper_events(
         t2 = int((end_time or 999999) * 1_000_000)
         action_args.extend(["-range", str(t1), str(t2)])
 
-    # Cheap line prefilter to avoid splitting every line. Build a tuple of
-    # "<class>," — fast `startswith` check after stripping.
-    wanted_prefixes = tuple(f"{name}," for name in active_handlers)
+    # Cheap line prefilter to avoid splitting every line. For each active
+    # handler, expand its canonical name into the set of accepted dumper
+    # prefixes (see ``_EVENT_PREFIX_ALIASES``) — xperf may emit any of:
+    # "TcpIp/Recv,", "TcpIp_Recv,", "TcpIpRecv,". Build a flat
+    # (prefix → canonical name) list so the per-line scan is one pass.
+    prefix_to_canonical: list[tuple[str, str]] = []
+    for canonical in active_handlers:
+        aliases = _EVENT_PREFIX_ALIASES.get(canonical, frozenset({canonical}))
+        for alias in aliases:
+            prefix_to_canonical.append((f"{alias},", canonical))
     skip_prefixes = tuple(f"{name}," for name in _EVENT_SKIP_PREFIXES)
 
     line_iter = _run_xperf_lines(
@@ -988,12 +1315,12 @@ def parse_dumper_events(
         if stripped.startswith(skip_prefixes):
             continue
 
-        # Find the matching class prefix. tuple-startswith is O(prefixes)
-        # but our prefix list is tiny (2-10 entries).
+        # Find the matching class prefix. List scan is O(prefixes) but our
+        # prefix list is small (single-digit canonical classes × ~3 aliases).
         matched = None
-        for prefix, name in zip(wanted_prefixes, active_handlers.keys()):
+        for prefix, canonical in prefix_to_canonical:
             if stripped.startswith(prefix):
-                matched = name
+                matched = canonical
                 break
         if matched is None:
             continue
