@@ -11,6 +11,8 @@ mcp = FastMCP(
         "Available analysis: get_cpu_samples, get_hot_functions, get_hot_stacks, "
         "get_function_callers, walk_stack, count_stacks, butterfly_chain, "
         "get_dpc_summary, get_dpc_per_cpu, get_per_cpu_summary, get_cpu_timeline, "
-        "get_lock_contention. Use trace_id explicitly for parallel trace analysis."
+        "get_lock_contention, get_network_hot_functions, get_network_dpcs, "
+        "get_network_lock_contention, get_network_hot_stacks. "
+        "Use trace_id explicitly for parallel trace analysis."
     ),
 )

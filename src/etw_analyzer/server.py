@@ -17,6 +17,7 @@ import etw_analyzer.tools.memory  # noqa: F401, E402
 import etw_analyzer.tools.system_info  # noqa: F401, E402
 import etw_analyzer.tools.compare  # noqa: F401, E402
 import etw_analyzer.tools.summary  # noqa: F401, E402
+import etw_analyzer.tools.network_lenses  # noqa: F401, E402
 
 
 def main():
