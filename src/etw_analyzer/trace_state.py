@@ -68,6 +68,26 @@ class TraceData:
     # provider (see ``udp-perf/scripts/networking.wprp``).
     packet_capture_df: pd.DataFrame | None = None
 
+    # Phase 5: HTTP.sys request-lifecycle events
+    # (``Microsoft-Windows-HttpService``). One row per opcode. Schemas are
+    # speculative until validated against a real trace — see the
+    # ``_handle_http_*`` handlers in :mod:`parsing.wpa_exporter`. Empty
+    # when the trace was collected without the HttpService provider.
+    http_recv_df: pd.DataFrame | None = None
+    http_deliver_df: pd.DataFrame | None = None
+    http_send_df: pd.DataFrame | None = None
+    http_close_df: pd.DataFrame | None = None
+
+    # Phase 5: MsQuic connection-state events (``Microsoft-Quic``). Same
+    # caveats as the HTTP.sys DataFrames above. Schemas align with the
+    # ``_handle_quic_*`` handlers; empty when the MsQuic provider was not
+    # enabled at capture time.
+    quic_conn_created_df: pd.DataFrame | None = None
+    quic_conn_closed_df: pd.DataFrame | None = None
+    quic_packet_recv_df: pd.DataFrame | None = None
+    quic_packet_send_df: pd.DataFrame | None = None
+    quic_ack_recv_df: pd.DataFrame | None = None
+
     # Background extraction state
     _dumper_future: threading.Thread | None = field(default=None, repr=False)
     _dumper_ready: threading.Event = field(default_factory=threading.Event, repr=False)

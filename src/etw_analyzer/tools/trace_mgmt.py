@@ -236,6 +236,17 @@ _DUMPER_EVENT_CLASSES: dict[str, tuple[str, str]] = {
     "NdisDrop":         ("ndis_drops_df",        "ndis_drops"),
     # Phase 4: NDIS PacketCapture (decoded packet bytes).
     "NdisPacketCapture": ("packet_capture_df",   "packet_capture"),
+    # Phase 5: HTTP.sys request lifecycle.
+    "HttpService/Recv":    ("http_recv_df",       "http_recv"),
+    "HttpService/Deliver": ("http_deliver_df",    "http_deliver"),
+    "HttpService/Send":    ("http_send_df",       "http_send"),
+    "HttpService/Close":   ("http_close_df",      "http_close"),
+    # Phase 5: MsQuic connection state.
+    "Quic/ConnectionCreated": ("quic_conn_created_df", "quic_conn_created"),
+    "Quic/ConnectionClosed":  ("quic_conn_closed_df",  "quic_conn_closed"),
+    "Quic/PacketRecv":        ("quic_packet_recv_df",  "quic_packet_recv"),
+    "Quic/PacketSend":        ("quic_packet_send_df",  "quic_packet_send"),
+    "Quic/AckReceived":       ("quic_ack_recv_df",     "quic_ack_recv"),
 }
 
 
@@ -401,6 +412,17 @@ _PARQUET_EXCLUDED = frozenset({
     "ndis_drops",
     # Phase 4 packet-capture parquet — loaded into trace.packet_capture_df.
     "packet_capture",
+    # Phase 5 HTTP.sys parquets — loaded into trace.http_*_df.
+    "http_recv",
+    "http_deliver",
+    "http_send",
+    "http_close",
+    # Phase 5 MsQuic parquets — loaded into trace.quic_*_df.
+    "quic_conn_created",
+    "quic_conn_closed",
+    "quic_packet_recv",
+    "quic_packet_send",
+    "quic_ack_recv",
 })
 
 # Datasets that MUST be present (and load successfully) for the cache to be

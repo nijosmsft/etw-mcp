@@ -1442,6 +1442,251 @@ def _handle_ndis_packet_capture(parts: list[str], **_kwargs) -> dict | None:
     }
 
 
+# ---------------------------------------------------------------------------
+# HTTP.sys handlers — Phase 5
+# ---------------------------------------------------------------------------
+#
+# The ``Microsoft-Windows-HttpService`` provider records the HTTP request
+# lifecycle inside http.sys: request received off the wire, delivered to a
+# URL group / worker process, response sent, connection closed. Exact field
+# layouts emitted by xperf's dumper for this provider are not publicly
+# documented — different Windows builds have different manifest versions.
+#
+# Working assumption (best-guess from the manifest field order, with the
+# standard xperf 5-column event header prepended):
+#
+#   HttpService/Recv (a.k.a. RecvRequest):
+#       0: event name
+#       1: TimeStamp
+#       2: Process Name ( PID)
+#       3: ThreadID
+#       4: CPU
+#       5: RequestId (uint64, may be hex)
+#       6: ConnectionId (uint64, may be hex)
+#       7: Verb (string, e.g. GET, POST)
+#       8: Url (string, may contain commas — handled by reassembling tail)
+#
+#   HttpService/Deliver (a.k.a. DeliverRequest):
+#       5: RequestId
+#       6: UrlGroupId (uint64, may be hex)
+#
+#   HttpService/Send (a.k.a. SendResponse / FastResponse):
+#       5: RequestId
+#       6: StatusCode (uint16)
+#       7: ContentLength (uint, may be 0 or -1 for chunked)
+#
+#   HttpService/Close (a.k.a. CloseRequest):
+#       5: RequestId
+#
+# All handlers are defensive — they return None when the leading header
+# fails to parse, and fall back to 0 / "" for missing tail columns rather
+# than crashing.
+
+
+def _parse_handle_or_id(value: str) -> int:
+    """Parse a RequestId / ConnectionId / UrlGroupId column.
+
+    Real http.sys IDs are 64-bit pointer-sized handles. xperf may emit them
+    as decimal, ``0x``-prefixed hex, or bare-hex strings. Returns 0 on
+    failure so groupby keys still work (collapsing parse failures into a
+    single bucket is preferable to throwing).
+    """
+    value = value.strip().strip('"')
+    if not value:
+        return 0
+    try:
+        if value.lower().startswith("0x"):
+            return int(value, 16)
+        return int(value)
+    except ValueError:
+        try:
+            return int(value, 16)
+        except ValueError:
+            return 0
+
+
+def _handle_http_recv(parts: list[str], **_kwargs) -> dict | None:
+    """Handler for HttpService/Recv (request received off the wire)."""
+    header = _parse_tcpip_header(parts)
+    if header is None:
+        return None
+
+    request_id = _parse_handle_or_id(parts[5]) if len(parts) > 5 else 0
+    connection_id = _parse_handle_or_id(parts[6]) if len(parts) > 6 else 0
+    verb = parts[7].strip().strip('"') if len(parts) > 7 else ""
+    # URL may legitimately contain commas — reassemble any tail columns.
+    if len(parts) > 8:
+        url = ",".join(parts[8:]).strip().strip('"')
+    else:
+        url = ""
+
+    return {
+        **header,
+        "RequestId": request_id,
+        "ConnectionId": connection_id,
+        "Verb": verb,
+        "Url": url,
+    }
+
+
+def _handle_http_deliver(parts: list[str], **_kwargs) -> dict | None:
+    """Handler for HttpService/Deliver (request handed off to URL group)."""
+    header = _parse_tcpip_header(parts)
+    if header is None:
+        return None
+
+    request_id = _parse_handle_or_id(parts[5]) if len(parts) > 5 else 0
+    url_group_id = _parse_handle_or_id(parts[6]) if len(parts) > 6 else 0
+
+    return {
+        **header,
+        "RequestId": request_id,
+        "UrlGroupId": url_group_id,
+    }
+
+
+def _handle_http_send(parts: list[str], **_kwargs) -> dict | None:
+    """Handler for HttpService/Send (response sent)."""
+    header = _parse_tcpip_header(parts)
+    if header is None:
+        return None
+
+    request_id = _parse_handle_or_id(parts[5]) if len(parts) > 5 else 0
+    status = _parse_int_or_none(parts[6]) if len(parts) > 6 else None
+    content_len = _parse_int_or_none(parts[7]) if len(parts) > 7 else None
+
+    return {
+        **header,
+        "RequestId": request_id,
+        "StatusCode": status if status is not None else 0,
+        "ContentLength": content_len if content_len is not None else 0,
+    }
+
+
+def _handle_http_close(parts: list[str], **_kwargs) -> dict | None:
+    """Handler for HttpService/Close (request lifecycle done)."""
+    header = _parse_tcpip_header(parts)
+    if header is None:
+        return None
+
+    request_id = _parse_handle_or_id(parts[5]) if len(parts) > 5 else 0
+    return {
+        **header,
+        "RequestId": request_id,
+    }
+
+
+# ---------------------------------------------------------------------------
+# MsQuic handlers — Phase 5
+# ---------------------------------------------------------------------------
+#
+# The ``Microsoft-Quic`` provider (GUID ff15e657-4f26-570e-88ab-0796b258d11c)
+# emits hundreds of fine-grained opcodes for connection/stream/packet
+# events. We only need to cover five canonical classes for the Phase 5
+# tools: ConnectionCreated, ConnectionClosed, PacketRecv, PacketSend,
+# AckReceived. The MsQuic manifest is manifest-driven and field layouts
+# have changed across versions; everything below is best-effort.
+#
+# Working assumption (after the xperf 5-column event header):
+#
+#   Quic/ConnectionCreated:
+#       5: ConnectionId (uint64 pointer or correlation id)
+#       6: CID          (hex string, MsQuic Connection ID; opaque token used
+#                        for CPU steering / cpuredirect)
+#       7: LocalAddr
+#       8: RemoteAddr
+#
+#   Quic/ConnectionClosed:
+#       5: ConnectionId
+#
+#   Quic/PacketRecv, Quic/PacketSend:
+#       5: ConnectionId
+#       6: PacketNumber
+#       7: Size
+#
+#   Quic/AckReceived:
+#       5: ConnectionId
+#       6: AckDelay (microseconds)
+#       7: LargestAcknowledged
+#
+# MsQuic's xperf event names may use any of the following forms across
+# builds: ``Quic/ConnectionCreated``, ``Quic_ConnectionCreated``,
+# ``QuicConnectionCreated``, ``MsQuic/Connection``, or numeric opcode-only
+# names (e.g. ``QuicEvent_0042``). The _EVENT_PREFIX_ALIASES table covers
+# the slash / underscore / squashed variants explicitly; numeric-only
+# opcode forms are not currently handled — the manifest would need to be
+# consulted to map them.
+
+
+def _handle_quic_conn_created(parts: list[str], **_kwargs) -> dict | None:
+    """Handler for Quic/ConnectionCreated dumper lines."""
+    header = _parse_tcpip_header(parts)
+    if header is None:
+        return None
+
+    conn_id = _parse_handle_or_id(parts[5]) if len(parts) > 5 else 0
+    cid = parts[6].strip().strip('"') if len(parts) > 6 else ""
+    local_addr = parts[7].strip().strip('"') if len(parts) > 7 else ""
+    remote_addr = parts[8].strip().strip('"') if len(parts) > 8 else ""
+
+    return {
+        **header,
+        "ConnectionId": conn_id,
+        "CID": cid,
+        "LocalAddr": local_addr,
+        "RemoteAddr": remote_addr,
+    }
+
+
+def _handle_quic_conn_closed(parts: list[str], **_kwargs) -> dict | None:
+    """Handler for Quic/ConnectionClosed dumper lines."""
+    header = _parse_tcpip_header(parts)
+    if header is None:
+        return None
+
+    conn_id = _parse_handle_or_id(parts[5]) if len(parts) > 5 else 0
+    return {
+        **header,
+        "ConnectionId": conn_id,
+    }
+
+
+def _handle_quic_packet(parts: list[str], **_kwargs) -> dict | None:
+    """Handler for Quic/PacketRecv and Quic/PacketSend dumper lines."""
+    header = _parse_tcpip_header(parts)
+    if header is None:
+        return None
+
+    conn_id = _parse_handle_or_id(parts[5]) if len(parts) > 5 else 0
+    packet_number = _parse_int_or_none(parts[6]) if len(parts) > 6 else None
+    size = _parse_int_or_none(parts[7]) if len(parts) > 7 else None
+
+    return {
+        **header,
+        "ConnectionId": conn_id,
+        "PacketNumber": packet_number if packet_number is not None else 0,
+        "Size": size if size is not None else 0,
+    }
+
+
+def _handle_quic_ack(parts: list[str], **_kwargs) -> dict | None:
+    """Handler for Quic/AckReceived dumper lines."""
+    header = _parse_tcpip_header(parts)
+    if header is None:
+        return None
+
+    conn_id = _parse_handle_or_id(parts[5]) if len(parts) > 5 else 0
+    ack_delay = _parse_int_or_none(parts[6]) if len(parts) > 6 else None
+    largest_ack = _parse_int_or_none(parts[7]) if len(parts) > 7 else None
+
+    return {
+        **header,
+        "ConnectionId": conn_id,
+        "AckDelay": ack_delay if ack_delay is not None else 0,
+        "LargestAcknowledged": largest_ack if largest_ack is not None else 0,
+    }
+
+
 def _handle_udp_recv_or_send(parts: list[str], **_kwargs) -> dict | None:
     """Handler for UdpIp/Recv and UdpIp/Send dumper lines.
 
@@ -1521,6 +1766,17 @@ EVENT_HANDLERS = {
     # Send events — the handler discriminates direction from the
     # event-name suffix and emits a ``Direction`` column.
     "NdisPacketCapture": _handle_ndis_packet_capture,
+    # Phase 5: HTTP.sys request lifecycle (Microsoft-Windows-HttpService).
+    "HttpService/Recv":    _handle_http_recv,
+    "HttpService/Deliver": _handle_http_deliver,
+    "HttpService/Send":    _handle_http_send,
+    "HttpService/Close":   _handle_http_close,
+    # Phase 5: MsQuic connection state (Microsoft-Quic).
+    "Quic/ConnectionCreated": _handle_quic_conn_created,
+    "Quic/ConnectionClosed":  _handle_quic_conn_closed,
+    "Quic/PacketRecv":        _handle_quic_packet,
+    "Quic/PacketSend":        _handle_quic_packet,
+    "Quic/AckReceived":       _handle_quic_ack,
 }
 
 
@@ -1570,6 +1826,69 @@ _EVENT_PREFIX_ALIASES: dict[str, frozenset[str]] = {
         "Ndis/PacketCapture/Send", "NDIS-PacketCapture/Send",
         "PacketCapture/Send", "PacketCapture_Send", "PacketCaptureSend",
         "PktMon/Send", "PktMonSend",
+    ),
+    # Phase 5: HTTP.sys (Microsoft-Windows-HttpService). xperf labels are
+    # not consistent across builds — different opcode names appear depending
+    # on manifest version. Cover the common slash / underscore / squashed
+    # forms plus the legacy "HTTPRequestTraceTask" prefix some builds emit.
+    "HttpService/Recv": _alias_set(
+        "HttpService/Recv", "HttpService_Recv", "HttpServiceRecv",
+        "HttpService/RecvRequest", "HttpService_RecvRequest",
+        "HTTPRequestTraceTask/RecvReq", "HTTPRequestTraceTask_RecvReq",
+        "Http/RecvRequest", "Http_RecvRequest",
+    ),
+    "HttpService/Deliver": _alias_set(
+        "HttpService/Deliver", "HttpService_Deliver", "HttpServiceDeliver",
+        "HttpService/DeliverRequest", "HttpService_DeliverRequest",
+        "HTTPRequestTraceTask/Deliver", "HTTPRequestTraceTask_Deliver",
+        "Http/Deliver", "Http_Deliver",
+    ),
+    "HttpService/Send": _alias_set(
+        "HttpService/Send", "HttpService_Send", "HttpServiceSend",
+        "HttpService/SendResponse", "HttpService_SendResponse",
+        "HttpService/FastResponse", "HttpService_FastResponse",
+        "HTTPRequestTraceTask/SendResponse", "HTTPRequestTraceTask_SendResponse",
+        "HTTPRequestTraceTask/FastSend", "HTTPRequestTraceTask_FastSend",
+        "Http/SendResponse", "Http_SendResponse",
+    ),
+    "HttpService/Close": _alias_set(
+        "HttpService/Close", "HttpService_Close", "HttpServiceClose",
+        "HttpService/CloseRequest", "HttpService_CloseRequest",
+        "HTTPRequestTraceTask/SrvdReq", "HTTPRequestTraceTask_SrvdReq",
+        "Http/Close", "Http_Close",
+    ),
+    # Phase 5: MsQuic (Microsoft-Quic). Provider names are not stable: some
+    # builds emit "Quic/...", others "MsQuic/...", others squash to
+    # "QuicConnectionCreated". Cover the common forms.
+    "Quic/ConnectionCreated": _alias_set(
+        "Quic/ConnectionCreated", "Quic_ConnectionCreated", "QuicConnectionCreated",
+        "MsQuic/ConnectionCreated", "MsQuic_ConnectionCreated",
+        "Quic/ConnCreated", "Quic_ConnCreated",
+        "Quic/Connection", "Quic_Connection",
+    ),
+    "Quic/ConnectionClosed": _alias_set(
+        "Quic/ConnectionClosed", "Quic_ConnectionClosed", "QuicConnectionClosed",
+        "MsQuic/ConnectionClosed", "MsQuic_ConnectionClosed",
+        "Quic/ConnClosed", "Quic_ConnClosed",
+        "Quic/ConnectionDestroyed", "Quic_ConnectionDestroyed",
+    ),
+    "Quic/PacketRecv": _alias_set(
+        "Quic/PacketRecv", "Quic_PacketRecv", "QuicPacketRecv",
+        "MsQuic/PacketRecv", "MsQuic_PacketRecv",
+        "Quic/PacketReceived", "Quic_PacketReceived",
+        "Quic/ConnPacketRecv", "Quic_ConnPacketRecv",
+    ),
+    "Quic/PacketSend": _alias_set(
+        "Quic/PacketSend", "Quic_PacketSend", "QuicPacketSend",
+        "MsQuic/PacketSend", "MsQuic_PacketSend",
+        "Quic/PacketSent", "Quic_PacketSent",
+        "Quic/ConnPacketSent", "Quic_ConnPacketSent",
+    ),
+    "Quic/AckReceived": _alias_set(
+        "Quic/AckReceived", "Quic_AckReceived", "QuicAckReceived",
+        "MsQuic/AckReceived", "MsQuic_AckReceived",
+        "Quic/AckRecv", "Quic_AckRecv",
+        "Quic/AckProcessed", "Quic_AckProcessed",
     ),
 }
 

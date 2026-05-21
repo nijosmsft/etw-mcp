@@ -20,7 +20,9 @@ mcp = FastMCP(
         "get_connect_latency, get_accept_latency, get_packet_drops, "
         "get_afd_batching, get_socket_lifecycle, get_socket_affinity_check, "
         "get_packet_capture_summary, get_packet_timeline, "
-        "get_send_recv_latency, decode_packet. "
+        "get_send_recv_latency, decode_packet, "
+        "get_http_requests, get_http_queue_depth, "
+        "get_quic_connections, get_quic_cid_distribution, get_quic_ack_delays. "
         "Use trace_id explicitly for parallel trace analysis."
     ),
 )
