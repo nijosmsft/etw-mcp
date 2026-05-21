@@ -49,6 +49,16 @@ class TraceData:
     udp_recv_df: pd.DataFrame | None = None
     udp_send_df: pd.DataFrame | None = None
 
+    # Phase 3b: AFD socket-level events + NDIS dropped packets. Same caveats
+    # as the TCPIP/UDP DataFrames above — populated by the background dumper
+    # extraction, empty when the trace lacks the Winsock-AFD / NDIS providers.
+    afd_recv_df: pd.DataFrame | None = None
+    afd_send_df: pd.DataFrame | None = None
+    afd_connect_df: pd.DataFrame | None = None
+    afd_accept_df: pd.DataFrame | None = None
+    afd_close_df: pd.DataFrame | None = None
+    ndis_drops_df: pd.DataFrame | None = None
+
     # Background extraction state
     _dumper_future: threading.Thread | None = field(default=None, repr=False)
     _dumper_ready: threading.Event = field(default_factory=threading.Event, repr=False)

@@ -227,6 +227,13 @@ _DUMPER_EVENT_CLASSES: dict[str, tuple[str, str]] = {
     "TcpIp/Accept":     ("tcpip_accept_df",      "tcpip_accept"),
     "UdpIp/Recv":       ("udp_recv_df",          "udp_recv"),
     "UdpIp/Send":       ("udp_send_df",          "udp_send"),
+    # Phase 3b: AFD socket-level events + NDIS drops.
+    "AFD/Recv":         ("afd_recv_df",          "afd_recv"),
+    "AFD/Send":         ("afd_send_df",          "afd_send"),
+    "AFD/Connect":      ("afd_connect_df",       "afd_connect"),
+    "AFD/Accept":       ("afd_accept_df",        "afd_accept"),
+    "AFD/Close":        ("afd_close_df",         "afd_close"),
+    "NdisDrop":         ("ndis_drops_df",        "ndis_drops"),
 }
 
 
@@ -383,6 +390,13 @@ _PARQUET_EXCLUDED = frozenset({
     "tcpip_accept",
     "udp_recv",
     "udp_send",
+    # Phase 3b networking event-class parquets — same plumbing as above.
+    "afd_recv",
+    "afd_send",
+    "afd_connect",
+    "afd_accept",
+    "afd_close",
+    "ndis_drops",
 })
 
 # Datasets that MUST be present (and load successfully) for the cache to be

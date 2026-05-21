@@ -16,7 +16,9 @@ mcp = FastMCP(
         "get_rss_dispatch_quality, get_per_nic_queue_arrivals, "
         "get_udp_dispatch_quality, get_network_wait_chain, "
         "get_connection_summary, get_udp_flow_summary, "
-        "get_tcp_retransmits, get_per_process_socket_throughput. "
+        "get_tcp_retransmits, get_per_process_socket_throughput, "
+        "get_connect_latency, get_accept_latency, get_packet_drops, "
+        "get_afd_batching, get_socket_lifecycle, get_socket_affinity_check. "
         "Use trace_id explicitly for parallel trace analysis."
     ),
 )

@@ -1129,6 +1129,157 @@ def _handle_tcpip_connect_or_accept(parts: list[str], **_kwargs) -> dict | None:
     }
 
 
+# ---------------------------------------------------------------------------
+# AFD / NDIS handlers — Phase 3b
+# ---------------------------------------------------------------------------
+#
+# AFD events come from the Microsoft-Windows-Winsock-AFD provider when the
+# Phase 0.1 networking.wprp profile is in use. xperf's dumper does not
+# publish a stable, documented column layout for AFD events — the layouts
+# below are best-effort and derived from the MOF/manifest field order, with
+# defensive parsing throughout. Every helper returns ``None`` rather than
+# raising when a field is missing or malformed.
+#
+# Column layout assumed for the AFD I/O events (Recv / Send), prefixed with
+# xperf's standard 5-column event header:
+#
+#     0: event name (e.g. "AFD/Recv" or "AFD_Recv")
+#     1: TimeStamp (uint)
+#     2: "Process Name ( PID)"
+#     3: ThreadID
+#     4: CPU
+#     5: SocketHandle (hex or decimal)
+#     6: Size            (uint, may be 0 for control events)
+#     7: CompletionStatus (uint / NTSTATUS, may be -1)
+#
+# For Connect / Accept:
+#     5: SocketHandle
+#     6: LocalAddr
+#     7: LocalPort
+#     8: RemoteAddr
+#     9: RemotePort
+#
+# For Close:
+#     5: SocketHandle
+#
+# NdisDrop events (Microsoft-Windows-NDIS dropped-packet) layout assumed:
+#     0: event name
+#     1: TimeStamp
+#     2: Process Name ( PID)  (may be "<unknown>")
+#     3: ThreadID
+#     4: CPU
+#     5: MiniportName / FriendlyName
+#     6: Reason (string, e.g. "MissingBuffer")
+#     7: Size (bytes)
+#
+# All of this needs validation against a real trace. Document the
+# assumption rather than guess — handlers degrade to "" / 0 when columns
+# are missing.
+
+
+def _parse_socket_handle(value: str) -> int:
+    """Parse a socket handle from a column (decimal, "0x" hex, or bare hex).
+
+    Returns 0 on failure — sockets routinely round-trip through user-mode
+    as 64-bit identifiers and we want a single integer key for grouping.
+    """
+    value = value.strip().strip('"')
+    if not value:
+        return 0
+    try:
+        if value.lower().startswith("0x"):
+            return int(value, 16)
+        return int(value)
+    except ValueError:
+        # Some xperf builds emit pointer-style handles like "FFFFAB00..."
+        try:
+            return int(value, 16)
+        except ValueError:
+            return 0
+
+
+def _handle_afd_recv_or_send(parts: list[str], **_kwargs) -> dict | None:
+    """Handler for AFD/Recv and AFD/Send dumper lines."""
+    header = _parse_tcpip_header(parts)
+    if header is None:
+        return None
+
+    handle = _parse_socket_handle(parts[5]) if len(parts) > 5 else 0
+    size = _parse_int_or_none(parts[6]) if len(parts) > 6 else None
+    status = _parse_int_or_none(parts[7]) if len(parts) > 7 else None
+
+    return {
+        **header,
+        "SocketHandle": handle,
+        "Size": size if size is not None else 0,
+        "CompletionStatus": status if status is not None else 0,
+    }
+
+
+def _handle_afd_connect_or_accept(parts: list[str], **_kwargs) -> dict | None:
+    """Handler for AFD/Connect and AFD/Accept dumper lines.
+
+    5-tuple fields are optional — older builds emit only the socket handle.
+    """
+    header = _parse_tcpip_header(parts)
+    if header is None:
+        return None
+
+    handle = _parse_socket_handle(parts[5]) if len(parts) > 5 else 0
+    local_addr = parts[6].strip() if len(parts) > 6 else ""
+    local_port = _parse_int_or_none(parts[7]) if len(parts) > 7 else None
+    remote_addr = parts[8].strip() if len(parts) > 8 else ""
+    remote_port = _parse_int_or_none(parts[9]) if len(parts) > 9 else None
+
+    return {
+        **header,
+        "SocketHandle": handle,
+        "LocalAddr": local_addr,
+        "LocalPort": local_port if local_port is not None else 0,
+        "RemoteAddr": remote_addr,
+        "RemotePort": remote_port if remote_port is not None else 0,
+    }
+
+
+def _handle_afd_close(parts: list[str], **_kwargs) -> dict | None:
+    """Handler for AFD/Close dumper lines (just the socket handle)."""
+    header = _parse_tcpip_header(parts)
+    if header is None:
+        return None
+
+    handle = _parse_socket_handle(parts[5]) if len(parts) > 5 else 0
+    return {
+        **header,
+        "SocketHandle": handle,
+    }
+
+
+def _handle_ndis_drop(parts: list[str], **_kwargs) -> dict | None:
+    """Handler for NDIS dropped-packet dumper lines.
+
+    Layout is provider-specific and not stable across builds. We extract:
+    TimeStamp, MiniportName, Reason, Size — process attribution is usually
+    "<unknown>" because the drop happens before socket dispatch.
+    """
+    # We reuse _parse_tcpip_header for the leading 5 columns but tolerate the
+    # process-name field being "<unknown>" or empty — _parse_proc_field already
+    # falls back gracefully.
+    header = _parse_tcpip_header(parts)
+    if header is None:
+        return None
+
+    miniport = parts[5].strip() if len(parts) > 5 else ""
+    reason = parts[6].strip() if len(parts) > 6 else ""
+    size = _parse_int_or_none(parts[7]) if len(parts) > 7 else None
+
+    return {
+        **header,
+        "MiniportName": miniport,
+        "Reason": reason,
+        "Size": size if size is not None else 0,
+    }
+
+
 def _handle_udp_recv_or_send(parts: list[str], **_kwargs) -> dict | None:
     """Handler for UdpIp/Recv and UdpIp/Send dumper lines.
 
@@ -1197,6 +1348,13 @@ EVENT_HANDLERS = {
     "TcpIp/Accept": _handle_tcpip_connect_or_accept,
     "UdpIp/Recv": _handle_udp_recv_or_send,
     "UdpIp/Send": _handle_udp_recv_or_send,
+    # Phase 3b: AFD socket-level events + NDIS drops
+    "AFD/Recv": _handle_afd_recv_or_send,
+    "AFD/Send": _handle_afd_recv_or_send,
+    "AFD/Connect": _handle_afd_connect_or_accept,
+    "AFD/Accept": _handle_afd_connect_or_accept,
+    "AFD/Close": _handle_afd_close,
+    "NdisDrop": _handle_ndis_drop,
 }
 
 
@@ -1220,6 +1378,16 @@ _EVENT_PREFIX_ALIASES: dict[str, frozenset[str]] = {
     "TcpIp/Accept":     _alias_set("TcpIp/Accept", "TcpIp_Accept", "TcpIpAccept"),
     "UdpIp/Recv":       _alias_set("UdpIp/Recv", "UdpIp_Recv", "UdpIpRecv"),
     "UdpIp/Send":       _alias_set("UdpIp/Send", "UdpIp_Send", "UdpIpSend"),
+    # Phase 3b. AFD events are namespaced by the Winsock-AFD provider; xperf
+    # may emit any of these forms depending on the build.
+    "AFD/Recv":         _alias_set("AFD/Recv", "AFD_Recv", "AFDRecv", "Afd/Recv"),
+    "AFD/Send":         _alias_set("AFD/Send", "AFD_Send", "AFDSend", "Afd/Send"),
+    "AFD/Connect":      _alias_set("AFD/Connect", "AFD_Connect", "AFDConnect", "Afd/Connect"),
+    "AFD/Accept":       _alias_set("AFD/Accept", "AFD_Accept", "AFDAccept", "Afd/Accept"),
+    "AFD/Close":        _alias_set("AFD/Close", "AFD_Close", "AFDClose", "Afd/Close"),
+    # NDIS dropped-packet event. Different xperf builds label this as
+    # "NdisDrop", "NDIS/Drop", "Ndis/Drop", or "PacketDrop".
+    "NdisDrop":         _alias_set("NdisDrop", "NDIS/Drop", "Ndis/Drop", "NDIS_Drop", "PacketDrop"),
 }
 
 
