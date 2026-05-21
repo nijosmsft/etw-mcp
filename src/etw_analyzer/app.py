@@ -12,7 +12,9 @@ mcp = FastMCP(
         "get_function_callers, walk_stack, count_stacks, butterfly_chain, "
         "get_dpc_summary, get_dpc_per_cpu, get_per_cpu_summary, get_cpu_timeline, "
         "get_lock_contention, get_network_hot_functions, get_network_dpcs, "
-        "get_network_lock_contention, get_network_hot_stacks. "
+        "get_network_lock_contention, get_network_hot_stacks, "
+        "get_rss_dispatch_quality, get_per_nic_queue_arrivals, "
+        "get_udp_dispatch_quality. "
         "Use trace_id explicitly for parallel trace analysis."
     ),
 )
