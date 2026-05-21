@@ -59,6 +59,15 @@ class TraceData:
     afd_close_df: pd.DataFrame | None = None
     ndis_drops_df: pd.DataFrame | None = None
 
+    # Phase 4: NDIS PacketCapture events. One row per captured frame.
+    # Columns: TimeStamp, Direction ("Recv"/"Send"), MiniportName,
+    # PacketBytes (hex string), Size. Decoding into Ethernet/IP/L4 fields
+    # is done lazily by the Phase 4 tools (see
+    # :mod:`etw_analyzer.parsing.packet_decode`). Empty when the trace was
+    # collected without the ``Microsoft-Windows-NDIS-PacketCapture``
+    # provider (see ``udp-perf/scripts/networking.wprp``).
+    packet_capture_df: pd.DataFrame | None = None
+
     # Background extraction state
     _dumper_future: threading.Thread | None = field(default=None, repr=False)
     _dumper_ready: threading.Event = field(default_factory=threading.Event, repr=False)

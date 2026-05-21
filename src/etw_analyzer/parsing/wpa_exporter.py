@@ -1280,6 +1280,168 @@ def _handle_ndis_drop(parts: list[str], **_kwargs) -> dict | None:
     }
 
 
+# ---------------------------------------------------------------------------
+# NDIS PacketCapture handler — Phase 4
+# ---------------------------------------------------------------------------
+#
+# The ``Microsoft-Windows-NDIS-PacketCapture`` provider emits one event per
+# captured frame containing the on-wire packet bytes. The exact column
+# layout xperf's dumper produces for this provider is not documented and
+# may vary across builds — see the Phase 4 plan caveat. The handler below
+# is best-effort and defensive: it accepts any of the most plausible
+# orderings and skips rows where no usable hex blob can be identified.
+#
+# Working assumption (best guess from observed xperf behavior for binary
+# event payloads):
+#
+#     0: event name (NdisPacketCapture/Recv | NdisPacketCapture/Send |
+#                    PacketCapture/Recv | ...)
+#     1: TimeStamp
+#     2: Process Name ( PID)   (usually "<unknown> ( 0)" for NDIS events)
+#     3: ThreadID
+#     4: CPU
+#     5: MiniportName / FriendlyName
+#     6: Size                 (bytes captured — may equal full frame or
+#                              truncated capture length)
+#     7: PacketBytes          (hex string, possibly quoted, possibly with
+#                              "0x" prefix or whitespace separators)
+#
+# We additionally support a fallback layout where ``PacketBytes`` is the
+# only post-header column and the size is derived from the byte count. If
+# nothing in the row parses as a hex blob the handler returns None — the
+# caller drops the row.
+#
+# ``Direction`` is parsed from the event-name suffix ("Recv" / "Send"). For
+# unknown event-name suffixes we default to "Unknown" so a degraded trace
+# still produces usable rows.
+
+
+def _looks_like_hex(value: str) -> bool:
+    """Return True if ``value`` is a non-trivial hex string.
+
+    Used to disambiguate the PacketBytes column from the size column when
+    layouts drift. Requires at least 24 hex characters (12 bytes — enough
+    for a partial Ethernet header) and rejects anything containing
+    non-hex characters.
+    """
+    cleaned = value.strip().strip('"').strip("'")
+    if cleaned.lower().startswith("0x"):
+        cleaned = cleaned[2:]
+    # Tolerate spaces / colons / dashes used as byte separators.
+    cleaned = cleaned.replace(" ", "").replace(":", "").replace("-", "")
+    if len(cleaned) < 24 or len(cleaned) % 2 != 0:
+        return False
+    try:
+        int(cleaned, 16)
+    except ValueError:
+        return False
+    return True
+
+
+def _normalize_packet_hex(value: str) -> str:
+    """Strip xperf-style decoration from a packet-bytes hex column.
+
+    Returns the cleaned hex string (lowercase, no separators) or "" if
+    parsing fails. Callers can convert with ``bytes.fromhex``.
+    """
+    cleaned = value.strip().strip('"').strip("'")
+    if cleaned.lower().startswith("0x"):
+        cleaned = cleaned[2:]
+    cleaned = cleaned.replace(" ", "").replace(":", "").replace("-", "")
+    if not cleaned or len(cleaned) % 2 != 0:
+        return ""
+    try:
+        int(cleaned, 16)
+    except ValueError:
+        return ""
+    return cleaned.lower()
+
+
+def _direction_from_event_name(event_name: str) -> str:
+    """Map an event-name to ``"Recv"`` / ``"Send"`` / ``"Unknown"``.
+
+    Matches case-insensitively on the suffix so all of "Recv", "Receive",
+    "RX", "Send", "Transmit", "TX" route correctly.
+    """
+    lower = event_name.lower()
+    if "recv" in lower or "receive" in lower or "/rx" in lower or "_rx" in lower:
+        return "Recv"
+    if "send" in lower or "transmit" in lower or "/tx" in lower or "_tx" in lower:
+        return "Send"
+    return "Unknown"
+
+
+def _handle_ndis_packet_capture(parts: list[str], **_kwargs) -> dict | None:
+    """Handler for NDIS PacketCapture dumper lines.
+
+    Expected output schema: ``TimeStamp, Direction, MiniportName,
+    PacketBytes, Size``. Auxiliary columns from the xperf event header
+    (Process Name, PID, ThreadID, CPU) are passed through when present so
+    downstream tools can correlate with CPU sampling.
+
+    The exact xperf dumper layout for PacketCapture events is unknown.
+    This handler scans the row defensively:
+
+      * Header columns 0..4 follow ``_parse_tcpip_header`` (event name,
+        TimeStamp, Process(PID), ThreadID, CPU).
+      * The first remaining column that looks like a hex blob (>=24 hex
+        chars) is treated as PacketBytes.
+      * Any preceding non-numeric column is treated as MiniportName.
+      * The last numeric column before PacketBytes (if any) is treated as
+        Size; if no such column exists, Size is derived from the decoded
+        byte count.
+
+    Rows with no parseable hex blob are dropped (return None).
+    """
+    header = _parse_tcpip_header(parts)
+    if header is None:
+        return None
+
+    event_name = parts[0].strip()
+    direction = _direction_from_event_name(event_name)
+
+    # Search for the hex column. We scan from the tail so a row that puts
+    # PacketBytes at the very end (the most common layout) is found cheaply.
+    hex_idx = -1
+    for idx in range(len(parts) - 1, _TCPIP_HEADER_COLS - 1, -1):
+        if _looks_like_hex(parts[idx]):
+            hex_idx = idx
+            break
+
+    if hex_idx < 0:
+        return None
+
+    packet_hex = _normalize_packet_hex(parts[hex_idx])
+    if not packet_hex:
+        return None
+
+    # Columns between the header and the hex blob (inclusive of MiniportName
+    # and any Size value). We treat the first non-numeric column as the
+    # miniport name and the last numeric one as Size.
+    miniport = ""
+    size: int | None = None
+    for idx in range(_TCPIP_HEADER_COLS, hex_idx):
+        raw = parts[idx].strip().strip('"')
+        if not raw:
+            continue
+        parsed_int = _parse_int_or_none(raw)
+        if parsed_int is not None:
+            size = parsed_int
+        elif not miniport:
+            miniport = raw
+
+    if size is None:
+        size = len(packet_hex) // 2
+
+    return {
+        **header,
+        "Direction": direction,
+        "MiniportName": miniport,
+        "PacketBytes": packet_hex,
+        "Size": size,
+    }
+
+
 def _handle_udp_recv_or_send(parts: list[str], **_kwargs) -> dict | None:
     """Handler for UdpIp/Recv and UdpIp/Send dumper lines.
 
@@ -1355,6 +1517,10 @@ EVENT_HANDLERS = {
     "AFD/Accept": _handle_afd_connect_or_accept,
     "AFD/Close": _handle_afd_close,
     "NdisDrop": _handle_ndis_drop,
+    # Phase 4: NDIS PacketCapture. A single class captures both Recv and
+    # Send events — the handler discriminates direction from the
+    # event-name suffix and emits a ``Direction`` column.
+    "NdisPacketCapture": _handle_ndis_packet_capture,
 }
 
 
@@ -1388,6 +1554,23 @@ _EVENT_PREFIX_ALIASES: dict[str, frozenset[str]] = {
     # NDIS dropped-packet event. Different xperf builds label this as
     # "NdisDrop", "NDIS/Drop", "Ndis/Drop", or "PacketDrop".
     "NdisDrop":         _alias_set("NdisDrop", "NDIS/Drop", "Ndis/Drop", "NDIS_Drop", "PacketDrop"),
+    # Phase 4: NDIS PacketCapture events. The exact event label xperf
+    # emits for the ``Microsoft-Windows-NDIS-PacketCapture`` provider is
+    # unknown — different builds and provider versions may use any of
+    # these forms. Both Recv and Send route to a single canonical class;
+    # the handler sets ``Direction`` based on the event-name suffix.
+    "NdisPacketCapture": _alias_set(
+        # Recv variants
+        "NdisPacketCapture/Recv", "NdisPacketCapture_Recv", "NdisPacketCaptureRecv",
+        "Ndis/PacketCapture/Recv", "NDIS-PacketCapture/Recv",
+        "PacketCapture/Recv", "PacketCapture_Recv", "PacketCaptureRecv",
+        "PktMon/Recv", "PktMonRecv",
+        # Send variants
+        "NdisPacketCapture/Send", "NdisPacketCapture_Send", "NdisPacketCaptureSend",
+        "Ndis/PacketCapture/Send", "NDIS-PacketCapture/Send",
+        "PacketCapture/Send", "PacketCapture_Send", "PacketCaptureSend",
+        "PktMon/Send", "PktMonSend",
+    ),
 }
 
 

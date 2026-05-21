@@ -234,6 +234,8 @@ _DUMPER_EVENT_CLASSES: dict[str, tuple[str, str]] = {
     "AFD/Accept":       ("afd_accept_df",        "afd_accept"),
     "AFD/Close":        ("afd_close_df",         "afd_close"),
     "NdisDrop":         ("ndis_drops_df",        "ndis_drops"),
+    # Phase 4: NDIS PacketCapture (decoded packet bytes).
+    "NdisPacketCapture": ("packet_capture_df",   "packet_capture"),
 }
 
 
@@ -397,6 +399,8 @@ _PARQUET_EXCLUDED = frozenset({
     "afd_accept",
     "afd_close",
     "ndis_drops",
+    # Phase 4 packet-capture parquet — loaded into trace.packet_capture_df.
+    "packet_capture",
 })
 
 # Datasets that MUST be present (and load successfully) for the cache to be
