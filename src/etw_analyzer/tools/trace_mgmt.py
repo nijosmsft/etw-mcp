@@ -275,8 +275,37 @@ def _load_file(file_path: Path) -> pd.DataFrame:
         raise ValueError(f"Unknown file type: {file_path.suffix}")
 
 
-# Datasets that are exported as parquet (structured data)
-_PARQUET_DATASETS = ["cpu_sampling", "cpu_timeline", "dpc_isr", "stacks", "stacks_callers"]
+# Parquet datasets are discovered dynamically via glob on the export directory
+# (see _load_from_cache). This means new parquets written by future event-class
+# exporters (e.g. tcpip_recv.parquet, udp_events.parquet, afd_events.parquet)
+# are picked up automatically without changes here.
+#
+# Approach chosen: glob-based discovery (option A).
+# Reasoning: parquet filename == dataset name is already the convention enforced
+# by wpa_exporter._save_df (writes "{name}.parquet"). A registry would require
+# every new producer module to be imported before _load_from_cache runs, which
+# is fragile given lazy-import patterns in this codebase. Glob discovery is
+# self-maintaining: drop a file in the dir, it loads.
+#
+# Stray-file mitigation: _PARQUET_EXCLUDED lists parquets that live in the
+# same export dir but are NOT part of raw_csv (loaded into other slots like
+# trace.dumper_df). Any other unexpected .parquet files will be loaded under
+# their filename stem — this is intentional so new exporters "just work".
+_PARQUET_EXCLUDED = frozenset({
+    "sampled_profile",  # Loaded into trace.dumper_df by _start_background_dumper
+})
+
+# Datasets that MUST be present (and load successfully) for the cache to be
+# considered usable. Without cpu_sampling, most analysis tools have nothing
+# to chew on, so we treat it as the floor. Other datasets are best-effort.
+_PARQUET_REQUIRED = frozenset({"cpu_sampling"})
+
+# Legacy exports may have written .csv instead of .parquet for the original
+# five datasets. Only fall back to CSV for these names, since we have no
+# equivalent allowlist signal for new event classes.
+_LEGACY_CSV_DATASETS = frozenset({
+    "cpu_sampling", "cpu_timeline", "dpc_isr", "stacks", "stacks_callers",
+})
 
 # Datasets that are raw text files
 _TEXT_DATASETS = {
@@ -293,6 +322,17 @@ def _load_from_cache(export_dir: Path, etl_path: Path) -> dict[str, pd.DataFrame
     """Try to load previously exported data from the cache directory.
 
     Returns None if the cache is missing or stale (ETL is newer than cache).
+
+    Parquet files are discovered by globbing the export directory rather than
+    iterating a hardcoded allowlist. Each "{name}.parquet" becomes a dataset
+    keyed by its filename stem, except names listed in _PARQUET_EXCLUDED which
+    are owned by other code paths.
+
+    Freshness policy: the cache is considered fresh if all names in
+    _PARQUET_REQUIRED loaded successfully (currently just cpu_sampling). This
+    matches the previous behaviour where "no useful data" returned None, but
+    is now keyed on a documented required set rather than an implicit
+    "at least one" check.
     """
     if not export_dir.exists():
         return None
@@ -306,27 +346,32 @@ def _load_from_cache(export_dir: Path, etl_path: Path) -> dict[str, pd.DataFrame
     except OSError:
         return None
 
-    # Need at least cpu_sampling to be useful
-    has_any = False
     results: dict[str, pd.DataFrame] = {}
 
-    for name in _PARQUET_DATASETS:
-        parquet_path = export_dir / f"{name}.parquet"
-        csv_path = export_dir / f"{name}.csv"  # backward compat
-        if parquet_path.exists():
-            try:
-                results[name] = pd.read_parquet(parquet_path)
-                has_any = True
-            except Exception:
-                pass
-        elif csv_path.exists():
+    # Discover parquet datasets via glob — any *.parquet not in the exclusion
+    # set is loaded as a dataset keyed by its filename stem.
+    for parquet_path in sorted(export_dir.glob("*.parquet")):
+        name = parquet_path.stem
+        if name in _PARQUET_EXCLUDED:
+            continue
+        try:
+            results[name] = pd.read_parquet(parquet_path)
+        except Exception:
+            pass
+
+    # Backward-compat: see _LEGACY_CSV_DATASETS at module scope.
+    for name in _LEGACY_CSV_DATASETS:
+        if name in results:
+            continue
+        csv_path = export_dir / f"{name}.csv"
+        if csv_path.exists():
             try:
                 results[name] = load_csv(csv_path)
-                has_any = True
             except Exception:
                 pass
 
-    if not has_any:
+    # Freshness gate: every required dataset must have loaded.
+    if not _PARQUET_REQUIRED.issubset(results.keys()):
         return None
 
     for key, filename in _TEXT_DATASETS.items():

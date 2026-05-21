@@ -7,6 +7,8 @@ import io
 import os
 import re
 import subprocess
+import threading
+from collections.abc import Iterator
 from pathlib import Path
 
 import pandas as pd
@@ -105,6 +107,127 @@ def _run_xperf(
         )
 
     return output
+
+
+def _run_xperf_lines(
+    etl_path: Path,
+    action: str,
+    action_args: list[str] | None = None,
+    symbol_path: str | None = None,
+    symbols: bool = True,
+    timeout_seconds: int = 300,
+) -> Iterator[str]:
+    """Run xperf and yield stdout one line at a time.
+
+    Same arg semantics as ``_run_xperf``. This variant uses ``subprocess.Popen``
+    and streams ``proc.stdout`` line-by-line so callers can process gigabyte-scale
+    output (e.g. ``xperf -a dumper``) without buffering the whole thing in memory.
+
+    Notes:
+      * Timeout: ``Popen`` has no built-in timeout. A ``threading.Timer`` arms
+        ``proc.kill()`` after ``timeout_seconds``; the iterator then raises
+        ``RuntimeError``. The timer is cancelled in the ``finally`` block.
+      * Stderr: redirected to ``DEVNULL``. The blocking variant captures stderr
+        only to format error messages; in streaming mode we can't safely block
+        on ``communicate()`` to retrieve it without risking a pipe-deadlock with
+        the (potentially huge) stdout we're already consuming, so we discard it.
+      * Non-zero exit: tolerated if any output was produced — matches the
+        behavior of ``_run_xperf`` (xperf is noisy about returning non-zero on
+        traces it still successfully dumped).
+      * Cleanup: if the caller stops iterating early (``break``, exception),
+        the generator's ``finally`` calls ``proc.terminate()`` + ``wait()`` so
+        the child process doesn't outlive us.
+    """
+    xperf = find_xperf()
+    if xperf is None:
+        raise FileNotFoundError(
+            "xperf.exe not found. Install Windows Performance Toolkit "
+            "(part of Windows SDK/ADK)."
+        )
+
+    cmd = [str(xperf), "-i", str(etl_path)]
+    if symbols:
+        cmd.append("-symbols")
+    cmd.extend(["-a", action])
+    if action_args:
+        cmd.extend(action_args)
+
+    env = os.environ.copy()
+    if symbol_path:
+        env["_NT_SYMBOL_PATH"] = symbol_path
+
+    import sys
+    creation_flags = 0
+    if sys.platform == "win32":
+        creation_flags = subprocess.CREATE_NO_WINDOW
+
+    proc = subprocess.Popen(
+        cmd,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        bufsize=1,  # line-buffered
+        env=env,
+        creationflags=creation_flags,
+    )
+
+    timed_out = {"flag": False}
+
+    def _on_timeout() -> None:
+        timed_out["flag"] = True
+        try:
+            proc.kill()
+        except OSError:
+            pass
+
+    timer = threading.Timer(timeout_seconds, _on_timeout)
+    timer.daemon = True
+    timer.start()
+
+    produced_any = False
+    try:
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            produced_any = True
+            yield line.rstrip("\r\n")
+
+        if timed_out["flag"]:
+            raise RuntimeError(
+                f"xperf timed out after {timeout_seconds}s. "
+                "Try a shorter trace or increase timeout."
+            )
+
+        # Drain & reap. Tolerate non-zero exit only if we got output.
+        proc.wait()
+        if proc.returncode != 0 and not produced_any:
+            raise RuntimeError(
+                f"xperf -a {action} failed (exit {proc.returncode}); "
+                "no stdout produced."
+            )
+    finally:
+        timer.cancel()
+        if proc.poll() is None:
+            try:
+                proc.terminate()
+            except OSError:
+                pass
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
+        if proc.stdout is not None:
+            try:
+                proc.stdout.close()
+            except OSError:
+                pass
 
 
 def _parse_profile_detail(text: str) -> pd.DataFrame:
@@ -629,7 +752,11 @@ def parse_sampled_profile_events(
         t2 = int((end_time or 999999) * 1_000_000)
         action_args.extend(["-range", str(t1), str(t2)])
 
-    text = _run_xperf(
+    # Stream xperf stdout line-by-line — dumper output for cpu-sampling traces
+    # can reach gigabytes (1.3 GB seen for 18s of sampling). Buffering the full
+    # string would OOM the server. We filter aggressively here and only retain
+    # parsed rows.
+    line_iter = _run_xperf_lines(
         etl_path, "dumper", action_args,
         symbol_path=symbol_path,
         symbols=True,
@@ -637,7 +764,7 @@ def parse_sampled_profile_events(
     )
 
     rows = []
-    for line in text.splitlines():
+    for line in line_iter:
         # Match: "         SampledProfile,  timestamp, ..."
         if "SampledProfile," not in line or "SampledProfileNmi," in line:
             continue
