@@ -65,6 +65,7 @@ def load_trace(
     symbol_path: str | None = None,
     timeout_seconds: int = 300,
     force: bool = False,
+    mode: str = "xperf",
 ) -> str:
     """Load an ETL trace file for analysis.
 
@@ -81,12 +82,29 @@ def load_trace(
                      If not set, uses _NT_SYMBOL_PATH env var.
         timeout_seconds: Max seconds per xperf invocation. Default: 300.
         force: Delete cached exports and re-run xperf. Default: False.
+        mode: Pipeline used to populate the dumper DataFrames. Either
+              ``"xperf"`` (default — text-based ``xperf -a dumper`` extraction),
+              ``"native"`` (in-process ``OpenTraceW`` consumer added in
+              Phase N1 of the native-ETW work — see
+              ``udp-perf/docs/wpr-mcp-native-etw-design.md``), or ``"auto"``
+              (use native when available, fall back to xperf). The
+              ``WPR_MCP_MODE`` environment variable overrides this arg.
+              In Phase N1, ``"native"`` is limited — only ``SampledProfile``
+              has a working decoder; CSwitch, TCPIP, AFD etc. produce empty
+              DataFrames until Phase N2.
     """
     path = Path(etl_path)
     if not path.exists():
         return f"File not found: {etl_path}"
     if not path.suffix.lower() == ".etl":
         return f"Expected .etl file, got: {path.suffix}"
+
+    # Resolve the load pipeline. Environment variable overrides the arg.
+    from etw_analyzer.native.config import resolve_mode
+    try:
+        resolved_mode = resolve_mode(mode, etl_path=path)
+    except ValueError as e:
+        return str(e)
 
     # Resolve symbol path
     sym_path = symbol_path or os.environ.get("_NT_SYMBOL_PATH")
@@ -99,8 +117,12 @@ def load_trace(
         import shutil
         shutil.rmtree(export_dir)
 
+    # Native mode skips xperf entirely. Without xperf installed we still
+    # try the cache and the native pipeline; if neither works we fall
+    # through to the "xperf.exe not found" error at the bottom of this
+    # block.
     xperf = find_xperf()
-    if xperf is None:
+    if xperf is None and resolved_mode != "native":
         return (
             "xperf.exe not found. Install Windows Performance Toolkit "
             "(part of Windows SDK/ADK) or add it to PATH.\n\n"
@@ -117,6 +139,7 @@ def load_trace(
             etl_path=path,
             export_dir=export_dir,
             symbol_path=sym_path,
+            mode=resolved_mode,
             raw_csv=cached,
             export_errors=errors,
         )
@@ -125,6 +148,41 @@ def load_trace(
         _start_background_dumper(trace)
         summary = _format_load_summary(trace)
         return summary.replace("**Trace loaded:**", "**Trace loaded (from cache):**")
+
+    # Native fast path: skip the xperf export pipeline entirely. The
+    # background dumper extraction (kicked off below) reads the trace via
+    # the native consumer; we only need to synthesize the minimal
+    # ``raw_csv`` slots that existing analysis tools look for. Phase N4
+    # will replace these synthesized stubs with proper native
+    # aggregators; today, ``cpu_sampling`` is the only one tools depend
+    # on for the no-cpu-filter path, and we materialise it on first use
+    # via ``_synthesize_native_cpu_sampling`` rather than running xperf.
+    if resolved_mode == "native":
+        export_dir.mkdir(parents=True, exist_ok=True)
+        results: dict[str, pd.DataFrame] = {}
+        errors: list[str] = []
+
+        trace = TraceData(
+            trace_id=make_trace_id(path),
+            etl_path=path,
+            export_dir=export_dir,
+            symbol_path=sym_path,
+            mode=resolved_mode,
+            raw_csv=results,
+            export_errors=errors,
+        )
+
+        _populate_metadata(trace)
+        register_trace(trace)
+        _start_background_dumper(trace)
+        # The native dumper produces SampledProfile rows; derive the
+        # aggregated ``cpu_sampling`` DataFrame from them so
+        # ``get_cpu_samples`` (no-cpu-filter path) has data. Blocks until
+        # the background extraction finishes — Phase N1 doesn't have a
+        # streaming variant.
+        _synthesize_native_cpu_sampling(trace)
+
+        return _format_load_summary(trace)
 
     # Build symcache — idempotent, fast when symbols already cached
     from etw_analyzer.parsing.wpa_exporter import _run_xperf
@@ -164,6 +222,7 @@ def load_trace(
         etl_path=path,
         export_dir=export_dir,
         symbol_path=sym_path,
+        mode=resolved_mode,
         raw_csv=results,
         export_errors=errors,
     )
@@ -308,10 +367,9 @@ def _start_background_dumper(trace: TraceData) -> None:
 
     def _extract():
         try:
-            from etw_analyzer.parsing.wpa_exporter import parse_dumper_events
-
-            # Only re-extract classes that weren't cached. A single xperf
-            # pass services all of them.
+            # Only re-extract classes that weren't cached. A single
+            # extraction pass services all of them — both pipelines
+            # accept the same ``event_classes`` set.
             wanted: set[str] = {
                 canonical
                 for canonical, (attr, _) in _DUMPER_EVENT_CLASSES.items()
@@ -321,15 +379,25 @@ def _start_background_dumper(trace: TraceData) -> None:
             if not wanted:
                 return
 
-            results = parse_dumper_events(
-                etl_path=trace.etl_path,
-                symbol_path=trace.symbol_path,
-                cpu_filter=None,
-                start_time=None,
-                end_time=None,
-                timeout_seconds=300,
-                event_classes=wanted,
-            )
+            if trace.mode == "native":
+                from etw_analyzer.native import extract_events
+
+                results = extract_events(
+                    trace.etl_path,
+                    event_classes=wanted,
+                )
+            else:
+                from etw_analyzer.parsing.wpa_exporter import parse_dumper_events
+
+                results = parse_dumper_events(
+                    etl_path=trace.etl_path,
+                    symbol_path=trace.symbol_path,
+                    cpu_filter=None,
+                    start_time=None,
+                    end_time=None,
+                    timeout_seconds=300,
+                    event_classes=wanted,
+                )
             with trace.lock:
                 for canonical, (attr, stem) in _DUMPER_EVENT_CLASSES.items():
                     if canonical not in results:
@@ -361,6 +429,58 @@ def _start_background_dumper(trace: TraceData) -> None:
             return
         trace._dumper_future = thread
         thread.start()
+
+
+def _synthesize_native_cpu_sampling(trace: TraceData) -> None:
+    """Build a ``cpu_sampling`` DataFrame from the native SampledProfile dump.
+
+    The xperf-driven path produces a ``cpu_sampling.parquet`` aggregated by
+    ``Process Name`` / ``PID`` / ``Module`` / ``Function`` with ``Weight``
+    summed across CPUs and threads. In Phase N1 native mode we don't run
+    xperf, so we synthesize the same DataFrame from ``trace.dumper_df``
+    (the per-sample stream the native consumer collects). Module and
+    Function are blank until Phase N3 wires in dbghelp symbolization; the
+    aggregation by ``PID`` is enough for ``get_cpu_samples`` to produce
+    meaningful output.
+
+    Blocks on the background dumper extraction. If it produced no
+    SampledProfile rows (small/odd trace), ``cpu_sampling`` stays absent
+    rather than empty so downstream tools fall through to their existing
+    "no data" branch.
+    """
+
+    dumper_df = trace.wait_for_dumper()
+    if dumper_df is None or dumper_df.empty:
+        return
+
+    # Match the xperf schema. Process Name, PID are already there;
+    # Module / Function are empty strings on the native path; Weight
+    # comes from the per-sample Count.
+    group_cols = ["Process Name", "PID", "Module", "Function"]
+    agg = (
+        dumper_df.groupby(group_cols, dropna=False)["Weight"]
+        .sum()
+        .reset_index()
+    )
+    total = agg["Weight"].sum() or 1
+    agg["% Weight"] = (agg["Weight"] / total) * 100.0
+
+    # Reorder columns to match xperf for downstream tools that index by
+    # name/position.
+    agg = agg[["Process Name", "PID", "Weight", "% Weight", "Module", "Function"]]
+
+    with trace.lock:
+        trace.raw_csv["cpu_sampling"] = agg
+        trace.event_counts["cpu_sampling"] = len(agg)
+
+    # Persist alongside the native parquets so a follow-up
+    # ``_load_from_cache`` call can rehydrate without re-running the
+    # consumer. Best-effort: a write failure isn't fatal.
+    try:
+        trace.export_dir.mkdir(parents=True, exist_ok=True)
+        agg.to_parquet(trace.export_dir / "cpu_sampling.parquet", index=False)
+    except Exception:
+        pass
 
 
 def _load_file(file_path: Path) -> pd.DataFrame:

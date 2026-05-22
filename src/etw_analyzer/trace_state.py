@@ -20,6 +20,15 @@ class TraceData:
     export_dir: Path
     symbol_path: str | None = None
 
+    # Source mode for the cached DataFrames. Either ``"xperf"`` (the
+    # default text-based ``xperf -a dumper`` pipeline) or ``"native"``
+    # (the in-process ``OpenTraceW``/``ProcessTrace`` consumer added in
+    # Phase N1 of the native-ETW work). Tools may surface this in their
+    # output but should not rely on it for correctness — both modes are
+    # expected to populate the same DataFrame slots with equivalent
+    # schemas. See ``udp-perf/docs/wpr-mcp-native-etw-design.md`` §8.
+    mode: str = "xperf"
+
     # Parsed DataFrames keyed by profile name
     raw_csv: dict[str, pd.DataFrame] = field(default_factory=dict)
 
