@@ -349,6 +349,7 @@ def test_invalid_mode_is_rejected():
 # ---------------------------------------------------------------------------
 # Tests on the large trace (skipped when absent — large traces aren't in CI)
 # ---------------------------------------------------------------------------
+@pytest.mark.slow
 @need_large
 def test_load_trace_native_large_produces_sampled_profile(isolate_traces):
     """End-to-end smoke test: 452 MB trace produces millions of samples."""

@@ -47,3 +47,7 @@ packages = ["src/etw_analyzer"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+addopts = "-m 'not slow'"
+markers = [
+    "slow: tests that load multi-100MB traces (~60s+). Run with: pytest -m slow",
+]
