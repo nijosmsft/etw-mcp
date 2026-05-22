@@ -801,8 +801,19 @@ def _handle_sampled_profile(
 def _handle_cswitch(parts: list[str], **_kwargs) -> dict | None:
     """Handler for ``CSwitch`` dumper lines.
 
-    Stable column layout used here (varies across Windows builds — be
-    defensive, skip on parse failure):
+    **Bug history.** The previous version of this handler used a column
+    layout that pre-dated a Windows-build change: it expected
+    ``NWaitTime`` at position 6 and ``Old Process Name`` at position 7.
+    Current xperf builds (Win10+ kernel logger) emit *two* columns between
+    ``NQnt`` and ``Old Process Name`` — ``TmSinceLast`` and ``WaitTime`` —
+    so everything from ``Old Process Name`` onward is shifted right by one.
+    The old code read ``parts[8]`` as ``Old TID`` and tried ``int()`` on
+    what is actually ``Old Process Name``, which raised and was caught,
+    silently dropping *every* CSwitch row. That cascaded into empty
+    ``trace.cswitch_events_df`` and a useless ``get_network_wait_chain``.
+
+    Verified xperf dumper layout (real ``vmserver-networking-test.etl``
+    output, ``xperf -a dumper``)::
 
         0:  "CSwitch"
         1:  TimeStamp
@@ -810,34 +821,45 @@ def _handle_cswitch(parts: list[str], **_kwargs) -> dict | None:
         3:  New TID
         4:  NPri (new priority)
         5:  NQnt (new quantum)
-        6:  NWaitTime (irrelevant)
-        7:  "Old Process Name ( PID)"
-        8:  Old TID
-        9:  OPri (old priority)
-        10: OQnt
-        11: OldState
-        12: WaitReason
-        13+: Swapable, InSwitchTime, CPU, IdealProc, OldRemQnt, NewPriDecr, PrevCState
+        6:  TmSinceLast
+        7:  WaitTime
+        8:  "Old Process Name ( PID)"
+        9:  Old TID
+        10: OPri (old priority)
+        11: OQnt
+        12: OldState   (e.g. "Running", "Waiting", "Standby")
+        13: Wait Reason (e.g. "Executive", "WrQueue", "WrDispatchInt")
+        14: Swapable
+        15: InSwitchTime
+        16: CPU
+        17: IdealProc
+        18+: OldRemQnt, NewPriDecr, PrevCState, OldThrdBamQosLevel,
+             NewThrdBamQosLevel
 
-    Newer builds add columns after position 12; older may have fewer. We
-    only require the columns up through WaitReason and try to find CPU near
-    the tail. Anything we can't parse → return None to drop the row.
+    Emits the canonical CSwitch column dict that
+    :func:`etw_analyzer.parsing.mof_cswitch.decode_cswitch_v5` produces
+    on the binary path:
 
-    Emits columns: TimeStamp, NewProcessName, NewPID, NewTID, OldProcessName,
-    OldPID, OldTID, WaitReason, OldState, CPU, NewPriority, OldPriority.
+        TimeStamp, OldProcessName, OldPID, OldTID,
+        NewProcessName, NewPID, NewTID, WaitReason, WaitMode,
+        OldThreadState, NewPriority, OldPriority, CPU, Extra4
+
+    ``WaitMode`` and ``Extra4`` are not present in dumper text; we still
+    surface them in the dict so the schema matches the binary decoder
+    (``WaitMode=""``, ``Extra4=None``).
     """
-    if len(parts) < 13:
+    if len(parts) < 14:
         return None
 
     try:
         timestamp = int(parts[1].strip())
         new_tid = int(parts[3].strip())
-        old_tid = int(parts[8].strip())
+        old_tid = int(parts[9].strip())
     except (ValueError, IndexError):
         return None
 
     new_name, new_pid = _parse_proc_field(parts[2])
-    old_name, old_pid = _parse_proc_field(parts[7])
+    old_name, old_pid = _parse_proc_field(parts[8])
 
     # Priorities (best-effort)
     try:
@@ -845,53 +867,56 @@ def _handle_cswitch(parts: list[str], **_kwargs) -> dict | None:
     except (ValueError, IndexError):
         new_pri = -1
     try:
-        old_pri = int(parts[9].strip())
+        old_pri = int(parts[10].strip())
     except (ValueError, IndexError):
         old_pri = -1
 
-    old_state = parts[11].strip()
-    wait_reason = parts[12].strip()
+    old_state = parts[12].strip()
+    wait_reason = parts[13].strip()
 
-    # CPU is at position 15 in the standard recent-build layout:
-    #   13:Swapable, 14:InSwitchTime, 15:CPU, 16:IdealProc, ...
-    # If position 15 isn't a valid CPU number, fall back to scanning a wider
-    # window for the first small non-negative integer that looks like a CPU
-    # number (skip very large values which are timing fields).
+    # CPU is at position 16 in the documented layout above:
+    #   14:Swapable, 15:InSwitchTime, 16:CPU, 17:IdealProc, ...
+    # Fall back to scanning a small window if the position-16 value is not
+    # a plausible CPU number — covers any remaining layout drift.
     cpu = -1
-    if len(parts) > 15:
+    if len(parts) > 16:
         try:
-            cpu = int(parts[15].strip())
+            cpu = int(parts[16].strip())
         except (ValueError, IndexError):
             cpu = -1
     if cpu < 0 or cpu >= 4096:
-        # Layout drift fallback. Skip Swapable (small boolean) and
-        # InSwitchTime (potentially large timestamp) by looking past them.
         cpu = -1
-        for idx in range(14, min(len(parts), 19)):
+        for idx in range(15, min(len(parts), 20)):
             candidate = parts[idx].strip()
             try:
                 value = int(candidate)
             except ValueError:
                 continue
-            # CPU numbers are 0..4095 in practice. Also exclude obvious
-            # InSwitchTime values (typically much larger).
+            # CPU numbers are 0..4095 in practice. Skip obvious large
+            # InSwitchTime values that may sneak through.
             if 0 <= value < 4096:
                 cpu = value
                 break
 
     return {
         "TimeStamp": timestamp,
-        "NewProcessName": new_name,
-        "NewPID": new_pid,
-        "NewTID": new_tid,
         "OldProcessName": old_name,
         "OldPID": old_pid,
         "OldTID": old_tid,
+        "NewProcessName": new_name,
+        "NewPID": new_pid,
+        "NewTID": new_tid,
         "WaitReason": wait_reason,
-        "OldState": old_state,
-        "CPU": cpu,
+        # Not surfaced by xperf-dumper text. The binary MOF path
+        # (mof_cswitch.decode_cswitch_v5) fills this in; here we keep the
+        # key so the DataFrame schema is the same on both code paths.
+        "WaitMode": "",
+        "OldThreadState": old_state,
         "NewPriority": new_pri,
         "OldPriority": old_pri,
+        "CPU": cpu,
+        # Likewise — only the binary v=5 payload carries Extra4.
+        "Extra4": None,
     }
 
 

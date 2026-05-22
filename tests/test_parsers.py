@@ -290,10 +290,10 @@ SampledProfile, TimeStamp, Process Name ( PID), ThreadID, PrgrmCtr, CPU, ThreadS
     SampledProfile, 1000, echo_server.exe (1234), 5678, 0x7fff00000000, 0, ntdll.dll!Start, ntoskrnl.exe!KiIdleLoop, 1, Profile
     SampledProfile, 1100, echo_server.exe (1234), 5678, 0x7fff00000010, 7, ntdll.dll!Start, tcpip.sys!UdpReceiveDatagrams, 1, Profile
     SampledProfileNmi, 1200, ignored.exe (9), 9, 0x0, 0, x!y, x!y, 1, Profile
-CSwitch, TimeStamp, New Process Name ( PID), New TID, NPri, NQnt, NWaitTime, OldProcess ( PID), OldTID, OPri, OQnt, OldState, WaitReason, Swapable, InSwitchTime, CPU, IdealProc, OldRemQnt, NewPriDecr, PrevCState
-    CSwitch, 2000, echo_server.exe (1234), 5678, 9, 0, 100, Idle (   0), 0, 0, 0, Waiting, WrQueue, 1, 12345, 3, 0, 0, 0, 0
-    CSwitch, 2100, echo_server.exe (1234), 5678, 9, 0, 50, dwm.exe (4321), 9999, 8, 0, Waiting, WrDispatchInt, 1, 200, 5, 0, 0, 0, 0
-    CSwitch, 2200, Idle (   0), 0, 0, 0, 0, echo_server.exe (1234), 5678, 9, 0, Standby, WrPreempted, 1, 100, 3, 0, 0, 0, 0
+CSwitch, TimeStamp, New Process Name ( PID), New TID, NPri, NQnt, TmSinceLast, WaitTime, Old Process Name ( PID), Old TID, OPri, OQnt, OldState, Wait Reason, Swapable, InSwitchTime, CPU, IdealProc, OldRemQnt, NewPriDecr, PrevCState
+    CSwitch, 2000, echo_server.exe (1234), 5678, 9, 0, 0, 100, Idle (   0), 0, 0, 0, Waiting, WrQueue, NonSwap, 12345, 3, 0, 0, 0, 0
+    CSwitch, 2100, echo_server.exe (1234), 5678, 9, 0, 0, 50, dwm.exe (4321), 9999, 8, 0, Waiting, WrDispatchInt, NonSwap, 200, 5, 0, 0, 0, 0
+    CSwitch, 2200, Idle (   0), 0, 0, 0, 0, 0, echo_server.exe (1234), 5678, 9, 0, Standby, WrPreempted, NonSwap, 100, 3, 0, 0, 0, 0
     CSwitch, malformed, this row has, way too few, fields
 """
 
@@ -334,8 +334,8 @@ class TestParseDumperEvents:
         cs = results["CSwitch"]
         expected = {
             "TimeStamp", "NewProcessName", "NewPID", "NewTID",
-            "OldProcessName", "OldPID", "OldTID", "WaitReason",
-            "OldState", "CPU", "NewPriority", "OldPriority",
+            "OldProcessName", "OldPID", "OldTID", "WaitReason", "WaitMode",
+            "OldThreadState", "CPU", "NewPriority", "OldPriority", "Extra4",
         }
         assert expected <= set(cs.columns)
 
@@ -349,8 +349,10 @@ class TestParseDumperEvents:
         assert first["NewTID"] == 5678
         assert first["OldProcessName"] == "Idle"
         assert first["OldTID"] == 0
-        # CPU column was at position 15 in our layout (value 3).
+        # CPU column is at position 16 in the current xperf layout.
         assert first["CPU"] == 3
+        # Extra4 only comes from the binary path; xperf-text leaves it None.
+        assert first["Extra4"] is None
 
     def test_event_classes_filter_skips_cswitch(self, tmp_path):
         with self._patch_xperf_lines(_DUMPER_TEXT):
@@ -371,11 +373,15 @@ class TestParseDumperEvents:
         assert (sp["TimeStamp"] != 1200).all()
 
     def test_malformed_cswitch_lines_skipped(self, tmp_path):
+        # Current xperf layout (21 fields after the prefix):
+        # CSwitch, ts, new_proc, new_tid, npri, nqnt, tmsincelast, waittime,
+        #   old_proc, old_tid, opri, oqnt, oldstate, waitreason, swap,
+        #   inswitchtime, cpu, idealproc, ...
         bad_text = (
             "CSwitch, TimeStamp, New Process Name ( PID), New TID, ...header...\n"
             "    CSwitch, abc, not, a, valid, row\n"  # non-numeric timestamp via header gate
-            "    CSwitch, 100, echo_server.exe (1), notanint, 0, 0, 0, Idle (0), 0, 0, 0, Waiting, WrQueue, 1, 1, 0, 0, 0, 0, 0\n"
-            "    CSwitch, 200, echo_server.exe (1), 5, 9, 0, 0, Idle (0), 0, 0, 0, Waiting, WrQueue, 1, 1, 0, 0, 0, 0, 0\n"
+            "    CSwitch, 100, echo_server.exe (1), notanint, 0, 0, 0, 0, Idle (0), 0, 0, 0, Waiting, WrQueue, NonSwap, 1, 0, 0, 0, 0, 0\n"
+            "    CSwitch, 200, echo_server.exe (1), 5, 9, 0, 0, 0, Idle (0), 0, 0, 0, Waiting, WrQueue, NonSwap, 1, 0, 0, 0, 0, 0\n"
         )
         with self._patch_xperf_lines(bad_text):
             results = parse_dumper_events(tmp_path / "fake.etl")
@@ -386,7 +392,7 @@ class TestParseDumperEvents:
     def test_too_few_commas_skipped(self, tmp_path):
         """CSwitch rows with not enough fields must not crash the parser."""
         short_text = (
-            "    CSwitch, 100, only, three, four, five, six\n"  # < 13 fields
+            "    CSwitch, 100, only, three, four, five, six\n"  # < 14 fields
         )
         with self._patch_xperf_lines(short_text):
             results = parse_dumper_events(tmp_path / "fake.etl")
@@ -439,28 +445,117 @@ SampledProfile, TimeStamp, Process Name ( PID), ThreadID, PrgrmCtr, CPU, ThreadS
 class TestCswitchHandlerDirect:
     """Direct unit tests for the CSwitch handler — easier to debug schema drift."""
 
+    # Real CSwitch line from xperf -a dumper on a current Windows build
+    # (captured from C:/traces/vmserver-networking-test.etl). Column layout:
+    # 0:"CSwitch", 1:ts, 2:newproc, 3:newtid, 4:npri, 5:nqnt, 6:tmsincelast,
+    # 7:waittime, 8:oldproc, 9:oldtid, 10:opri, 11:oqnt, 12:oldstate,
+    # 13:waitreason, 14:swap, 15:inswitchtime, 16:cpu, 17:idealproc, ...
+    _REAL_ROW = (
+        "CSwitch, 56678, System (   4), 3388, 8, -1, 0, 0, "
+        "Idle (   0), 0, 0, -1, Running, Executive, NonSwap, 0, "
+        "62, 62, 0, 0, 1, Important, Important"
+    )
+
     def test_standard_layout(self):
-        parts = (
-            "CSwitch, 1000, echo_server.exe (1234), 5678, 9, 0, 100, "
-            "Idle (   0), 0, 0, 0, Waiting, WrQueue, 1, 12345, 3, 0, 0, 0, 0"
-        ).split(",")
+        parts = self._REAL_ROW.split(",")
         row = _handle_cswitch(parts)
         assert row is not None
-        assert row["TimeStamp"] == 1000
-        assert row["NewTID"] == 5678
+        assert row["TimeStamp"] == 56678
+        assert row["NewProcessName"] == "System"
+        assert row["NewPID"] == 4
+        assert row["NewTID"] == 3388
+        assert row["OldProcessName"] == "Idle"
+        assert row["OldPID"] == 0
         assert row["OldTID"] == 0
-        assert row["WaitReason"] == "WrQueue"
-        assert row["OldState"] == "Waiting"
-        assert row["CPU"] == 3
+        # The off-by-one bug used to put "0" (WaitTime) in OldProcessName
+        # and tried to parse "Idle (   0)" as OldTID — every row was
+        # dropped. Fixed layout reads the real columns.
+        assert row["WaitReason"] == "Executive"
+        assert row["OldThreadState"] == "Running"
+        assert row["CPU"] == 62
+        assert row["NewPriority"] == 8
+        assert row["OldPriority"] == 0
+        # WaitMode / Extra4 are binary-only; xperf-text path leaves them
+        # as the schema sentinels.
+        assert row["WaitMode"] == ""
+        assert row["Extra4"] is None
 
     def test_short_row_returns_none(self):
         row = _handle_cswitch(["CSwitch", "1000", "foo"])
         assert row is None
 
     def test_non_numeric_tid_returns_none(self):
-        parts = (
-            "CSwitch, 1000, echo_server.exe (1234), notanint, 9, 0, 100, "
-            "Idle (   0), 0, 0, 0, Waiting, WrQueue, 1, 12345, 3, 0, 0, 0, 0"
-        ).split(",")
+        # NewTID is at position 3 — replacing it with a non-integer must
+        # cause the row to be dropped.
+        parts = self._REAL_ROW.split(",")
+        parts[3] = " notanint"
         row = _handle_cswitch(parts)
         assert row is None
+
+    def test_text_and_binary_paths_produce_same_keys(self):
+        """The xperf-text adapter and the binary MOF decoder must emit
+        dicts with the same key set so downstream code is uniform across
+        both code paths.
+        """
+        from etw_analyzer.parsing.mof_cswitch import decode_cswitch_v5
+
+        text_row = _handle_cswitch(self._REAL_ROW.split(","))
+        # Synthetic payload matching the text row's fields: NewThreadId=3388,
+        # OldThreadId=0, NewPri=8, OldPri=0, OldThreadState=2 (Running),
+        # WaitReason=0 (Executive), all other bytes 0.
+        # Layout: <IIbbBbbbbbII
+        import struct
+        payload = struct.pack(
+            "<IIbbBbbbbbII",
+            3388,   # NewThreadId
+            0,      # OldThreadId
+            8,      # NewPri
+            0,      # OldPri
+            0,      # PrevCState
+            0,      # SpareByte
+            0,      # OldWaitReason -> Executive
+            0,      # OldWaitMode   -> KernelMode
+            2,      # OldThreadState -> Running
+            62,     # OldWaitIdealProcessor
+            0,      # NewThreadWaitTime
+            0,      # Reserved
+        )
+        bin_row = decode_cswitch_v5(
+            payload,
+            hdr={
+                "TimeStamp": 56678,
+                "ProcessorNumber": 62,
+                "ProcessId": 4,
+                "ThreadId": 3388,
+            },
+        )
+        assert text_row is not None
+        assert bin_row is not None
+        assert set(text_row.keys()) == set(bin_row.keys())
+
+        # Numeric fields the two paths *should* agree on:
+        for key in ("TimeStamp", "NewTID", "OldTID", "CPU",
+                    "NewPriority", "OldPriority"):
+            assert text_row[key] == bin_row[key], (
+                f"mismatch on {key}: text={text_row[key]!r} bin={bin_row[key]!r}"
+            )
+        # String-enum fields the binary decoder resolves and the text path
+        # gets straight from xperf — same logical value either way.
+        assert text_row["WaitReason"] == bin_row["WaitReason"] == "Executive"
+        assert text_row["OldThreadState"] == bin_row["OldThreadState"] == "Running"
+
+    def test_off_by_one_bug_is_fixed(self):
+        """Regression test for the silent CSwitch-drop bug.
+
+        Pre-fix, ``_handle_cswitch`` read ``parts[8]`` as ``Old TID`` but
+        the current xperf layout puts ``Old Process Name`` there, so the
+        ``int()`` raised and every row was dropped. The fix must accept
+        this real captured line.
+        """
+        row = _handle_cswitch(self._REAL_ROW.split(","))
+        assert row is not None
+        # The unique tells: OldProcessName="Idle" and OldThreadState
+        # comes from a string column, not a number from WaitTime.
+        assert row["OldProcessName"] == "Idle"
+        assert row["OldThreadState"] == "Running"
+        assert row["WaitReason"] == "Executive"

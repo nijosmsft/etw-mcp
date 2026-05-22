@@ -70,8 +70,8 @@ def _patch_xperf_lines(text: str):
 _FIXTURE_DUMPER = """\
 SampledProfile, TimeStamp, Process Name ( PID), ThreadID, PrgrmCtr, CPU, ThreadStartImage!Function, Image!Function, Count, Type
     SampledProfile, 1000, echo_server.exe (1234), 5678, 0x0, 0, x!y, ntoskrnl.exe!KiIdle, 1, Profile
-CSwitch, TimeStamp, New Process Name ( PID), New TID, NPri, NQnt, NWaitTime, OldProc ( PID), OldTID, OPri, OQnt, OldState, WaitReason, Swapable, InSwitchTime, CPU, IdealProc, OldRemQnt, NewPriDecr, PrevCState
-    CSwitch, 2000, echo_server.exe (1234), 5678, 9, 0, 100, Idle (   0), 0, 0, 0, Waiting, WrQueue, 1, 12345, 3, 0, 0, 0, 0
+CSwitch, TimeStamp, New Process Name ( PID), New TID, NPri, NQnt, TmSinceLast, WaitTime, Old Process Name ( PID), Old TID, OPri, OQnt, OldState, Wait Reason, Swapable, InSwitchTime, CPU, IdealProc, OldRemQnt, NewPriDecr, PrevCState
+    CSwitch, 2000, echo_server.exe (1234), 5678, 9, 0, 0, 100, Idle (   0), 0, 0, 0, Waiting, WrQueue, NonSwap, 12345, 3, 0, 0, 0, 0
 TcpIp/Recv, TimeStamp, Process Name ( PID), ThreadID, CPU, size, daddr, saddr, dport, sport, seqnum, connid
     TcpIp/Recv, 3000, echo_server.exe (1234), 5678, 4, 1024, 10.0.0.5, 10.0.0.7, 5000, 40000, 100, 1
     TcpIp/Recv, 3100, echo_server.exe (1234), 5678, 4, 1024, 10.0.0.5, 10.0.0.7, 5000, 40000, 200, 1

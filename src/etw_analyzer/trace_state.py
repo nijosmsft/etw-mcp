@@ -30,8 +30,9 @@ class TraceData:
     # Cached parsed CSwitch events (also from xperf -a dumper, single pass).
     # Populated by the same background thread that fills ``dumper_df``. Each
     # row has TimeStamp, NewProcessName/PID/TID, OldProcessName/PID/TID,
-    # WaitReason, OldState, CPU, NewPriority, OldPriority. None until the
-    # extraction completes (use ``wait_for_dumper`` to block).
+    # WaitReason, WaitMode, OldThreadState, CPU, NewPriority, OldPriority,
+    # Extra4. None until the extraction completes (use ``wait_for_dumper``
+    # to block).
     cswitch_events_df: pd.DataFrame | None = None
 
     # Phase 3a: per-event-class networking DataFrames populated by the same

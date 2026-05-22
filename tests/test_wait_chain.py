@@ -51,7 +51,7 @@ def _cswitch_row(
         "OldPID": old_pid,
         "OldTID": old_tid,
         "WaitReason": wait_reason,
-        "OldState": old_state,
+        "OldThreadState": old_state,
         "CPU": cpu,
         "NewPriority": 9,
         "OldPriority": 0,

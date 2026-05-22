@@ -85,7 +85,7 @@ def _format_thread_section(
     sample_df = pd.DataFrame(sample_rows)
     # Project to the columns we want to display, in a stable order. Skip
     # columns that aren't present (defensive against schema drift).
-    desired = ["TimeStamp", "WaitReason", "OldTID", "OldProcessName", "OldState", "CPU"]
+    desired = ["TimeStamp", "WaitReason", "OldTID", "OldProcessName", "OldThreadState", "CPU"]
     present = [c for c in desired if c in sample_df.columns]
     sample_df = sample_df[present] if present else sample_df
 
