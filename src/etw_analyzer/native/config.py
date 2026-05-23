@@ -4,13 +4,19 @@ The resolution order is documented in the design doc §8.1:
 
     1. The explicit ``mode=...`` argument on ``load_trace``.
     2. The ``WPR_MCP_MODE`` environment variable.
-    3. The hard-coded default ``"xperf"`` (Phase N5 will flip to
-       ``"auto"``).
+    3. The hard-coded default ``"auto"`` (Phase N5 flipped this from
+       ``"xperf"`` once the native pipeline reached parity).
 
 When ``"auto"`` is requested, the resolved mode is computed by probing
 the native consumer; on failure the result is ``"xperf"`` and the
 auto-detect failure is cached for the lifetime of the process so we
 don't re-probe on every load.
+
+When ``"native"`` is requested explicitly but the consumer is not
+available (e.g. running on a non-Windows host, or ``tdh.dll`` failed
+to load), :func:`resolve_mode` raises ``RuntimeError``. Auto silently
+falls back to xperf in the same situation — the contract is "explicit
+wins over graceful degradation".
 """
 
 from __future__ import annotations
@@ -40,7 +46,7 @@ def normalize_mode(mode: Optional[str]) -> str:
     """
 
     if mode is None:
-        return "xperf"
+        return "auto"
     m = mode.lower()
     if m not in VALID_MODES:
         raise ValueError(
@@ -57,21 +63,37 @@ def resolve_mode(
 
     Returns one of ``"xperf"`` or ``"native"`` — ``"auto"`` is always
     collapsed to a concrete choice.
+
+    Raises
+    ------
+    RuntimeError
+        When ``mode="native"`` is requested explicitly (via arg or env
+        var) but the native consumer is not available on this host.
+        ``mode="auto"`` silently degrades to ``"xperf"`` instead.
     """
 
     global _AUTO_CACHED
 
     env_mode = os.environ.get("WPR_MCP_MODE")
 
-    # Arg wins. Empty string is treated as "not provided" so users can
-    # pass through environment-driven config without quoting tricks.
+    # Arg wins, except that ``"auto"`` is treated as "let policy
+    # decide" — i.e. it's indistinguishable from "no arg passed"
+    # because Python can't tell a caller-supplied ``"auto"`` from
+    # the default. That lets the env var override the new default
+    # without needing the caller to pass ``mode=None``. Empty string
+    # is also treated as "not provided" so callers can pipe through
+    # environment-driven config without quoting tricks.
     candidate: Optional[str] = None
     if arg_mode:
-        candidate = normalize_mode(arg_mode)
+        normalized_arg = normalize_mode(arg_mode)
+        if normalized_arg == "auto" and env_mode:
+            candidate = normalize_mode(env_mode)
+        else:
+            candidate = normalized_arg
     elif env_mode:
         candidate = normalize_mode(env_mode)
     else:
-        candidate = "xperf"
+        candidate = "auto"
 
     if candidate == "auto":
         if _AUTO_CACHED is not None:
@@ -86,6 +108,29 @@ def resolve_mode(
         else:
             _AUTO_CACHED = "xperf"
         return _AUTO_CACHED
+
+    if candidate == "native":
+        # Explicit native request — fail loudly when the consumer is
+        # unavailable so the caller knows to switch to xperf rather
+        # than silently getting a different pipeline.
+        try:
+            from .consumer import is_available
+        except Exception as exc:
+            raise RuntimeError(
+                "mode='native' was requested but the native ETW consumer "
+                "could not be imported on this host. Use mode='xperf' "
+                "(or set WPR_MCP_MODE=xperf) to fall back to the "
+                "text-based xperf extraction pipeline. "
+                f"Underlying error: {exc}"
+            ) from exc
+        if not is_available(etl_path):
+            raise RuntimeError(
+                "mode='native' was requested but the native ETW consumer "
+                "is not available on this host (advapi32/tdh failed to "
+                "load, or the trace file could not be probed). Use "
+                "mode='xperf' (or set WPR_MCP_MODE=xperf) to fall back "
+                "to the text-based xperf extraction pipeline."
+            )
 
     return candidate
 

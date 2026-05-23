@@ -294,11 +294,47 @@ def test_load_trace_native_produces_sampled_profile_df(isolate_traces):
 
 @need_multi_provider
 def test_load_trace_xperf_mode_is_unchanged(isolate_traces):
-    """Default mode='xperf' must keep working exactly as before."""
+    """Explicit mode='xperf' opt-out must keep working after the Phase N5 flip."""
     from etw_analyzer.tools.trace_mgmt import load_trace
     from etw_analyzer.trace_state import get_trace
 
     _clear_export_dir(MULTI_PROVIDER_ETL)
+    # Phase N5: ``"xperf"`` is now opt-in (the default is ``"auto"``
+    # which prefers native). This test pins the contract that the
+    # legacy pipeline is still reachable on demand.
+    result = load_trace(str(MULTI_PROVIDER_ETL), mode="xperf")
+    tid = _extract_trace_id(result)
+    trace = get_trace(tid)
+    assert trace.mode == "xperf"
+
+
+@need_multi_provider
+def test_load_trace_default_uses_native(isolate_traces):
+    """Phase N5: the default (no ``mode=`` arg) resolves to native on Windows."""
+    from etw_analyzer.tools.trace_mgmt import load_trace
+    from etw_analyzer.trace_state import get_trace
+
+    _clear_export_dir(MULTI_PROVIDER_ETL)
+    # No ``mode=`` arg — the default is now ``"auto"`` which picks
+    # native when the bindings load (always true on Windows hosts
+    # where this test runs; the module-level pytestmark skips
+    # everywhere else).
+    result = load_trace(str(MULTI_PROVIDER_ETL))
+    tid = _extract_trace_id(result)
+    trace = get_trace(tid)
+    assert trace.mode == "native"
+
+
+@need_multi_provider
+def test_wpr_mcp_mode_env_var_can_force_xperf(isolate_traces, monkeypatch):
+    """Setting WPR_MCP_MODE=xperf opts out of the new native default."""
+    from etw_analyzer.tools.trace_mgmt import load_trace
+    from etw_analyzer.trace_state import get_trace
+
+    monkeypatch.setenv("WPR_MCP_MODE", "xperf")
+    _clear_export_dir(MULTI_PROVIDER_ETL)
+    # No explicit ``mode=`` arg — the env var takes over and forces
+    # the legacy xperf pipeline.
     result = load_trace(str(MULTI_PROVIDER_ETL))
     tid = _extract_trace_id(result)
     trace = get_trace(tid)
@@ -307,33 +343,33 @@ def test_load_trace_xperf_mode_is_unchanged(isolate_traces):
 
 @need_multi_provider
 def test_wpr_mcp_mode_env_var_overrides_arg(isolate_traces, monkeypatch):
-    """WPR_MCP_MODE wins over the load_trace arg when set."""
+    """The explicit ``mode=`` arg wins over the env var when both are set."""
     from etw_analyzer.tools.trace_mgmt import load_trace
     from etw_analyzer.trace_state import get_trace
 
     monkeypatch.setenv("WPR_MCP_MODE", "native")
     _clear_export_dir(MULTI_PROVIDER_ETL)
-    # Explicit mode='xperf' is overridden by the env var.
+    # Explicit mode='xperf' beats the env var per the documented
+    # precedence (arg > env > default).
     result = load_trace(str(MULTI_PROVIDER_ETL), mode="xperf")
     tid = _extract_trace_id(result)
     trace = get_trace(tid)
-    # WPR_MCP_MODE only kicks in when the arg is None/empty per the
-    # documented precedence; double-check we honour the arg when both
-    # are set.
     assert trace.mode == "xperf"
 
 
 @need_multi_provider
 def test_wpr_mcp_mode_env_var_used_when_arg_default(isolate_traces, monkeypatch):
     """WPR_MCP_MODE is consulted when load_trace is called without mode."""
-    from etw_analyzer.native.config import resolve_mode
+    from etw_analyzer.native.config import resolve_mode, reset_auto_cache
 
     monkeypatch.setenv("WPR_MCP_MODE", "native")
-    # The default mode='xperf' is passed explicitly via Python's default
-    # arg evaluation; ``resolve_mode`` only honours the env var when the
-    # argument is falsy. This test pins the contract for resolve_mode.
+    reset_auto_cache()
+    # ``resolve_mode`` only honours the env var when the argument is
+    # falsy. This test pins the contract for resolve_mode after the
+    # Phase N5 default flip.
     assert resolve_mode(None) == "native"
     monkeypatch.setenv("WPR_MCP_MODE", "xperf")
+    reset_auto_cache()
     assert resolve_mode(None) == "xperf"
 
 

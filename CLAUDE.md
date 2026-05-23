@@ -42,8 +42,30 @@ Every analysis tool's signature starts with `trace_id: str` and calls `require_t
 
 ## Trace lifecycle
 
+Phase N5 flipped the default extraction mode from `"xperf"` to `"auto"`. `resolve_mode()` in `src/etw_analyzer/native/config.py` collapses `"auto"` to `"native"` whenever the native bindings load and to `"xperf"` otherwise. Resolution precedence: explicit `mode=` arg > `WPR_MCP_MODE` env var > the `"auto"` default. Explicit `mode="native"` raises if the consumer is unavailable; explicit `mode="xperf"` always works as the opt-out.
+
+### Native path (default)
 ```
-load_trace(etl_path)
+load_trace(etl_path)               # mode defaults to "auto"
+  → resolve_mode() → "native" when advapi32/tdh load (Windows Server / recent client)
+  → export_dir = etl_path.parent / ".etw-export-<stem>"
+  → _load_from_cache() — if parquet files newer than ETL, rehydrate without re-extracting
+  → _start_background_dumper() launches the native pipeline in a thread:
+       OpenTraceW + ProcessTrace decode every requested event class
+       (SampledProfile, CSwitch, TCPIP, UDP, AFD, NDIS, HTTP.sys, MsQuic,
+        Image/Load, PerfInfo DPC/ISR, Process, DiskIo, SystemConfig)
+       events flow through native_handlers + text_adapter → EVENT_HANDLERS
+  → Symbolizer is built from Image/Load + Image/DCStart rows
+  → _run_native_aggregators() turns the per-event DataFrames into the
+    xperf-equivalent aggregates (cpu_sampling, cpu_timeline, dpc_isr,
+    stacks, stacks_callers, sysconfig, process_info, diskio, tracestats)
+  → trace.wait_for_dumper() blocks the load until aggregators finish
+  → returns markdown summary including the trace_id
+```
+
+### xperf fallback (`mode="xperf"` or `WPR_MCP_MODE=xperf`)
+```
+load_trace(etl_path, mode="xperf")
   → find_xperf() locates xperf.exe under "Windows Kits\10\Windows Performance Toolkit"
   → export_dir = etl_path.parent / ".etw-export-<stem>"
   → _load_from_cache() — if parquet files newer than ETL, skip xperf entirely
@@ -54,14 +76,12 @@ load_trace(etl_path)
        outputs land in export_dir as .parquet (structured) or .txt (raw)
   → _refresh_stack_cache_from_html() re-parses the richer butterfly HTML into stacks.parquet
   → TraceData built with raw_csv = {profile_name: DataFrame}, registered in _traces dict
-  → _start_background_dumper() kicks off xperf -a dumper in a thread to populate
-    SampledProfile events for per-CPU queries (TraceData._dumper_future / _dumper_ready)
-  → returns markdown summary including the trace_id
+  → _start_background_dumper() kicks off xperf -a dumper in a thread for per-CPU events
+```
 
-trace_id format: "trace_<sha256[:12]>" of (lowercase path | size | mtime_ns) — stable per ETL version.
+trace_id format: `"trace_<sha256[:12]>"` of (lowercase path | size | mtime_ns) — stable per ETL version. Both pipelines produce the same trace_id and parquet schema, so a trace loaded in one mode can rehydrate from cache in the other.
 
 require_trace(trace_id) raises ValueError listing loaded IDs when the ID is unknown — propagate that message, don't swallow it.
-```
 
 ## Conventions
 

@@ -65,13 +65,13 @@ def load_trace(
     symbol_path: str | None = None,
     timeout_seconds: int = 300,
     force: bool = False,
-    mode: str = "xperf",
+    mode: str = "auto",
 ) -> str:
     """Load an ETL trace file for analysis.
 
-    Runs xperf to extract CPU sampling, DPC/ISR, and context switch data,
-    then caches the results in memory. Takes 30-180 seconds depending on
-    trace size and symbol resolution.
+    Extracts CPU sampling, DPC/ISR, context switch, networking, HTTP, and
+    QUIC events from the trace and caches the results in memory. Takes
+    30-180 seconds depending on trace size and symbol resolution.
 
     If the trace was previously loaded, uses cached data for instant reload.
     Set force=True to delete the cache and re-export from scratch.
@@ -82,16 +82,18 @@ def load_trace(
                      If not set, uses _NT_SYMBOL_PATH env var.
         timeout_seconds: Max seconds per xperf invocation. Default: 300.
         force: Delete cached exports and re-run xperf. Default: False.
-        mode: Pipeline used to populate the dumper DataFrames. Either
-              ``"xperf"`` (default — text-based ``xperf -a dumper`` extraction),
-              ``"native"`` (in-process ``OpenTraceW`` consumer added in
-              Phase N1 of the native-ETW work — see
-              ``udp-perf/docs/wpr-mcp-native-etw-design.md``), or ``"auto"``
-              (use native when available, fall back to xperf). The
-              ``WPR_MCP_MODE`` environment variable overrides this arg.
-              In Phase N1, ``"native"`` is limited — only ``SampledProfile``
-              has a working decoder; CSwitch, TCPIP, AFD etc. produce empty
-              DataFrames until Phase N2.
+        mode: Pipeline used to load the trace.
+              ``"auto"`` (default — Phase N5) probes the in-process
+              ``OpenTraceW`` consumer and uses it when available, silently
+              falling back to ``xperf.exe`` if the native bindings can't
+              load. ``"native"`` forces the in-process consumer and
+              raises if it's unavailable. ``"xperf"`` forces the legacy
+              text-based ``xperf -a dumper`` extraction. The
+              ``WPR_MCP_MODE`` environment variable overrides this arg
+              when the arg is left at its default. The native pipeline
+              extracts events xperf cannot enumerate (manifest providers
+              like TCPIP/AFD/MsQuic/HTTP.sys) — see
+              ``udp-perf/docs/wpr-mcp-native-etw-design.md``.
     """
     path = Path(etl_path)
     if not path.exists():
@@ -99,11 +101,18 @@ def load_trace(
     if not path.suffix.lower() == ".etl":
         return f"Expected .etl file, got: {path.suffix}"
 
-    # Resolve the load pipeline. Environment variable overrides the arg.
+    # Resolve the load pipeline. Environment variable overrides the arg
+    # when the arg is left at its default. An explicit ``mode="native"``
+    # request can raise ``RuntimeError`` when the consumer isn't
+    # available on this host — surface that to the caller rather than
+    # silently falling back to xperf, so they know to flip to
+    # ``mode="xperf"`` or ``mode="auto"``.
     from etw_analyzer.native.config import resolve_mode
     try:
         resolved_mode = resolve_mode(mode, etl_path=path)
     except ValueError as e:
+        return str(e)
+    except RuntimeError as e:
         return str(e)
 
     # Resolve symbol path

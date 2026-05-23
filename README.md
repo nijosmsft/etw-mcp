@@ -1,6 +1,6 @@
 # WPR Trace Analyzer MCP Server
 
-An [MCP](https://modelcontextprotocol.io/) server that lets AI coding assistants analyze Windows WPR/ETW traces (`.etl` files). Load a trace, then ask questions in natural language — the server calls `xperf.exe` under the hood and returns structured results.
+An [MCP](https://modelcontextprotocol.io/) server that lets AI coding assistants analyze Windows WPR/ETW traces (`.etl` files). Load a trace, then ask questions in natural language — the server decodes the ETL in-process via `OpenTraceW` (with a legacy `xperf.exe` fallback) and returns structured results.
 
 Works with any Windows performance trace: networking (tcpip.sys, NDIS, NIC drivers, HTTP.sys), kernel (DPCs, ISRs, context switches), and application workloads.
 
@@ -37,12 +37,12 @@ Install the WPR trace analyzer MCP server on this Windows machine:
 
 ## Installation
 
-**Windows only** — this server requires `xperf.exe` which is a Windows-only tool.
+**Windows only** — this server uses Windows ETW APIs (`advapi32`, `tdh`, `dbghelp`).
 
 ```powershell
 # 1. Install prerequisites — skip any you already have
 winget install astral-sh.uv              # Python package manager
-winget install Microsoft.WindowsSDK      # Includes xperf.exe (Windows Performance Toolkit)
+winget install Microsoft.WindowsSDK      # Optional — only needed for the xperf fallback
 
 # 2. Clone and verify
 git clone https://github.com/nijosmsft/wpr-mcp-server.git
@@ -51,7 +51,8 @@ uv run python -m etw_analyzer.server     # verify it starts (Ctrl+C to stop)
 ```
 
 - **uv** automatically downloads Python, creates a virtual environment, and installs all dependencies on first run. No separate Python install needed.
-- **xperf.exe** is installed as part of the Windows Performance Toolkit (included in the Windows SDK). Expected location: `C:\Program Files (x86)\Windows Kits\10\Windows Performance Toolkit\xperf.exe`
+- **Native ETW consumer (default)** — the server decodes ETL files in-process via `OpenTraceW`/`tdh.dll`. No external tools needed on a recent Windows build.
+- **xperf.exe (fallback)** — installed as part of the Windows Performance Toolkit (included in the Windows SDK). Only required if you opt out of the native pipeline with `mode="xperf"` or `WPR_MCP_MODE=xperf`, or when running on an older Windows build where the native bindings can't load. Expected location: `C:\Program Files (x86)\Windows Kits\10\Windows Performance Toolkit\xperf.exe`
 
 ## Setup
 
@@ -140,7 +141,7 @@ Every analysis tool requires the `trace_id` returned by `load_trace`. This allow
 | Tool | Purpose |
 |------|---------|
 | `list_traces` | Find `.etl` files in a directory |
-| `load_trace` | Load an ETL file. Runs xperf in parallel, caches as parquet. Set `force=True` to re-export. |
+| `load_trace` | Load an ETL file. Decodes events via the native consumer by default (set `mode="xperf"` to use the legacy pipeline), caches as parquet. Set `force=True` to re-export. |
 | `list_loaded_traces` | Show trace IDs currently loaded in memory |
 | `unload_trace` | Remove a loaded trace from memory |
 | `trace_info` | Show loaded trace metadata by `trace_id` |
@@ -198,6 +199,36 @@ Most analysis tools accept:
 
 `get_hot_stacks` uses xperf's butterfly `Functions by UniInclusive Hits` table, so inclusive and exclusive hit counts are kept separate. `walk_stack` and `butterfly_chain` use the butterfly caller/callee table and require the `trace_id` returned by `load_trace`. `count_stacks` currently works from aggregate butterfly edges, so it estimates matching sample counts rather than counting distinct raw stack instances.
 
+### Trace Loading Modes
+
+`load_trace` accepts a `mode` argument that selects the extraction pipeline:
+
+| Mode | Behavior |
+|------|----------|
+| `"auto"` (default) | Probes the in-process native consumer. Uses it when available; silently falls back to xperf when the bindings can't load (e.g. older Windows builds). |
+| `"native"` | Forces the in-process `OpenTraceW`/`tdh.dll` consumer. Decodes manifest providers (TCPIP, AFD, MsQuic, HTTP.sys) that xperf cannot enumerate. Raises an error if the native bindings aren't available — does not fall back. |
+| `"xperf"` | Forces the legacy `xperf.exe -a dumper` text-based extraction. Requires the Windows Performance Toolkit on PATH. Use this if you hit a native-mode bug or are running on a build the native consumer doesn't support. |
+
+The `WPR_MCP_MODE` environment variable overrides the default when `mode=` is left unspecified. Set `WPR_MCP_MODE=xperf` in your MCP config to opt every load_trace call back to the legacy pipeline:
+
+```json
+{
+  "mcpServers": {
+    "wpr-trace-analyzer": {
+      "type": "stdio",
+      "command": "uv",
+      "args": ["run", "--directory", "C:\\path\\to\\wpr-mcp-server", "python", "-m", "etw_analyzer.server"],
+      "env": {
+        "_NT_SYMBOL_PATH": "srv*C:\\symbols*https://msdl.microsoft.com/download/symbols",
+        "WPR_MCP_MODE": "xperf"
+      }
+    }
+  }
+}
+```
+
+The explicit `mode=` arg always wins over the env var. Both pipelines write the same parquet cache layout, so traces loaded in one mode can be rehydrated from cache in the other without re-extracting.
+
 ### Parallel Analysis
 
 The server supports multiple loaded traces in one MCP server process when callers pass `trace_id` explicitly. Each analysis tool resolves data from the requested trace ID instead of using shared "current trace" state, so parallel agents can safely analyze different ETLs at the same time.
@@ -207,7 +238,15 @@ The server supports multiple loaded traces in one MCP server process when caller
 ```
 AI Assistant ←stdio→ wpr-mcp-server (Python)
                          │
-                         ├── xperf.exe (9 parallel actions on load)
+                         ├── Native consumer (default, mode="auto" or "native")
+                         │   ├── OpenTraceW / ProcessTrace via advapi32
+                         │   ├── TdhGetEventInformation via tdh.dll
+                         │   ├── dbghelp.dll for symbolization
+                         │   └── In-process event dispatch → aggregators
+                         │       → CPU sampling, DPC/ISR, CSwitch, TCPIP, UDP,
+                         │         AFD, NDIS PacketCapture, HTTP.sys, MsQuic, ...
+                         │
+                         ├── xperf.exe (fallback, mode="xperf")
                          │   ├── profile -detail   → CPU sampling (module!function)
                          │   ├── profile -util     → Per-CPU utilization timeline
                          │   ├── dpcisr            → DPC/ISR histograms
@@ -222,6 +261,7 @@ AI Assistant ←stdio→ wpr-mcp-server (Python)
                          ├── parquet cache (.etw-export-<name>/)
                          │   Structured data saved as .parquet for instant reload.
                          │   Raw text saved as .txt. Cache invalidated when ETL is newer.
+                         │   Shared between native and xperf modes.
                          │
                          ├── pandas (aggregation + filtering)
                          └── FastMCP (stdio transport)
@@ -229,9 +269,10 @@ AI Assistant ←stdio→ wpr-mcp-server (Python)
 
 ### Performance
 
-- **First load:** 30-180s (9 xperf actions run in parallel with 4 workers)
-- **Subsequent loads:** Instant (reads from parquet cache)
-- **Per-CPU queries:** First query parses all SampledProfile events (~30s), subsequent queries filter in-memory (<1s)
+- **First load (native, default):** 5-30s for typical traces. Single in-process pass — no subprocess overhead.
+- **First load (xperf fallback):** 30-180s (9 xperf actions run in parallel with 4 workers)
+- **Subsequent loads:** Instant (reads from parquet cache, regardless of mode)
+- **Per-CPU queries:** First query parses all SampledProfile events, subsequent queries filter in-memory (<1s)
 - **Trace comparison:** Uses cache from both traces — instant if both were previously loaded
 
 ## Project Structure
