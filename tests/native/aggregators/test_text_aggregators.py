@@ -40,6 +40,20 @@ class TestSysconfig:
         assert "CPU: 2 record" in text
         assert "NIC: 1 record" in text
 
+    def test_metadata_only(self):
+        metadata = pd.DataFrame([{
+            "NumberOfProcessors": 80,
+            "DurationSeconds": 16.4502142,
+            "CpuSpeedInMHz": 2295,
+            "TimerResolution": 156250,
+            "PointerSize": 8,
+        }])
+        text = build_sysconfig_text(_trace_with({"trace_metadata": metadata}))
+        assert text is not None
+        assert "ProcessorNum: 80" in text
+        assert "ProcessorSpeed: 2295" in text
+        assert "DurationSeconds: 16.4502142" in text
+
 
 class TestProcessInfo:
     def test_empty(self):
@@ -100,7 +114,24 @@ class TestTracestats:
         assert text is not None
         assert "cpu_sampling: 1000" in text
 
+    def test_with_metadata_only(self):
+        metadata = pd.DataFrame([{
+            "NumberOfProcessors": 80,
+            "DurationSeconds": 16.4502142,
+            "EventsLost": 0,
+            "BuffersLost": 0,
+            "BuffersWritten": 42,
+        }])
+        trace = _trace_with(raw_csv={"trace_metadata": metadata})
+        text = build_tracestats_text(trace)
+        assert text is not None
+        assert "Number of Processors : 80" in text
+        assert "Trace duration (s)   : 16.4502142" in text
+        assert "Total # Lost Events  : 0" in text
+        assert "Buffers Written      : 42" in text
+
     def test_with_extract_stats(self):
+        from etw_analyzer.native.consumer import TraceLogfileMetadata
         from etw_analyzer.native.extract import ExtractStats
         stats = ExtractStats(
             event_count=12345,
@@ -111,9 +142,23 @@ class TestTracestats:
             events_lost=0,
             stacks_paired=600,
             stacks_orphan=200,
+            logfile_metadata=[TraceLogfileMetadata(
+                number_of_processors=80,
+                start_time_utc_100ns=1_000_000_000,
+                end_time_utc_100ns=1_164_502_142,
+                perf_freq=10_000_000,
+                timer_resolution_100ns=156_250,
+                cpu_speed_mhz=2295,
+                events_lost=0,
+                buffers_lost=0,
+                buffers_written=1,
+                pointer_size=8,
+            )],
         )
         trace = _trace_with(extract_stats=stats)
         text = build_tracestats_text(trace)
         assert text is not None
+        assert "Number of Processors : 80" in text
+        assert "Trace duration (s)   : 16.4502142" in text
         assert "Total events:    12345" in text
         assert "SampledProfile: 800" in text

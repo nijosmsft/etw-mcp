@@ -27,6 +27,9 @@ from typing import Optional
 
 
 VALID_MODES = frozenset({"xperf", "native", "auto"})
+DEFAULT_NATIVE_MAX_ETL_MB = 512.0
+NATIVE_MAX_ETL_MB_ENV = "WPR_MCP_NATIVE_MAX_ETL_MB"
+NATIVE_ALLOW_LARGE_ENV = "WPR_MCP_NATIVE_ALLOW_LARGE"
 
 
 # Cache the auto-detect result so we don't pay the ``OpenTraceW`` probe
@@ -135,6 +138,83 @@ def resolve_mode(
     return candidate
 
 
+def _etl_size_mb(etl_path: Path | str) -> float:
+    return Path(etl_path).stat().st_size / (1024 * 1024)
+
+
+def _native_max_etl_mb() -> float:
+    raw = os.environ.get(NATIVE_MAX_ETL_MB_ENV)
+    if raw is None or raw.strip() == "":
+        return DEFAULT_NATIVE_MAX_ETL_MB
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"{NATIVE_MAX_ETL_MB_ENV} must be a positive number of MB, got {raw!r}."
+        ) from exc
+    if value <= 0:
+        raise ValueError(
+            f"{NATIVE_MAX_ETL_MB_ENV} must be a positive number of MB, got {raw!r}."
+        )
+    return value
+
+
+def _allow_large_native() -> bool:
+    return os.environ.get(NATIVE_ALLOW_LARGE_ENV) == "1"
+
+
+def _native_was_forced(arg_mode: Optional[str]) -> bool:
+    if arg_mode:
+        normalized_arg = normalize_mode(arg_mode)
+        if normalized_arg == "native":
+            return True
+        if normalized_arg != "auto":
+            return False
+
+    env_mode = os.environ.get("WPR_MCP_MODE")
+    if env_mode:
+        return normalize_mode(env_mode) == "native"
+    return False
+
+
+def apply_native_size_guardrail(
+    arg_mode: Optional[str],
+    resolved_mode: str,
+    etl_path: Path | str,
+) -> tuple[str, str | None]:
+    """Apply the native ETW size guardrail.
+
+    Native extraction buffers decoded events today. To avoid OOM on large
+    traces, auto mode falls back to xperf above ``WPR_MCP_NATIVE_MAX_ETL_MB``.
+    Explicit native requests fail fast unless ``WPR_MCP_NATIVE_ALLOW_LARGE=1``
+    is set.
+    """
+
+    if resolved_mode != "native" or _allow_large_native():
+        return resolved_mode, None
+
+    max_mb = _native_max_etl_mb()
+    size_mb = _etl_size_mb(etl_path)
+    if size_mb <= max_mb:
+        return resolved_mode, None
+
+    base = (
+        f"ETL is {size_mb:.1f} MB, above the native safety limit of "
+        f"{max_mb:.1f} MB ({NATIVE_MAX_ETL_MB_ENV}). The native ETW "
+        "pipeline currently buffers decoded events and may run out of memory "
+        "on large traces."
+    )
+    if _native_was_forced(arg_mode):
+        raise RuntimeError(
+            base
+            + " Use mode='xperf' for this trace, raise "
+            f"{NATIVE_MAX_ETL_MB_ENV}, or set {NATIVE_ALLOW_LARGE_ENV}=1 to "
+            "bypass the guardrail."
+        )
+
+    return "xperf", base + " Falling back to mode='xperf'."
+
+
 def reset_auto_cache() -> None:
     """Clear the cached auto-detect result. Primarily for tests."""
 
@@ -144,6 +224,10 @@ def reset_auto_cache() -> None:
 
 __all__ = [
     "VALID_MODES",
+    "DEFAULT_NATIVE_MAX_ETL_MB",
+    "NATIVE_ALLOW_LARGE_ENV",
+    "NATIVE_MAX_ETL_MB_ENV",
+    "apply_native_size_guardrail",
     "normalize_mode",
     "resolve_mode",
     "reset_auto_cache",

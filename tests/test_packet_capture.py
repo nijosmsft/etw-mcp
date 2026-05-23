@@ -15,6 +15,7 @@ from unittest.mock import patch
 import pandas as pd
 import pytest
 
+from etw_analyzer.native.event_store import EventStoreTimebase, NativeEventStoreWriter
 from etw_analyzer.parsing.wpa_exporter import (
     EVENT_HANDLERS,
     _handle_ndis_packet_capture,
@@ -218,6 +219,55 @@ def _register_synthetic(trace_id: str, df: pd.DataFrame | None) -> TraceData:
     return trace
 
 
+def _packet_store_row(
+    sequence: int,
+    qpc: int,
+    direction: str,
+    packet_hex: str,
+    *,
+    process: str = "echo_server.exe",
+    pid: int = 100,
+) -> dict:
+    return {
+        "EventSequence": sequence,
+        "TimeStampQpc": qpc,
+        "CPU": 4,
+        "Process Name": process,
+        "PID": pid,
+        "ThreadID": 10,
+        "Direction": direction,
+        "MiniportName": "mlx5.sys",
+        "PacketBytes": packet_hex,
+        "Size": len(packet_hex) // 2,
+    }
+
+
+def _register_event_store_trace(
+    tmp_path: Path,
+    trace_id: str,
+    rows: list[dict],
+) -> TraceData:
+    writer = NativeEventStoreWriter(
+        tmp_path / f".etw-export-{trace_id}",
+        run_id=f"{trace_id}-store",
+        timebase=EventStoreTimebase(qpc_origin=0, perf_freq=1_000_000),
+        staging=False,
+        max_rows_per_part=1,
+    )
+    for row in rows:
+        writer.append("packet_capture", row)
+    trace = TraceData(
+        trace_id=trace_id,
+        etl_path=tmp_path / f"{trace_id}.etl",
+        export_dir=tmp_path / f".etw-export-{trace_id}",
+        mode="native",
+        event_store=writer.commit(),
+    )
+    trace._dumper_ready.set()
+    register_trace(trace)
+    return trace
+
+
 # ---------------------------------------------------------------------------
 # Tool tests: get_packet_capture_summary
 # ---------------------------------------------------------------------------
@@ -403,6 +453,28 @@ class TestSendRecvLatency:
         out = get_send_recv_latency("srl4")
         assert "No matched Send/Recv pairs" in out
 
+    def test_exact_window_match_survives_older_candidate_eviction(self):
+        old_send = _build_ipv4_udp(
+            src_ip="10.0.0.1", dst_ip="10.0.0.2",
+            src_port=5000, dst_port=6000, ip_id=1,
+        )
+        matched = _build_ipv4_udp(
+            src_ip="10.0.0.1", dst_ip="10.0.0.2",
+            src_port=5000, dst_port=6000, ip_id=2,
+        )
+        rows = [
+            {"TimeStamp": 0, "Direction": "Send",
+             "PacketBytes": old_send.hex(), "Size": len(old_send)},
+            {"TimeStamp": 1, "Direction": "Send",
+             "PacketBytes": matched.hex(), "Size": len(matched)},
+            {"TimeStamp": 10_001, "Direction": "Recv",
+             "PacketBytes": matched.hex(), "Size": len(matched)},
+        ]
+        _register_synthetic("srl5", _packet_capture_df(rows))
+        out = get_send_recv_latency("srl5")
+        assert "Send" in out and "Recv" in out
+        assert "| 10,000 |" in out
+
 
 # ---------------------------------------------------------------------------
 # Tool tests: decode_packet
@@ -431,6 +503,44 @@ class TestDecodePacket:
         _register_synthetic("dp2", None)
         out = decode_packet("dp2", timestamp_us=100)
         assert "No packet-capture data" in out
+
+
+class TestPacketCaptureEventStore:
+    def test_summary_decode_and_latency_without_dataframe(self, tmp_path):
+        rows = [
+            _packet_store_row(1, 1_000, "Send", _PACKET_A_HEX),
+            _packet_store_row(2, 1_200, "Recv", _PACKET_A_HEX),
+            _packet_store_row(3, 2_000, "Recv", _PACKET_B_HEX),
+        ]
+        _register_event_store_trace(tmp_path, "pc_store", rows)
+
+        summary = get_packet_capture_summary("pc_store")
+        assert "Packet Capture Summary" in summary
+        assert "10.0.0.1:5000 -> 10.0.0.2:6000/udp" in summary
+
+        decoded = decode_packet("pc_store", timestamp_us=1_010)
+        assert "Decoded Packet" in decoded
+        assert "IPv4" in decoded
+        assert "10.0.0.1" in decoded
+
+        latency = get_send_recv_latency("pc_store")
+        assert "Send" in latency and "Recv" in latency
+        assert "| 200 |" in latency
+
+    def test_malformed_packet_bytes_do_not_crash_event_store_tools(self, tmp_path):
+        rows = [
+            {
+                **_packet_store_row(1, 1_000, "Recv", "not-hex"),
+                "Size": 7,
+            },
+        ]
+        _register_event_store_trace(tmp_path, "pc_bad", rows)
+
+        summary = get_packet_capture_summary("pc_bad")
+        assert "undecoded" in summary
+
+        decoded = decode_packet("pc_bad", timestamp_us=1_000)
+        assert "failed to decode" in decoded
 
 
 # ---------------------------------------------------------------------------

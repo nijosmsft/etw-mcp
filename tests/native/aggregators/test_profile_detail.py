@@ -23,9 +23,9 @@ class _FakeSymbolizer:
         return {int(a): self._mapping.get(int(a), "") for a in addrs}
 
 
-def _make_trace(dumper_df, process_df=None, symbolizer=None):
+def _make_trace(dumper_df, process_df=None, symbolizer=None, raw_csv=None):
     """Return a tiny namespace that quacks like TraceData for these aggregators."""
-    raw_csv = {}
+    raw_csv = dict(raw_csv or {})
     if process_df is not None:
         raw_csv["_native_process_events"] = process_df
     return types.SimpleNamespace(
@@ -99,6 +99,37 @@ class TestAggregateCpuSampling:
         # Percentages sum to 100.
         assert abs(result["% Weight"].sum() - 100.0) < 0.01
 
+    def test_payload_thread_id_resolves_pid_and_process_name(self):
+        dumper = pd.DataFrame([
+            {"TimeStamp": 500_000, "Process Name": "", "PID": 0xFFFFFFFF, "CPU": 0,
+             "InstructionPointer": 0xAAA, "PayloadThreadId": 4242, "Weight": 3,
+             "Module": "", "Function": ""},
+            {"TimeStamp": 600_000, "Process Name": "unknown", "PID": 0xFFFFFFFF, "CPU": 1,
+             "InstructionPointer": 0xAAA, "PayloadThreadId": 4242, "Weight": 2,
+             "Module": "", "Function": ""},
+        ])
+        raw_csv = {
+            "Thread/DCStart": pd.DataFrame([
+                {"TimeStamp": 0, "ThreadId": 4242, "ProcessId": 1234},
+            ]),
+            "Process/DCStart": pd.DataFrame([
+                {"TimeStamp": 0, "ProcessId": 1234, "ImageFileName": "ring.exe"},
+            ]),
+        }
+        sym = _FakeSymbolizer({0xAAA: "ring.exe!busy_loop+0x10"})
+        trace = _make_trace(dumper, raw_csv=raw_csv, symbolizer=sym)
+
+        result = aggregate_cpu_sampling(trace)
+
+        assert result is not None
+        assert len(result) == 1
+        row = result.iloc[0]
+        assert row["PID"] == 1234
+        assert row["Process Name"] == "ring.exe"
+        assert row["Weight"] == 5
+        assert trace.dumper_df["PID"].tolist() == [1234, 1234]
+        assert trace.dumper_df["Process Name"].tolist() == ["ring.exe", "ring.exe"]
+
     def test_no_symbolizer_keeps_existing_columns(self):
         dumper = pd.DataFrame([
             {"TimeStamp": 1, "Process Name": "myproc", "PID": 1000, "CPU": 0,
@@ -128,3 +159,18 @@ class TestAggregateCpuSampling:
         assert len(result) == 1
         assert result.iloc[0]["Weight"] == 10
         assert result.iloc[0]["% Weight"] == pytest.approx(100.0)
+
+    def test_aggregation_prefers_profile_weight_when_present(self):
+        dumper = pd.DataFrame([
+            {"TimeStamp": 1, "Process Name": "p", "PID": 1, "CPU": 0,
+             "InstructionPointer": 0x1, "Weight": 1, "ProfileWeight": 0x50000,
+             "Module": "m.sys", "Function": "f"},
+        ])
+        sym = _FakeSymbolizer({0x1: "m.sys!f+0x0"})
+        trace = _make_trace(dumper, symbolizer=sym)
+
+        result = aggregate_cpu_sampling(trace)
+
+        assert result is not None
+        assert len(result) == 1
+        assert result.iloc[0]["Weight"] == 0x50000

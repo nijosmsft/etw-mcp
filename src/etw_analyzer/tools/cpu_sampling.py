@@ -34,6 +34,13 @@ _KERNEL_MODULES = [
 # Default set: broad networking stack coverage
 _DEFAULT_HOT_MODULES = _XDP_MODULES + _NETWORKING_MODULES + _NIC_DRIVER_MODULES + _KERNEL_MODULES
 
+_NO_CPU_SAMPLING_MSG = (
+    "No CPU sampling data available. The trace may not contain CPU sampling events.\n\n"
+    "To capture CPU sampling data, use:\n"
+    "  wpr -start CPU              (CPU sampling only)\n"
+    "  wpr -start GeneralProfile   (CPU + context switches + DPC/ISR)"
+)
+
 
 def _get_sampling_df(trace: TraceData) -> pd.DataFrame:
     """Get the CPU sampling DataFrame, trying known profile names."""
@@ -41,17 +48,7 @@ def _get_sampling_df(trace: TraceData) -> pd.DataFrame:
         if key in trace.raw_csv:
             return trace.raw_csv[key].copy()
 
-    # Fall back to first available dataset
-    if trace.raw_csv:
-        first_key = next(iter(trace.raw_csv))
-        return trace.raw_csv[first_key].copy()
-
-    raise ValueError(
-        "No CPU sampling data available. The trace may not contain CPU sampling events.\n\n"
-        "To capture CPU sampling data, use:\n"
-        "  wpr -start CPU              (CPU sampling only)\n"
-        "  wpr -start GeneralProfile   (CPU + context switches + DPC/ISR)"
-    )
+    raise ValueError(_NO_CPU_SAMPLING_MSG)
 
 
 def _find_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
@@ -237,7 +234,10 @@ def get_cpu_samples(
             function_filter=function_filter, function_col=function_col,
         )
     else:
-        df = _get_sampling_df(trace)
+        try:
+            df = _get_sampling_df(trace)
+        except ValueError as e:
+            return f"*{e}*"
 
         # Identify columns by trying common WPA export names
         weight_col = _find_col(df, ["Weight", "Count", "Sample Count", "Samples"]) or "Weight"
@@ -341,7 +341,10 @@ def get_hot_functions(
             return f"*No SampledProfile events found for CPUs {cpu_filter}.*"
         weight_col, module_col, function_col = "Weight", "Module", "Function"
     else:
-        df = _get_sampling_df(trace)
+        try:
+            df = _get_sampling_df(trace)
+        except ValueError as e:
+            return f"*{e}*"
         weight_col = _find_col(df, ["Weight", "Count", "Sample Count"]) or "Weight"
         module_col = _find_col(df, ["Module", "Image"]) or "Module"
         function_col = _find_col(df, ["Function", "Function Name", "Symbol"]) or "Function"

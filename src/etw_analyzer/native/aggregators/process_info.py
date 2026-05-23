@@ -33,6 +33,9 @@ def _gather_process_events(trace: "TraceData") -> pd.DataFrame:
     combined = raw_csv.get("_native_process_events")
     if combined is not None and not combined.empty:
         return combined
+    process_table = raw_csv.get("process")
+    if process_table is not None and not process_table.empty:
+        return process_table
 
     rows: list[pd.DataFrame] = []
     for cls in _PROCESS_CLASSES:

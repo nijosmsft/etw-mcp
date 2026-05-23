@@ -11,6 +11,7 @@ import pandas as pd
 from etw_analyzer.app import mcp
 from etw_analyzer.trace_state import require_trace
 from etw_analyzer.tools.cpu_sampling import _get_sampling_df, _find_col
+from etw_analyzer.tools.system_info import _metadata_summary
 from etw_analyzer.formatting.markdown import format_table, format_pct
 from etw_analyzer.parsing.aggregator import group_and_sum
 
@@ -39,44 +40,62 @@ def analyze(
     sections.append(f"# Trace Analysis: `{trace.etl_path.name}`\n")
 
     # Sysconfig summary
+    metadata = _metadata_summary(trace)
     sysconfig = trace.raw_csv.get("sysconfig")
+    parts = []
+    cpu_count = metadata.get("NumberOfProcessors")
+    cpu_speed = metadata.get("CpuSpeedInMHz")
+    if cpu_count:
+        parts.append(f"**{int(cpu_count)} LPs**")
+    if cpu_speed:
+        parts.append(f"{int(cpu_speed)} MHz")
     if sysconfig is not None and "raw_text" in sysconfig.columns:
         text = sysconfig.iloc[0]["raw_text"]
-        cpu_count = _extract_field(text, r"ProcessorNum:\s*(\d+)")
-        cpu_speed = _extract_field(text, r"ProcessorSpeed:\s*(\d+)")
+        cpu_count_text = _extract_field(text, r"ProcessorNum:\s*(\d+)")
+        cpu_speed_text = _extract_field(text, r"ProcessorSpeed:\s*(\d+)")
         memory = _extract_field(text, r"MemorySize:\s*(\d+)")
         nic = _extract_field(text, r"Device Desc:\s*(.+?)(?:\n|$)")
 
-        parts = []
-        if cpu_count:
-            parts.append(f"**{cpu_count} LPs**")
-        if cpu_speed:
-            parts.append(f"{cpu_speed} MHz")
+        if not cpu_count and cpu_count_text:
+            parts.append(f"**{cpu_count_text} LPs**")
+        if not cpu_speed and cpu_speed_text:
+            parts.append(f"{cpu_speed_text} MHz")
         if memory:
             parts.append(f"{int(memory)//1024} GB RAM")
         if nic:
             parts.append(f"NIC: {nic}")
-        if parts:
-            sections.append("**System:** " + ", ".join(parts))
+    if parts:
+        sections.append("**System:** " + ", ".join(parts))
 
     # Trace stats summary
     tracestats = trace.raw_csv.get("tracestats")
+    duration = metadata.get("DurationSeconds") or trace.duration_seconds
+    lost_value = metadata.get("EventsLost")
+    parts = []
     if tracestats is not None and "raw_text" in tracestats.columns:
         text = tracestats.iloc[0]["raw_text"]
-        duration = _extract_field(text, r"\+\s+\d+:\d+:\d+:(\d+\.\d+)")
+        duration_text = (
+            _extract_field(text, r"\+\s+\d+:\d+:\d+:(\d+\.\d+)")
+            or _extract_field(text, r"Trace duration \(s\)\s*:\s*(\d+(?:\.\d+)?)")
+        )
         os_build = _extract_field(text, r"OS Build Number\s*:\s*(\d+)")
         lost = _extract_field(text, r"Total # Lost Events\s*:\s*(\d+)")
-        parts = []
+        if duration is None and duration_text:
+            duration = float(duration_text)
+        if lost_value is None and lost is not None:
+            lost_value = float(lost)
         if os_build:
             parts.append(f"Build {os_build}")
-        if duration:
-            parts.append(f"{float(duration):.1f}s duration")
-        if lost and lost != "0":
-            parts.append(f"**{lost} lost events!**")
-        elif lost:
+    if duration:
+        parts.append(f"{float(duration):.1f}s duration")
+    if lost_value is not None:
+        lost_int = int(lost_value)
+        if lost_int:
+            parts.append(f"**{lost_int} lost events!**")
+        else:
             parts.append("0 lost events")
-        if parts:
-            sections.append("**Trace:** " + ", ".join(parts))
+    if parts:
+        sections.append("**Trace:** " + ", ".join(parts))
 
     sections.append("")
 

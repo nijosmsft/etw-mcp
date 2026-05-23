@@ -16,6 +16,7 @@ from unittest.mock import patch
 import pandas as pd
 import pytest
 
+from etw_analyzer.native.event_store import EventStoreTimebase, NativeEventStoreWriter
 from etw_analyzer.parsing.wpa_exporter import (
     EVENT_HANDLERS,
     _handle_tcpip_connect_or_accept,
@@ -328,8 +329,12 @@ def _register_synthetic(
     tcp_recv=None,
     tcp_send=None,
     tcp_rtx=None,
+    tcp_connect=None,
     udp_recv=None,
     udp_send=None,
+    raw_csv=None,
+    mode="xperf",
+    event_store=None,
 ) -> TraceData:
     """Register a TraceData with pre-populated event DataFrames.
 
@@ -339,9 +344,13 @@ def _register_synthetic(
         trace_id=trace_id,
         etl_path=Path(f"C:\\fake\\{trace_id}.etl"),
         export_dir=Path(f"C:\\fake\\.etw-export-{trace_id}"),
+        mode=mode,
+        raw_csv=raw_csv or {},
+        event_store=event_store,
         tcpip_recv_df=tcp_recv,
         tcpip_send_df=tcp_send,
         tcpip_retransmit_df=tcp_rtx,
+        tcpip_connect_df=tcp_connect,
         udp_recv_df=udp_recv,
         udp_send_df=udp_send,
     )
@@ -418,6 +427,41 @@ class TestConnectionSummary:
         small_idx = out.find("10.0.0.5:100")
         assert big_idx != -1 and small_idx != -1
         assert big_idx < small_idx
+
+    def test_native_send_recv_enriched_from_tcb_and_process_map(self):
+        recv = _make_tcp_recv_df([
+            {"TimeStamp": 1_000_000, "Process Name": "<unknown>", "PID": 1234,
+             "LocalAddr": "", "LocalPort": 0,
+             "RemoteAddr": "", "RemotePort": 0, "Size": 1000, "ConnId": 42},
+        ])
+        send = _make_tcp_recv_df([
+            {"TimeStamp": 1_500_000, "Process Name": "<unknown>", "PID": 1234,
+             "LocalAddr": "", "LocalPort": 0,
+             "RemoteAddr": "", "RemotePort": 0, "Size": 250, "ConnId": 42},
+        ])
+        connect = _make_tcp_recv_df([
+            {"TimeStamp": 900_000, "Process Name": "<unknown>", "PID": 1234,
+             "LocalAddr": "10.0.0.5", "LocalPort": 5000,
+             "RemoteAddr": "10.0.0.7", "RemotePort": 40000, "Size": 0, "ConnId": 42},
+        ])
+        process = pd.DataFrame([
+            {"ProcessId": 1234, "ImageFileName": "echo_server.exe", "TimeStamp": 1},
+        ])
+        _register_synthetic(
+            "c_native",
+            tcp_recv=recv,
+            tcp_send=send,
+            tcp_connect=connect,
+            raw_csv={"Process/DCStart": process},
+            mode="native",
+        )
+
+        out = get_connection_summary("c_native")
+
+        assert "10.0.0.5:5000" in out
+        assert "10.0.0.7:40000" in out
+        assert "echo_server.exe" in out
+        assert "1,250" in out
 
 
 class TestUdpFlowSummary:
@@ -577,6 +621,112 @@ class TestPerProcessSocketThroughput:
         _register_synthetic("p2")
         out = get_per_process_socket_throughput("p2")
         assert "No TCP or UDP socket event data" in out
+
+
+def _base_store_row(sequence: int, qpc: int, *, pid: int = 1234) -> dict:
+    return {
+        "EventSequence": sequence,
+        "TimeStampQpc": qpc,
+        "CPU": 4,
+        "Process Name": "<unknown>",
+        "PID": pid,
+        "ThreadID": 5678,
+    }
+
+
+def _tcp_data_row(sequence: int, qpc: int, *, conn_id: int, size: int) -> dict:
+    row = _base_store_row(sequence, qpc)
+    row.update({
+        "LocalAddr": "",
+        "LocalPort": 0,
+        "RemoteAddr": "",
+        "RemotePort": 0,
+        "Size": size,
+        "SeqNo": sequence,
+        "ConnId": conn_id,
+    })
+    return row
+
+
+class TestNetworkEventStore:
+    def test_tcp_udp_tools_read_event_store_only_trace(self, tmp_path):
+        export_dir = tmp_path / ".etw-export-net-store"
+        writer = NativeEventStoreWriter(
+            export_dir,
+            run_id="network-store",
+            timebase=EventStoreTimebase(qpc_origin=0, perf_freq=1_000_000),
+            staging=False,
+            max_rows_per_part=1,
+        )
+        writer.append("process", {
+            "EventSequence": 1,
+            "TimeStampQpc": 1,
+            "CPU": 0,
+            "ProcessId": 1234,
+            "ParentId": 4,
+            "SessionId": 0,
+            "ImageFileName": "echo_server.exe",
+            "CommandLine": "echo_server.exe",
+            "Type": "DCStart",
+        })
+        writer.append("tcpip_connect", {
+            **_base_store_row(2, 900_000),
+            "LocalAddr": "10.0.0.5",
+            "LocalPort": 5000,
+            "RemoteAddr": "10.0.0.7",
+            "RemotePort": 40000,
+            "Size": 0,
+            "MSS": 1460,
+            "RcvWin": 65535,
+            "SeqNo": 0,
+            "ConnId": 42,
+        })
+        writer.append("tcpip_recv", _tcp_data_row(3, 1_000_000, conn_id=42, size=1000))
+        writer.append("tcpip_send", _tcp_data_row(4, 1_500_000, conn_id=42, size=250))
+        writer.append("tcpip_retransmit", {
+            **_tcp_data_row(5, 1_800_000, conn_id=42, size=0),
+            "LocalAddr": "10.0.0.5",
+            "LocalPort": 5000,
+            "RemoteAddr": "10.0.0.7",
+            "RemotePort": 40000,
+            "RetransmitCount": 2,
+        })
+        writer.append("udp_recv", {
+            **_base_store_row(6, 2_000_000),
+            "LocalAddr": "10.0.0.5",
+            "LocalPort": 5001,
+            "RemoteAddr": "10.0.0.7",
+            "RemotePort": 40001,
+            "Size": 64,
+        })
+        writer.append("udp_send", {
+            **_base_store_row(7, 2_500_000),
+            "LocalAddr": "10.0.0.5",
+            "LocalPort": 5001,
+            "RemoteAddr": "10.0.0.7",
+            "RemotePort": 40001,
+            "Size": 64,
+        })
+        store = writer.commit()
+        _register_synthetic("net_store", mode="native", event_store=store)
+
+        conn = get_connection_summary("net_store")
+        assert "10.0.0.5:5000" in conn
+        assert "10.0.0.7:40000" in conn
+        assert "echo_server.exe" in conn
+        assert "1,250" in conn
+
+        udp = get_udp_flow_summary("net_store")
+        assert "UDP Flow Summary" in udp
+        assert "10.0.0.5:5001" in udp
+
+        rtx = get_tcp_retransmits("net_store")
+        assert "TCP Retransmits" in rtx
+        assert "2" in rtx
+
+        throughput = get_per_process_socket_throughput("net_store")
+        assert "Per-Process Socket Throughput" in throughput
+        assert "echo_server.exe" in throughput
 
 
 # ---------------------------------------------------------------------------

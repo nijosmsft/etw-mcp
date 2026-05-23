@@ -21,7 +21,13 @@ class _FakeSymbolizer:
         return {int(a): self._mapping.get(int(a), "") for a in addrs}
 
 
-def _make_trace(dpc_rows, symbolizer=None, duration_seconds=10.0, qpc_hz=10_000_000):
+def _make_trace(
+    dpc_rows,
+    symbolizer=None,
+    duration_seconds=10.0,
+    timestamp_frequency=10_000_000,
+    mode="xperf",
+):
     raw_csv = {}
     if dpc_rows:
         raw_csv["_native_dpc_events"] = pd.DataFrame(dpc_rows)
@@ -29,8 +35,9 @@ def _make_trace(dpc_rows, symbolizer=None, duration_seconds=10.0, qpc_hz=10_000_
         raw_csv=raw_csv,
         symbolizer=symbolizer,
         duration_seconds=duration_seconds,
+        timestamp_frequency=timestamp_frequency,
+        mode=mode,
     )
-    trace.qpc_frequency_hz = qpc_hz
     return trace
 
 
@@ -80,6 +87,37 @@ class TestAggregateDpcIsr:
         result = aggregate_dpc_isr(trace)
         assert result is not None
         assert "unknown" in set(result["Module"].unique())
+
+    def test_duration_uses_trace_timestamp_frequency(self):
+        rows = [
+            {"TimeStamp": 150, "InitialTime": 50, "Routine": 0x1, "CPU": 0},
+        ]
+        sym = _FakeSymbolizer({0x1: "ndis.sys!NdisRecv+0x10"})
+        trace = _make_trace(rows, symbolizer=sym, timestamp_frequency=1_000_000)
+        trace.qpc_frequency_hz = 10_000_000
+
+        result = aggregate_dpc_isr(trace)
+
+        assert result is not None
+        ndis = result[result["Module"] == "ndis.sys"]
+        populated = ndis[ndis["Count"] > 0].iloc[0]
+        assert populated["Bucket_Low_us"] == 64
+        assert populated["Bucket_High_us"] == 128
+
+    def test_native_relative_microsecond_duration_not_qpc_scaled(self):
+        rows = [
+            {"TimeStamp": 150, "InitialTime": 50, "Routine": 0x1, "CPU": 0},
+        ]
+        sym = _FakeSymbolizer({0x1: "ndis.sys!NdisRecv+0x10"})
+        trace = _make_trace(rows, symbolizer=sym, duration_seconds=1.0, mode="native")
+
+        result = aggregate_dpc_isr(trace)
+
+        assert result is not None
+        ndis = result[result["Module"] == "ndis.sys"]
+        populated = ndis[ndis["Count"] > 0].iloc[0]
+        assert populated["Bucket_Low_us"] == 64
+        assert populated["Bucket_High_us"] == 128
 
 
 class TestBuildDpcIsrRawText:

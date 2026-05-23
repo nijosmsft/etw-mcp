@@ -8,6 +8,11 @@ from etw_analyzer.parsing.aggregator import apply_filters, group_and_sum
 from etw_analyzer.parsing.csv_loader import normalize_duration_column
 from etw_analyzer.formatting.markdown import format_table, format_pct
 from etw_analyzer.tools.cpu_sampling import _find_col
+from etw_analyzer.native.accessors import (
+    has_event_store_dataset,
+    iter_readythread_cswitch_waits,
+)
+from etw_analyzer.native.event_store import EventFilters
 
 import pandas as pd
 
@@ -72,7 +77,9 @@ def get_lock_contention(
     on KeAcquireInStackQueuedSpinLock in CPUMAP code indicates the per-CPU
     ring spinlock is a bottleneck.
 
-    Requires CpuCswitchSample WPR profile (includes ReadyThread stacks).
+    Requires ReadyThread stacks, either from the xperf on-demand
+    ``readythread -stacks`` path or a native event-store loaded with
+    ``WPR_MCP_NATIVE_STREAMING_PROFILE=all``.
 
     Args:
         trace_id: ID returned by load_trace.
@@ -84,6 +91,21 @@ def get_lock_contention(
         max_rows: Maximum rows to return. Default: 30.
     """
     trace = require_trace(trace_id)
+
+    if (
+        has_event_store_dataset(trace, "readythread")
+        and has_event_store_dataset(trace, "cswitch")
+    ):
+        return _get_lock_contention_from_event_store(
+            trace,
+            module_filter=module_filter,
+            function_filter=function_filter,
+            cpu_filter=cpu_filter,
+            start_time=start_time,
+            end_time=end_time,
+            max_rows=max_rows,
+        )
+
     df = _get_cswitch_df(trace, start_time=start_time, end_time=end_time)
 
     # Find relevant columns
@@ -212,6 +234,122 @@ def get_lock_contention(
                 lines.append(format_table(result.head(max_rows)))
 
         return "\n".join(lines)
+
+
+def _get_lock_contention_from_event_store(
+    trace: TraceData,
+    *,
+    module_filter: str | None,
+    function_filter: str | None,
+    cpu_filter: str | None,
+    start_time: float | None,
+    end_time: float | None,
+    max_rows: int,
+) -> str:
+    filters = EventFilters(
+        cpu_filter=cpu_filter,
+        start_time=start_time,
+        end_time=end_time,
+    )
+    spinlock_patterns = [
+        "KeAcquireInStackQueuedSpinLock",
+        "KeAcquireSpinLock",
+        "KeTryToAcquireSpinLock",
+        "ExAcquireResourceExclusiveLite",
+        "ExAcquireResourceSharedLite",
+        "ExAcquireFastMutex",
+    ]
+
+    total_events = 0
+    lock_events = 0
+    wait_values: list[float] = []
+    site_counts: dict[str, int] = {}
+
+    for batch in iter_readythread_cswitch_waits(trace, filters=filters):
+        if batch.empty:
+            continue
+        stack_col = _find_col(batch, [
+            "ReadyThread Stack", "Ready Thread Stack", "Readying Stack",
+            "ReadyingProcess Stack",
+        ])
+        if stack_col is None:
+            total_events += len(batch)
+            continue
+        stacks = batch[stack_col].astype(str)
+        if module_filter:
+            batch = batch[stacks.str.contains(module_filter, case=False, na=False)]
+            stacks = batch[stack_col].astype(str)
+        if function_filter:
+            batch = batch[stacks.str.contains(function_filter, case=False, na=False)]
+            stacks = batch[stack_col].astype(str)
+        if batch.empty:
+            continue
+
+        total_events += len(batch)
+        lock_mask = stacks.apply(
+            lambda s: any(p.lower() in s.lower() for p in spinlock_patterns)
+        )
+        lock_df = batch[lock_mask]
+        lock_events += len(lock_df)
+        if not lock_df.empty and "Wait (us)" in lock_df.columns:
+            wait_values.extend(
+                pd.to_numeric(lock_df["Wait (us)"], errors="coerce")
+                .dropna()
+                .astype(float)
+                .tolist()
+            )
+        if not lock_df.empty:
+            for site, count in (
+                lock_df[stack_col]
+                .astype(str)
+                .apply(_extract_contention_site)
+                .value_counts()
+                .items()
+            ):
+                site_counts[str(site)] = site_counts.get(str(site), 0) + int(count)
+
+    if total_events == 0:
+        return "*No context switch events match the specified filters.*"
+
+    lock_pct = lock_events / total_events * 100 if total_events > 0 else 0
+    lines = [
+        "**Lock Contention Analysis**",
+        "",
+        f"Total context switches: {total_events:,}",
+        f"Lock-related switches: {lock_events:,} ({lock_pct:.1f}%)",
+        "",
+    ]
+
+    if wait_values:
+        waits = pd.Series(wait_values)
+        lines.append(
+            f"Lock wait time: median={waits.median():.1f}us, "
+            f"p99={waits.quantile(0.99):.1f}us, "
+            f"max={waits.max():.1f}us"
+        )
+        lines.append("")
+
+    if site_counts:
+        site_rows = pd.DataFrame([
+            {
+                "Contention Site": site,
+                "Count": count,
+                "% of Lock Waits": format_pct(count / lock_events * 100 if lock_events else 0),
+            }
+            for site, count in site_counts.items()
+        ]).sort_values("Count", ascending=False).head(max_rows)
+        lines.append("**Top Contention Sites:**")
+        lines.append("")
+        lines.append(format_table(site_rows))
+
+    if lock_pct > 10:
+        lines.append(f"\n**ALERT:** Lock contention at {lock_pct:.1f}% — above 10% threshold. "
+                    "Consider lock-free SPSC rings for CPUMAP.")
+    elif lock_pct > 5:
+        lines.append(f"\nLock contention at {lock_pct:.1f}% — moderate. Monitor under higher load.")
+    else:
+        lines.append(f"\nLock contention at {lock_pct:.1f}% — within healthy range.")
+    return "\n".join(lines)
 
 
 def _extract_contention_site(stack_str: str) -> str:

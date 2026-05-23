@@ -20,6 +20,13 @@ import pandas as pd
 
 from etw_analyzer.app import mcp
 from etw_analyzer.formatting.markdown import format_table
+from etw_analyzer.native.accessors import (
+    build_cswitch_events_for_tid,
+    build_readythread_cswitch_waits,
+    find_cswitch_tids_for_process,
+    has_event_store_dataset,
+)
+from etw_analyzer.native.event_store import EventFilters
 from etw_analyzer.parsing.wait_chain import (
     find_tids_for_process,
     summarize_wait_reasons,
@@ -42,6 +49,7 @@ def _format_thread_section(
     max_depth: int,
     max_window_us: float,
     process_name: str | None = None,
+    ready_waits: pd.DataFrame | None = None,
 ) -> str:
     """Render the wait-chain output for one TID as a markdown section."""
     events = walk_wait_chain(
@@ -96,6 +104,18 @@ def _format_thread_section(
         lines.append("")
         lines.append(f"*({len(events) - _MAX_SAMPLE_ROWS:,} additional events not shown.)*")
     lines.append("")
+
+    if ready_waits is not None and not ready_waits.empty:
+        desired_waits = [
+            "ReadyTimeStamp", "SwitchTimeStamp", "Wait (us)", "WaitReason",
+            "CPU", "SwitchCPU", "OldTID", "Ready Thread Stack",
+        ]
+        present_waits = [c for c in desired_waits if c in ready_waits.columns]
+        wait_df = ready_waits[present_waits] if present_waits else ready_waits
+        lines.append("**ReadyThread -> next CSwitch waits** (bounded by max_window_us):")
+        lines.append("")
+        lines.append(format_table(wait_df, max_rows=_MAX_SAMPLE_ROWS))
+        lines.append("")
     return "\n".join(lines)
 
 
@@ -114,29 +134,30 @@ def get_network_wait_chain(
     waiting on a DPC; ``WrAlertByThreadId`` is typical for IOCP/ALPC; lock
     waits show up as ``WrResource``/``WrEventPair``.
 
-    v1 surfaces the histogram and a sample of switch-in events. v2 (when
-    ReadyThread events land in the dumper extraction) will additionally
-    correlate each wake to the readying thread's preceding switch-out for
-    true causal chain attribution.
+    When native event-store ReadyThread data is available, also joins each
+    ReadyThread event to the target thread's next CSwitch within
+    ``max_window_us`` to surface scheduler wait time and readying stacks.
 
     Args:
         trace_id: ID returned by load_trace.
         thread_filter: Either a thread ID (int) or a substring of the
             process name (str). When a string is given, the busiest TIDs
             matching that process are surfaced as separate sections.
-        max_depth: Reserved for the v2 ReadyThread join. Accepted today
-            for API stability.
-        max_window_us: Reserved for the v2 ReadyThread join. Accepted
+        max_depth: Reserved for recursive causal-chain expansion. Accepted
             today for API stability.
+        max_window_us: Maximum ReadyThread-to-CSwitch join window in
+            microseconds when native scheduler detail is present.
     """
     trace = require_trace(trace_id)
 
-    # The CSwitch DataFrame is populated by the background dumper thread.
-    # Wait for it so we don't false-negative on a freshly-loaded trace.
-    trace.wait_for_dumper()
+    event_store_cswitch = has_event_store_dataset(trace, "cswitch")
+    if not event_store_cswitch:
+        # The CSwitch DataFrame is populated by the background dumper thread.
+        # Wait for it so we don't false-negative on a freshly-loaded trace.
+        trace.wait_for_dumper()
 
     cswitch_df = trace.cswitch_events_df
-    if cswitch_df is None or cswitch_df.empty:
+    if (cswitch_df is None or cswitch_df.empty) and not event_store_cswitch:
         return (
             "**Wait-chain analysis**\n\n"
             "*No CSwitch events available for this trace.*\n\n"
@@ -154,11 +175,25 @@ def get_network_wait_chain(
     sections: list[str] = []
 
     if isinstance(thread_filter, int):
+        tid = int(thread_filter)
+        tid_df = cswitch_df
+        if event_store_cswitch:
+            tid_df = build_cswitch_events_for_tid(
+                trace,
+                tid,
+                max_rows=None,
+            )
+        ready_waits = _ready_waits_for_tid(
+            trace,
+            tid,
+            max_window_us=max_window_us,
+        )
         sections.append(_format_thread_section(
-            cswitch_df,
-            tid=thread_filter,
+            tid_df if tid_df is not None else pd.DataFrame(),
+            tid=tid,
             max_depth=max_depth,
             max_window_us=max_window_us,
+            ready_waits=ready_waits,
         ))
     else:
         substring = str(thread_filter).strip()
@@ -167,7 +202,10 @@ def get_network_wait_chain(
                 "*`thread_filter` must be a TID (int) or a non-empty process-name substring.*",
             ])
 
-        matches = find_tids_for_process(cswitch_df, substring)
+        if event_store_cswitch:
+            matches = find_cswitch_tids_for_process(trace, substring)
+        else:
+            matches = find_tids_for_process(cswitch_df, substring)
         if not matches:
             return "\n".join(header + [
                 f"*No threads matched process substring `{substring}`.*",
@@ -182,12 +220,45 @@ def get_network_wait_chain(
         header.append("")
 
         for tid, proc_name, _count in top:
+            tid_df = cswitch_df
+            if event_store_cswitch:
+                tid_df = build_cswitch_events_for_tid(
+                    trace,
+                    tid,
+                    max_rows=None,
+                )
+            ready_waits = _ready_waits_for_tid(
+                trace,
+                tid,
+                max_window_us=max_window_us,
+            )
             sections.append(_format_thread_section(
-                cswitch_df,
+                tid_df if tid_df is not None else pd.DataFrame(),
                 tid=tid,
                 max_depth=max_depth,
                 max_window_us=max_window_us,
                 process_name=proc_name,
+                ready_waits=ready_waits,
             ))
 
     return "\n".join(header + sections)
+
+
+def _ready_waits_for_tid(
+    trace: TraceData,
+    tid: int,
+    *,
+    max_window_us: float,
+) -> pd.DataFrame | None:
+    if not (
+        has_event_store_dataset(trace, "readythread")
+        and has_event_store_dataset(trace, "cswitch")
+    ):
+        return None
+    return build_readythread_cswitch_waits(
+        trace,
+        filters=EventFilters(),
+        target_tid=int(tid),
+        max_window_us=max_window_us,
+        max_rows=None,
+    )

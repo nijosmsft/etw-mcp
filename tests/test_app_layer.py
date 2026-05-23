@@ -14,6 +14,7 @@ from unittest.mock import patch
 import pandas as pd
 import pytest
 
+from etw_analyzer.native.event_store import EventStoreTimebase, NativeEventStoreWriter
 from etw_analyzer.parsing.wpa_exporter import (
     EVENT_HANDLERS,
     _handle_http_recv,
@@ -336,6 +337,32 @@ def _register_synthetic(
     return trace
 
 
+def _register_event_store_synthetic(
+    trace_id: str,
+    tmp_path: Path,
+    rows_by_class: dict[str, list[dict]],
+) -> TraceData:
+    writer = NativeEventStoreWriter(
+        tmp_path / f".etw-export-{trace_id}",
+        run_id=f"run-{trace_id}",
+        timebase=EventStoreTimebase(qpc_origin=0, perf_freq=1_000_000),
+        staging=False,
+        max_rows_per_part=2,
+    )
+    for event_class, rows in rows_by_class.items():
+        for row in rows:
+            writer.append(event_class, row)
+    trace = TraceData(
+        trace_id=trace_id,
+        etl_path=tmp_path / f"{trace_id}.etl",
+        export_dir=tmp_path / f".etw-export-{trace_id}",
+        event_store=writer.commit(),
+    )
+    trace._dumper_ready.set()
+    register_trace(trace)
+    return trace
+
+
 # ---------------------------------------------------------------------------
 # Tool tests: get_http_requests
 # ---------------------------------------------------------------------------
@@ -408,6 +435,64 @@ class TestGetHttpRequests:
         _register_synthetic("h5")
         out = get_http_requests("h5")
         assert "No HTTP.sys event data" in out
+
+    def test_event_store_only_lifecycle(self, tmp_path):
+        _register_event_store_synthetic(
+            "hstore",
+            tmp_path,
+            {
+                "HttpService/Recv": [{
+                    "EventSequence": 1,
+                    "TimeStamp": 1_000,
+                    "CPU": 1,
+                    "PID": 100,
+                    "ThreadID": 200,
+                    "RequestId": 10,
+                    "ConnectionId": 99,
+                    "Verb": "GET",
+                    "Url": "/store",
+                }],
+                "HttpService/Deliver": [{
+                    "EventSequence": 2,
+                    "TimeStamp": 1_100,
+                    "CPU": 1,
+                    "PID": 100,
+                    "ThreadID": 200,
+                    "RequestId": 10,
+                    "UrlGroupId": 7,
+                }],
+                "HttpService/Send": [{
+                    "EventSequence": 3,
+                    "TimeStamp": 1_500,
+                    "CPU": 1,
+                    "PID": 100,
+                    "ThreadID": 200,
+                    "RequestId": 10,
+                    "StatusCode": 201,
+                    "ContentLength": 42,
+                }],
+                "HttpService/Close": [{
+                    "EventSequence": 4,
+                    "TimeStamp": 1_600,
+                    "CPU": 1,
+                    "PID": 100,
+                    "ThreadID": 200,
+                    "RequestId": 10,
+                }],
+            },
+        )
+
+        out = get_http_requests("hstore")
+        assert "HTTP Requests" in out
+        assert "/store" in out
+        assert "201" in out
+        assert "500" in out
+
+        queue = get_http_queue_depth("hstore")
+        assert "HTTP Queue Depth" in queue
+        assert "UrlGroupId" in queue
+        assert "7" in queue
+        assert "Latency p50" in queue
 
 
 # ---------------------------------------------------------------------------
@@ -651,3 +736,101 @@ class TestGetQuicAckDelays:
         _register_synthetic("qa3")
         out = get_quic_ack_delays("qa3")
         assert "No MsQuic event data" in out
+
+    def test_event_store_only_quic_lifecycle_and_ack(self, tmp_path):
+        _register_event_store_synthetic(
+            "qstore",
+            tmp_path,
+            {
+                "Quic/ConnectionCreated": [{
+                    "EventSequence": 1,
+                    "TimeStamp": 2_000,
+                    "CPU": 2,
+                    "PID": 300,
+                    "ThreadID": 400,
+                    "ConnectionId": 77,
+                    "CID": "deadbeef",
+                    "LocalAddr": "10.0.0.1:443",
+                    "RemoteAddr": "10.0.0.2:5000",
+                    "Process Name": "secnetperf.exe",
+                }],
+                "Quic/PacketRecv": [
+                    {
+                        "EventSequence": 2,
+                        "TimeStamp": 2_100,
+                        "CPU": 2,
+                        "PID": 300,
+                        "ThreadID": 400,
+                        "ConnectionId": 77,
+                        "PacketNumber": 1,
+                        "Size": 1200,
+                    },
+                    {
+                        "EventSequence": 3,
+                        "TimeStamp": 2_200,
+                        "CPU": 2,
+                        "PID": 300,
+                        "ThreadID": 400,
+                        "ConnectionId": 77,
+                        "PacketNumber": 3,
+                        "Size": 1200,
+                    },
+                ],
+                "Quic/PacketSend": [{
+                    "EventSequence": 4,
+                    "TimeStamp": 2_150,
+                    "CPU": 2,
+                    "PID": 300,
+                    "ThreadID": 400,
+                    "ConnectionId": 77,
+                    "PacketNumber": 1,
+                    "Size": 128,
+                }],
+                "Quic/AckReceived": [
+                    {
+                        "EventSequence": 5,
+                        "TimeStamp": 2_300,
+                        "CPU": 2,
+                        "PID": 300,
+                        "ThreadID": 400,
+                        "ConnectionId": 77,
+                        "AckDelay": 500,
+                        "LargestAcknowledged": 1,
+                    },
+                    {
+                        "EventSequence": 6,
+                        "TimeStamp": 2_400,
+                        "CPU": 2,
+                        "PID": 300,
+                        "ThreadID": 400,
+                        "ConnectionId": 77,
+                        "AckDelay": 30_000,
+                        "LargestAcknowledged": 3,
+                    },
+                ],
+                "Quic/ConnectionClosed": [{
+                    "EventSequence": 7,
+                    "TimeStamp": 5_000,
+                    "CPU": 2,
+                    "PID": 300,
+                    "ThreadID": 400,
+                    "ConnectionId": 77,
+                }],
+            },
+        )
+
+        conns = get_quic_connections("qstore")
+        assert "MsQuic Connections" in conns
+        assert "deadbeef" in conns
+        assert "Lost Pkts" in conns
+        assert "3,000" in conns or " 3000 " in conns
+
+        acks = get_quic_ack_delays("qstore")
+        assert "MsQuic Ack Delays" in acks
+        assert "HIGH ACK DELAY" in acks
+        assert "30,000" in acks or "30000" in acks
+
+        cids = get_quic_cid_distribution("qstore")
+        assert "MsQuic CID Distribution" in cids
+        assert "deadbeef" not in cids  # tool reports hashed buckets, not raw CIDs.
+        assert "CPU count" in cids

@@ -22,11 +22,18 @@ from __future__ import annotations
 from .profile_detail import aggregate_cpu_sampling
 from .profile_util import aggregate_cpu_timeline
 from .dpcisr import aggregate_dpc_isr, build_dpc_isr_raw_text
-from .stack_butterfly import aggregate_stack_butterfly
+from .stack_butterfly import (
+    aggregate_stack_butterfly,
+    aggregate_stack_callers,
+    aggregate_stack_data_from_event_store,
+    ensure_stack_aggregates,
+)
 from .sysconfig import build_sysconfig_text
 from .process_info import build_process_info_text
 from .diskio import build_diskio_text
 from .tracestats import build_tracestats_text
+from .network import enrich_network_events
+from .streaming import build_streaming_aggregates
 
 
 __all__ = [
@@ -35,8 +42,13 @@ __all__ = [
     "aggregate_dpc_isr",
     "build_dpc_isr_raw_text",
     "aggregate_stack_butterfly",
+    "aggregate_stack_callers",
+    "aggregate_stack_data_from_event_store",
+    "ensure_stack_aggregates",
     "build_sysconfig_text",
     "build_process_info_text",
     "build_diskio_text",
     "build_tracestats_text",
+    "enrich_network_events",
+    "build_streaming_aggregates",
 ]

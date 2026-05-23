@@ -53,6 +53,25 @@ _DPC_ISR = struct.Struct("<QQ")
 assert _DPC_ISR.size == 16
 
 
+def _sample_count_weight(count: int) -> int:
+    """Return xperf-dumper Count semantics for a SampledProfile payload."""
+    if count <= 0:
+        return 1
+    if count < 16:
+        return int(count)
+    low_nibble = int(count) & 0xF
+    return low_nibble if low_nibble > 0 else 1
+
+
+def _profile_detail_weight(count: int) -> int:
+    """Return xperf profile-detail Weight semantics for a payload Count."""
+    sample_weight = _sample_count_weight(count)
+    if count < 16:
+        return sample_weight
+    profile_weight = int(count) >> 4
+    return profile_weight if profile_weight > 0 else sample_weight
+
+
 def decode_sampled_profile(payload: bytes, hdr: dict) -> Optional[dict]:
     """Decode a ``PerfInfo/SampledProfile`` (opcode 46) MOF payload.
 
@@ -63,7 +82,13 @@ def decode_sampled_profile(payload: bytes, hdr: dict) -> Optional[dict]:
         TimeStamp, Process Name, PID, CPU, Module, Function, Weight
 
     ``Process Name`` / ``Module`` / ``Function`` are blank — symbol
-    resolution lives in Phase N3 (see design §6).
+    resolution lives in Phase N3 (see design §6). ``PID`` is copied from
+    the event header but may be the kernel ``0xFFFFFFFF`` sentinel; the
+    native extractor/aggregator resolves that through ``PayloadThreadId``.
+    ``Weight`` matches xperf dumper Count semantics. ``ProfileWeight``
+    matches xperf profile-detail Weight semantics; recent kernels encode
+    that value in the high bits of the payload Count field. Count=0 is
+    normalized to 1.
     """
     if len(payload) < _SAMPLED_PROFILE.size:
         return None
@@ -73,9 +98,11 @@ def decode_sampled_profile(payload: bytes, hdr: dict) -> Optional[dict]:
     if cpu is None:
         cpu = hdr.get("CPU", -1)
 
-    # weight = max(1, count). A few WPR profiles emit Count=0 sentinel,
-    # which would make every aggregation produce zero rows.
-    weight = int(count) if count > 0 else 1
+    # A few WPR profiles emit Count=0 sentinels, which would make every
+    # aggregation produce zero rows. On newer kernels the high bits carry
+    # profile-detail weight while the low nibble carries xperf-dumper Count.
+    weight = _sample_count_weight(int(count))
+    profile_weight = _profile_detail_weight(int(count))
 
     return {
         "TimeStamp": int(hdr.get("TimeStamp", 0)),
@@ -85,6 +112,7 @@ def decode_sampled_profile(payload: bytes, hdr: dict) -> Optional[dict]:
         "Module": "",
         "Function": "",
         "Weight": weight,
+        "ProfileWeight": profile_weight,
         # The IP and per-payload TID are kept around so Phase N3
         # symbolisation can resolve module!function pairs without
         # re-reading the trace.
@@ -150,6 +178,8 @@ __all__ = [
     "PROVIDER_GUID",
     "HANDLERS",
     "decode_sampled_profile",
+    "_sample_count_weight",
+    "_profile_detail_weight",
     "decode_dpc",
     "decode_dpc_threaded",
     "decode_dpc_timer",

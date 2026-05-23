@@ -28,6 +28,7 @@ from .consumer import (
     ConsumerStats,
     EtwConsumer,
     NativeConsumerError,
+    TraceLogfileMetadata,
     is_available,
 )
 from .extract import (
@@ -35,11 +36,19 @@ from .extract import (
     ExtractStats,
     count_events_by_provider,
     extract_events,
+    extract_events_to_store,
 )
 from .symbolizer import (
     Symbolizer,
     SymbolizerError,
     is_available as is_symbolizer_available,
+)
+from .event_store import (
+    EventFilters,
+    EventStoreTimebase,
+    NativeEventStore,
+    NativeEventStoreError,
+    NativeEventStoreWriter,
 )
 
 
@@ -47,12 +56,19 @@ __all__ = [
     "EtwConsumer",
     "ConsumerStats",
     "NativeConsumerError",
+    "TraceLogfileMetadata",
     "is_available",
     "extract_events",
+    "extract_events_to_store",
     "count_events_by_provider",
     "CANONICAL_EVENT_CLASSES",
     "ExtractStats",
     "Symbolizer",
     "SymbolizerError",
     "is_symbolizer_available",
+    "EventFilters",
+    "EventStoreTimebase",
+    "NativeEventStore",
+    "NativeEventStoreError",
+    "NativeEventStoreWriter",
 ]

@@ -21,6 +21,7 @@ import pandas as pd
 
 from etw_analyzer.app import mcp
 from etw_analyzer.formatting.markdown import format_table
+from etw_analyzer.native.aggregators.network import iter_enriched_network_batches
 from etw_analyzer.trace_state import TraceData, require_trace
 
 
@@ -54,6 +55,12 @@ _NO_NDIS_DROP_DATA_MSG = (
 
 def _ensure_dumper_ready(trace: TraceData) -> None:
     trace.wait_for_dumper()
+    if getattr(trace, "mode", "xperf") == "native":
+        try:
+            from etw_analyzer.native.aggregators.network import enrich_network_events
+            enrich_network_events(trace)
+        except Exception:
+            pass
 
 
 def _apply_process_filter(df: pd.DataFrame, process_filter: str | None) -> pd.DataFrame:
@@ -69,6 +76,32 @@ def _has_columns(df: pd.DataFrame | None, *required: str) -> bool:
     if df is None or df.empty:
         return False
     return all(col in df.columns for col in required)
+
+
+def _network_batches(trace: TraceData, event_class: str, columns: list[str]):
+    yield from iter_enriched_network_batches(
+        trace,
+        event_class,
+        columns=columns,
+    )
+
+
+def _safe_int(value, default: int = 0) -> int:
+    try:
+        if pd.isna(value):
+            return default
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _timestamp_us(value) -> int | None:
+    try:
+        if pd.isna(value):
+            return None
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _percentile_us(series: pd.Series, p: float) -> float:
@@ -121,6 +154,42 @@ def _compute_event_latencies_us(events_df: pd.DataFrame) -> pd.DataFrame:
     if "Process Name" not in df.columns:
         df["Process Name"] = ""
     return df[["Process Name", "PID", "LatencyUs"]]
+
+
+def _compute_event_latencies_from_batches(
+    trace: TraceData,
+    event_class: str,
+) -> tuple[bool, pd.DataFrame]:
+    columns = ["TimeStamp", "Process Name", "PID", "ThreadID"]
+    last_by_thread: dict[tuple[int, int], tuple[int, str]] = {}
+    rows: list[dict] = []
+    saw_source = False
+
+    for batch in _network_batches(trace, event_class, columns):
+        if not _has_columns(batch, "TimeStamp", "PID", "ThreadID"):
+            continue
+        saw_source = True
+        local = batch.copy()
+        local["TimeStamp"] = pd.to_numeric(local["TimeStamp"], errors="coerce")
+        local = local.dropna(subset=["TimeStamp"]).sort_values(["PID", "ThreadID", "TimeStamp"])
+        for _, row in local.iterrows():
+            pid = _safe_int(row.get("PID", 0))
+            tid = _safe_int(row.get("ThreadID", 0))
+            ts = _timestamp_us(row.get("TimeStamp"))
+            if ts is None:
+                continue
+            key = (pid, tid)
+            proc = row.get("Process Name", "")
+            previous = last_by_thread.get(key)
+            if previous is not None and ts >= previous[0]:
+                rows.append({
+                    "Process Name": proc or previous[1],
+                    "PID": pid,
+                    "LatencyUs": ts - previous[0],
+                })
+            last_by_thread[key] = (ts, str(proc or ""))
+
+    return saw_source, pd.DataFrame(rows, columns=["Process Name", "PID", "LatencyUs"])
 
 
 def _format_latency_table(
@@ -206,14 +275,13 @@ def get_connect_latency(
     trace = require_trace(trace_id)
     _ensure_dumper_ready(trace)
 
-    source = trace.tcpip_connect_df
-    if not _has_columns(source, "TimeStamp", "PID", "ThreadID"):
-        source = trace.afd_connect_df
+    saw_source, latency_df = _compute_event_latencies_from_batches(trace, "TcpIp/Connect")
+    if not saw_source:
+        saw_source, latency_df = _compute_event_latencies_from_batches(trace, "AFD/Connect")
 
-    if not _has_columns(source, "TimeStamp", "PID", "ThreadID"):
+    if not saw_source:
         return _NO_TCPIP_DATA_MSG
 
-    latency_df = _compute_event_latencies_us(source)
     return _format_latency_table(
         latency_df,
         top_n=top_n,
@@ -254,14 +322,13 @@ def get_accept_latency(
     trace = require_trace(trace_id)
     _ensure_dumper_ready(trace)
 
-    source = trace.tcpip_accept_df
-    if not _has_columns(source, "TimeStamp", "PID", "ThreadID"):
-        source = trace.afd_accept_df
+    saw_source, latency_df = _compute_event_latencies_from_batches(trace, "TcpIp/Accept")
+    if not saw_source:
+        saw_source, latency_df = _compute_event_latencies_from_batches(trace, "AFD/Accept")
 
-    if not _has_columns(source, "TimeStamp", "PID", "ThreadID"):
+    if not saw_source:
         return _NO_TCPIP_DATA_MSG
 
-    latency_df = _compute_event_latencies_us(source)
     return _format_latency_table(
         latency_df,
         top_n=top_n,
@@ -296,30 +363,42 @@ def get_packet_drops(trace_id: str, top_n: int = 30) -> str:
     trace = require_trace(trace_id)
     _ensure_dumper_ready(trace)
 
-    df = trace.ndis_drops_df
-    if df is None or df.empty or "Reason" not in df.columns:
+    columns = ["MiniportName", "Reason", "Size"]
+    aggregate: dict[tuple[str, str], dict[str, int | str]] = {}
+    total_drops = 0
+    saw_reason = False
+    for batch in _network_batches(trace, "NdisDrop", columns):
+        if batch.empty or "Reason" not in batch.columns:
+            continue
+        saw_reason = True
+        if "MiniportName" not in batch.columns:
+            batch = batch.assign(MiniportName="")
+        if "Size" not in batch.columns:
+            batch = batch.assign(Size=0)
+        for _, row in batch.iterrows():
+            miniport = str(row.get("MiniportName", "") or "")
+            reason = str(row.get("Reason", "") or "")
+            key = (miniport, reason)
+            entry = aggregate.setdefault(
+                key,
+                {"Miniport": miniport, "Reason": reason, "Count": 0, "Bytes": 0},
+            )
+            entry["Count"] = int(entry["Count"]) + 1
+            entry["Bytes"] = int(entry["Bytes"]) + _safe_int(row.get("Size", 0))
+            total_drops += 1
+
+    if not saw_reason or not aggregate:
         return _NO_NDIS_DROP_DATA_MSG
 
-    df = df.copy()
-    # Defensive: fill missing columns with sensible defaults so the groupby
-    # never crashes on a real trace whose schema drifted.
-    if "MiniportName" not in df.columns:
-        df["MiniportName"] = ""
-    if "Size" not in df.columns:
-        df["Size"] = 0
-    df["Size"] = pd.to_numeric(df["Size"], errors="coerce").fillna(0)
-
     rows = []
-    total_drops = len(df)
-    for (miniport, reason), group in df.groupby(["MiniportName", "Reason"]):
-        count = len(group)
-        bytes_dropped = int(group["Size"].sum())
+    for entry in aggregate.values():
+        count = int(entry["Count"])
         pct = (count / total_drops * 100.0) if total_drops > 0 else 0.0
         rows.append({
-            "Miniport": miniport,
-            "Reason": reason,
+            "Miniport": entry["Miniport"],
+            "Reason": entry["Reason"],
             "Count": count,
-            "Bytes": bytes_dropped,
+            "Bytes": int(entry["Bytes"]),
             "% of Drops": round(pct, 2),
         })
 
@@ -387,20 +466,45 @@ def get_afd_batching(
     trace = require_trace(trace_id)
     _ensure_dumper_ready(trace)
 
-    df = trace.afd_recv_df
-    if not _has_columns(df, "TimeStamp", "SocketHandle", "ThreadID"):
-        return _NO_AFD_DATA_MSG
+    columns = ["TimeStamp", "Process Name", "PID", "ThreadID", "CPU", "SocketHandle", "Size"]
+    groups: dict[tuple[int, int], dict] = {}
+    saw_source = False
+    saw_after_filter = False
+    for batch in _network_batches(trace, "AFD/Recv", columns):
+        if not _has_columns(batch, "TimeStamp", "SocketHandle", "ThreadID"):
+            continue
+        saw_source = True
+        local = _apply_process_filter(batch, process_filter)
+        if local.empty:
+            continue
+        saw_after_filter = True
+        for _, row in local.iterrows():
+            handle = _safe_int(row.get("SocketHandle", 0))
+            tid = _safe_int(row.get("ThreadID", 0))
+            ts = _timestamp_us(row.get("TimeStamp"))
+            if ts is None:
+                continue
+            key = (handle, tid)
+            entry = groups.setdefault(
+                key,
+                {
+                    "Process": row.get("Process Name", ""),
+                    "PID": _safe_int(row.get("PID", 0)),
+                    "SocketHandle": handle,
+                    "ThreadID": tid,
+                    "timestamps": [],
+                },
+            )
+            entry["timestamps"].append(ts)
 
-    df = _apply_process_filter(df, process_filter).copy()
-    if df.empty:
+    if not saw_source:
+        return _NO_AFD_DATA_MSG
+    if not saw_after_filter:
         return f"*No matching AFD recv events for process filter `{process_filter}`.*"
 
-    df["TimeStamp"] = pd.to_numeric(df["TimeStamp"], errors="coerce")
-    df = df.dropna(subset=["TimeStamp"]).sort_values(["SocketHandle", "ThreadID", "TimeStamp"])
-
     rows = []
-    for (handle, tid), group in df.groupby(["SocketHandle", "ThreadID"]):
-        timestamps = group["TimeStamp"].tolist()
+    for entry in groups.values():
+        timestamps = sorted(entry["timestamps"])
         if not timestamps:
             continue
         # Walk consecutive timestamps and count batches. Each batch starts
@@ -411,13 +515,12 @@ def get_afd_batching(
             if gap > _AFD_BATCH_WINDOW_US:
                 batches += 1
         events = len(timestamps)
-        proc = group["Process Name"].iloc[0] if "Process Name" in group.columns else ""
-        pid = int(group["PID"].iloc[0]) if "PID" in group.columns else 0
+        handle = entry["SocketHandle"]
         rows.append({
-            "Process": proc,
-            "PID": pid,
+            "Process": entry["Process"],
+            "PID": entry["PID"],
             "Socket": f"0x{int(handle):x}" if int(handle) else "0",
-            "ThreadID": int(tid),
+            "ThreadID": int(entry["ThreadID"]),
             "Events": events,
             "Batches": batches,
             "Avg per Completion": round(events / batches, 2) if batches > 0 else 0.0,
@@ -474,17 +577,10 @@ def get_socket_lifecycle(
     trace = require_trace(trace_id)
     _ensure_dumper_ready(trace)
 
-    # We need at least one AFD source to identify sockets.
-    sources = (
-        trace.afd_recv_df, trace.afd_send_df,
-        trace.afd_connect_df, trace.afd_accept_df, trace.afd_close_df,
-    )
-    if not any(_has_columns(df, "SocketHandle") for df in sources):
-        return _NO_AFD_DATA_MSG
-
     # Per-socket aggregation. Key = (PID, SocketHandle) — handles get reused
     # across processes but are unique within one.
     agg: dict[tuple, dict] = {}
+    saw_source = False
 
     def _touch(key: tuple, proc: str, pid: int) -> dict:
         entry = agg.setdefault(key, {
@@ -494,30 +590,23 @@ def get_socket_lifecycle(
         })
         return entry
 
-    def _process_df(df: pd.DataFrame | None, *, kind: str) -> None:
+    def _process_batch(df: pd.DataFrame, *, kind: str) -> None:
+        nonlocal saw_source
         if not _has_columns(df, "SocketHandle"):
             return
+        saw_source = True
         local = _apply_process_filter(df, process_filter)
         if local.empty:
             return
         for _, row in local.iterrows():
-            try:
-                handle = int(row["SocketHandle"])
-            except (TypeError, ValueError):
-                continue
+            handle = _safe_int(row.get("SocketHandle", 0))
             if handle == 0:
                 continue
             proc = row.get("Process Name", "")
-            try:
-                pid = int(row.get("PID", 0) or 0)
-            except (TypeError, ValueError):
-                pid = 0
+            pid = _safe_int(row.get("PID", 0))
             key = (pid, handle)
             entry = _touch(key, proc, pid)
-            try:
-                ts = int(row["TimeStamp"])
-            except (TypeError, ValueError, KeyError):
-                ts = None
+            ts = _timestamp_us(row.get("TimeStamp"))
             if kind == "connect" or kind == "accept":
                 if ts is not None and (entry["CreatedUs"] is None or ts < entry["CreatedUs"]):
                     entry["CreatedUs"] = ts
@@ -537,11 +626,19 @@ def get_socket_lifecycle(
                 except (TypeError, ValueError):
                     pass
 
-    _process_df(trace.afd_connect_df, kind="connect")
-    _process_df(trace.afd_accept_df, kind="accept")
-    _process_df(trace.afd_close_df, kind="close")
-    _process_df(trace.afd_recv_df, kind="recv")
-    _process_df(trace.afd_send_df, kind="send")
+    columns = ["TimeStamp", "Process Name", "PID", "ThreadID", "CPU", "SocketHandle", "Size"]
+    for event_class, kind in (
+        ("AFD/Connect", "connect"),
+        ("AFD/Accept", "accept"),
+        ("AFD/Close", "close"),
+        ("AFD/Recv", "recv"),
+        ("AFD/Send", "send"),
+    ):
+        for batch in _network_batches(trace, event_class, columns):
+            _process_batch(batch, kind=kind)
+
+    if not saw_source:
+        return _NO_AFD_DATA_MSG
 
     if not agg:
         msg = "*No AFD sockets matched"
@@ -640,33 +737,47 @@ def get_socket_affinity_check(trace_id: str) -> str:
     trace = require_trace(trace_id)
     _ensure_dumper_ready(trace)
 
-    df = trace.afd_recv_df
-    if not _has_columns(df, "SocketHandle", "CPU"):
-        return _NO_AFD_DATA_MSG
+    columns = ["Process Name", "PID", "SocketHandle", "CPU"]
+    socket_counts: dict[int, dict] = {}
+    saw_source = False
+    saw_parseable_cpu = False
+    for batch in _network_batches(trace, "AFD/Recv", columns):
+        if not _has_columns(batch, "SocketHandle", "CPU"):
+            continue
+        saw_source = True
+        for _, row in batch.iterrows():
+            handle_int = _safe_int(row.get("SocketHandle", 0))
+            if handle_int == 0:
+                continue
+            cpu = _safe_int(row.get("CPU", -1), -1)
+            if cpu < 0:
+                continue
+            saw_parseable_cpu = True
+            entry = socket_counts.setdefault(
+                handle_int,
+                {
+                    "Process": row.get("Process Name", ""),
+                    "PID": _safe_int(row.get("PID", 0)),
+                    "cpu_counts": {},
+                },
+            )
+            counts = entry["cpu_counts"]
+            counts[cpu] = counts.get(cpu, 0) + 1
 
-    df = df.copy()
-    df["CPU"] = pd.to_numeric(df["CPU"], errors="coerce")
-    df = df.dropna(subset=["CPU"])
-    df["CPU"] = df["CPU"].astype(int)
-    # Drop bogus -1 CPUs (parser fallback when xperf didn't surface the CPU).
-    df = df[df["CPU"] >= 0]
-    if df.empty:
+    if not saw_source:
+        return _NO_AFD_DATA_MSG
+    if not saw_parseable_cpu:
         return "*No AFD recv events with parseable CPU column.*"
 
     rows = []
-    for handle, group in df.groupby("SocketHandle"):
-        try:
-            handle_int = int(handle)
-        except (TypeError, ValueError):
+    for handle_int, entry in socket_counts.items():
+        cpu_counts_dict = entry["cpu_counts"]
+        if not cpu_counts_dict:
             continue
-        if handle_int == 0:
-            continue
-        events = len(group)
-        cpu_counts = group["CPU"].value_counts()
-        top_cpu = int(cpu_counts.index[0])
-        top_count = int(cpu_counts.iloc[0])
+        events = int(sum(cpu_counts_dict.values()))
+        top_cpu, top_count = max(cpu_counts_dict.items(), key=lambda item: item[1])
         dominance = (top_count / events) * 100.0 if events > 0 else 0.0
-        distinct_cpus = int(cpu_counts.shape[0])
+        distinct_cpus = len(cpu_counts_dict)
 
         if events < 10:
             status = "low confidence"
@@ -675,12 +786,9 @@ def get_socket_affinity_check(trace_id: str) -> str:
         else:
             status = "affinity not working"
 
-        proc = group["Process Name"].iloc[0] if "Process Name" in group.columns else ""
-        pid = int(group["PID"].iloc[0]) if "PID" in group.columns else 0
-
         rows.append({
-            "Process": proc,
-            "PID": pid,
+            "Process": entry["Process"],
+            "PID": entry["PID"],
             "Socket": f"0x{handle_int:x}",
             "Events": events,
             "Top CPU": top_cpu,

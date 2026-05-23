@@ -17,8 +17,8 @@ Usage::
 The consumer always sets ``PROCESS_TRACE_MODE_EVENT_RECORD`` (so we get
 the modern ``EVENT_RECORD`` callback rather than the legacy ``EVENT_TRACE``
 shape) and ``PROCESS_TRACE_MODE_RAW_TIMESTAMP`` (so timestamps remain in
-QPC units rather than being converted to ``FILETIME`` — matching the
-behaviour of every kernel-event timestamp join we want to do in Phase N2).
+QPC units while stack-walk pairing runs). The extractor normalizes emitted
+DataFrame timestamps to xperf-relative microseconds before tool/cache use.
 
 The class is a context manager: handles are released in ``__exit__`` even
 if ``run()`` raises. ``run()`` itself is idempotent — calling it a second
@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import ctypes
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterable, List, Optional
 
@@ -44,6 +44,32 @@ class NativeConsumerError(RuntimeError):
     """Raised when the underlying ETW consumer APIs fail."""
 
 
+@dataclass(frozen=True)
+class TraceLogfileMetadata:
+    """Authoritative per-ETL metadata from ``TRACE_LOGFILE_HEADER``."""
+
+    number_of_processors: int
+    start_time_utc_100ns: int
+    end_time_utc_100ns: int
+    perf_freq: int
+    timer_resolution_100ns: int
+    cpu_speed_mhz: int
+    events_lost: int
+    buffers_lost: int
+    buffers_written: int
+    pointer_size: int
+
+    @property
+    def duration_seconds(self) -> float | None:
+        """Return ``EndTime - StartTime`` converted from FILETIME ticks."""
+        if self.start_time_utc_100ns <= 0 or self.end_time_utc_100ns <= 0:
+            return None
+        delta = self.end_time_utc_100ns - self.start_time_utc_100ns
+        if delta <= 0:
+            return None
+        return delta / 10_000_000.0
+
+
 @dataclass
 class ConsumerStats:
     """Stats from a single :meth:`EtwConsumer.run` invocation."""
@@ -53,6 +79,7 @@ class ConsumerStats:
     elapsed_seconds: float
     events_lost: int
     process_trace_rc: int
+    logfile_metadata: list[TraceLogfileMetadata] = field(default_factory=list)
 
 
 # Event callback signature exposed to callers. Receives a *dereferenced*
@@ -75,6 +102,26 @@ def _resolve_paths(etl_paths: Iterable[Path | str]) -> List[Path]:
     if not paths:
         raise NativeConsumerError("At least one ETL path is required")
     return paths
+
+
+def _large_integer_value(value) -> int:
+    return int(getattr(value, "value", value) or 0)
+
+
+def _snapshot_logfile_metadata(logfile: EVENT_TRACE_LOGFILEW) -> TraceLogfileMetadata:
+    header = logfile.LogfileHeader
+    return TraceLogfileMetadata(
+        number_of_processors=int(header.NumberOfProcessors or 0),
+        start_time_utc_100ns=_large_integer_value(header.StartTime),
+        end_time_utc_100ns=_large_integer_value(header.EndTime),
+        perf_freq=_large_integer_value(header.PerfFreq),
+        timer_resolution_100ns=int(header.TimerResolution or 0),
+        cpu_speed_mhz=int(header.CpuSpeedInMHz or 0),
+        events_lost=int(header.EventsLost or 0),
+        buffers_lost=int(header.BuffersLost or 0),
+        buffers_written=int(header.BuffersWritten or 0),
+        pointer_size=int(header.PointerSize or 0),
+    )
 
 
 class EtwConsumer:
@@ -262,7 +309,11 @@ class EtwConsumer:
             raise err
 
         bytes_processed = sum(p.stat().st_size for p in self._etl_paths)
-        events_lost = sum(lf.LogfileHeader.EventsLost for lf in self._logfiles)
+        logfile_metadata = [
+            _snapshot_logfile_metadata(lf)
+            for lf in self._logfiles
+        ]
+        events_lost = sum(meta.events_lost for meta in logfile_metadata)
 
         return ConsumerStats(
             event_count=self._event_count,
@@ -270,6 +321,7 @@ class EtwConsumer:
             elapsed_seconds=elapsed,
             events_lost=events_lost,
             process_trace_rc=int(rc),
+            logfile_metadata=logfile_metadata,
         )
 
     def close(self) -> None:
@@ -325,6 +377,7 @@ def is_available(etl_path: Optional[Path | str] = None) -> bool:
 __all__ = [
     "EtwConsumer",
     "ConsumerStats",
+    "TraceLogfileMetadata",
     "NativeConsumerError",
     "EventCallback",
     "is_available",

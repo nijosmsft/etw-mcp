@@ -8,7 +8,11 @@ import pandas as pd
 
 from etw_analyzer.app import mcp
 from etw_analyzer.trace_state import TraceData, make_trace_id
-from etw_analyzer.tools.trace_mgmt import _load_from_cache, _load_file
+from etw_analyzer.tools.trace_mgmt import (
+    _load_file,
+    _load_from_cache,
+    _write_cache_manifest,
+)
 from etw_analyzer.parsing.wpa_exporter import export_all_profiles, find_xperf, _run_xperf
 from etw_analyzer.parsing.csv_loader import load_csv
 from etw_analyzer.formatting.markdown import format_table, format_pct
@@ -26,7 +30,7 @@ def _load_trace_data(etl_path: str) -> TraceData:
     export_dir = path.parent / f".etw-export-{path.stem}"
 
     # Try cache first
-    cached = _load_from_cache(export_dir, path)
+    cached = _load_from_cache(export_dir, path, mode="xperf")
     if cached is not None:
         return TraceData(
             trace_id=make_trace_id(path),
@@ -49,6 +53,8 @@ def _load_trace_data(etl_path: str) -> TraceData:
             results[name] = _load_file(fp)
         except Exception:
             pass
+
+    _write_cache_manifest(export_dir, path, "xperf", results, dumper_stems=frozenset())
 
     return TraceData(
         trace_id=make_trace_id(path),

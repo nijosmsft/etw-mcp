@@ -1,4 +1,4 @@
-"""Stack analysis tools — function-level inclusive/exclusive weight from xperf butterfly."""
+"""Stack analysis tools — function-level inclusive/exclusive weight from butterfly data."""
 
 from __future__ import annotations
 
@@ -22,6 +22,12 @@ def _get_stacks_df(trace: TraceData) -> pd.DataFrame | None:
             df = trace.raw_csv[key]
             if not df.empty and "Module" in df.columns:
                 return df.copy()
+    _ensure_lazy_stack_aggregates(trace, include_callers=False)
+    for key in ["stacks", "stack_butterfly"]:
+        if key in trace.raw_csv:
+            df = trace.raw_csv[key]
+            if not df.empty and "Module" in df.columns:
+                return df.copy()
     return None
 
 
@@ -29,8 +35,43 @@ def _get_callers_df(trace: TraceData) -> pd.DataFrame | None:
     """Get caller/callee edge data if available."""
     df = trace.raw_csv.get("stacks_callers")
     if df is None or df.empty:
+        _ensure_lazy_stack_aggregates(trace, include_callers=True)
+        df = trace.raw_csv.get("stacks_callers")
+    if df is None or df.empty:
         return None
     return df.copy()
+
+
+def _ensure_lazy_stack_aggregates(
+    trace: TraceData,
+    *,
+    include_callers: bool,
+) -> None:
+    if getattr(trace, "mode", None) != "native" or getattr(trace, "event_store", None) is None:
+        return
+    try:
+        from etw_analyzer.native.aggregators.stack_butterfly import ensure_stack_aggregates
+    except Exception:
+        return
+    ensure_stack_aggregates(trace, include_callers=include_callers)
+
+
+def _stack_warning_text(trace: TraceData) -> str:
+    warnings = list(getattr(trace, "_native_stack_aggregate_warnings", []) or [])
+    if not warnings:
+        return ""
+    return "\n".join(f"Warning: {warning}" for warning in warnings)
+
+
+def _no_callers_message(trace: TraceData) -> str:
+    message = (
+        "*No caller/callee data available. Re-load the trace with stack detail "
+        "enabled to generate butterfly stack analysis.*"
+    )
+    warning = _stack_warning_text(trace)
+    if warning:
+        message += "\n\n" + warning
+    return message
 
 
 def _split_stack_ref(ref: tuple[str, str] | list[str] | str) -> tuple[str | None, str]:
@@ -64,8 +105,20 @@ def _parse_pct_value(value: object) -> float:
         return 0.0
 
 
+def _contains_literal(series: pd.Series, value: object) -> pd.Series:
+    """Case-insensitive literal substring match for user-provided filters."""
+    return series.astype(str).str.contains(str(value), case=False, na=False, regex=False)
+
+
+def _contains_module_filter(series: pd.Series, value: object) -> pd.Series:
+    """Match module filters, preserving wrapper-built regex module sets."""
+    text = str(value)
+    use_regex = "|" in text or "\\" in text
+    return series.astype(str).str.contains(text, case=False, na=False, regex=use_regex)
+
+
 def _stack_total_weight(trace: TraceData, stacks_df: pd.DataFrame | None = None) -> float:
-    """Estimate the trace-wide stack sample denominator from xperf percentages."""
+    """Estimate the trace-wide stack sample denominator from aggregate percentages."""
     stacks_df = stacks_df if stacks_df is not None else _get_stacks_df(trace)
     if stacks_df is not None and not stacks_df.empty:
         if "Total %" in stacks_df.columns and "Inclusive" in stacks_df.columns:
@@ -196,9 +249,9 @@ def _find_stack_node(
     stacks_df = _get_stacks_df(trace)
     if stacks_df is not None and not stacks_df.empty:
         df = stacks_df
-        mask = df["Function"].astype(str).str.contains(function_filter, case=False, na=False)
+        mask = _contains_literal(df["Function"], function_filter)
         if module_filter:
-            mask &= df["Module"].astype(str).str.contains(module_filter, case=False, na=False)
+            mask &= _contains_module_filter(df["Module"], module_filter)
         matches = df[mask]
         if not matches.empty:
             row = matches.sort_values("Inclusive", ascending=False).iloc[0]
@@ -212,9 +265,9 @@ def _find_stack_node(
         ("Target_Module", "Target_Function"),
         ("Caller_Module", "Caller_Function"),
     ]:
-        mask = callers_df[function_col].astype(str).str.contains(function_filter, case=False, na=False)
+        mask = _contains_literal(callers_df[function_col], function_filter)
         if module_filter:
-            mask &= callers_df[module_col].astype(str).str.contains(module_filter, case=False, na=False)
+            mask &= _contains_module_filter(callers_df[module_col], module_filter)
         for _, row in callers_df[mask].iterrows():
             candidates.append((str(row[module_col]), str(row[function_col]), int(row.get("Weight", 0))))
     if not candidates:
@@ -281,7 +334,7 @@ def get_hot_stacks(
 ) -> str:
     """Show hottest functions with inclusive and exclusive CPU weight.
 
-    Uses xperf butterfly stack data when available (includes caller/callee
+    Uses aggregate butterfly stack data when available (includes caller/callee
     relationships and inclusive hit counts). Falls back to flat
     module!function view from CPU sampling data.
 
@@ -297,7 +350,7 @@ def get_hot_stacks(
         end_time: End of analysis window (seconds from trace start).
         max_depth: Not used (kept for API compat). Default: 10.
         min_weight_pct: Prune functions below this % of total. Default: 1.0.
-        dpc_only: Not used with xperf backend. Default: false.
+        dpc_only: Not used with aggregate butterfly data. Default: false.
         max_rows: Max rows to return. Default: 50.
         denominator: Percentage denominator: 'trace', 'active_cpus', 'active_busy', or 'custom'.
         denominator_lps: Logical processor count for denominator='custom'.
@@ -341,9 +394,9 @@ def _render_butterfly_stacks(
     """Render butterfly stack data as a table with inclusive/exclusive weights."""
     # Apply filters
     if module_filter:
-        df = df[df["Module"].astype(str).str.contains(module_filter, case=False, na=False)]
+        df = df[_contains_module_filter(df["Module"], module_filter)]
     if function_filter:
-        df = df[df["Function"].astype(str).str.contains(function_filter, case=False, na=False)]
+        df = df[_contains_literal(df["Function"], function_filter)]
 
     if df.empty:
         return "*No matching functions found with the specified filters.*"
@@ -414,24 +467,23 @@ def get_function_callers(
 
     df = _get_callers_df(trace)
     if df is None or df.empty:
-        return ("*No caller/callee data available. Re-load the trace with "
-                "`load_trace` to generate butterfly stack analysis.*")
+        return _no_callers_message(trace)
 
     if direction not in {"callers", "callees", "both"}:
         raise ValueError("direction must be one of: callers, callees, both")
 
     # Find entries where this function is the center (Target_Function)
-    mask = df["Target_Function"].astype(str).str.contains(function_filter, case=False, na=False)
+    mask = _contains_literal(df["Target_Function"], function_filter)
     if module_filter:
-        mask &= df["Target_Module"].astype(str).str.contains(module_filter, case=False, na=False)
+        mask &= _contains_module_filter(df["Target_Module"], module_filter)
 
     matched = df[mask]
 
     # If not found as center, try as a related function
     if matched.empty:
-        mask2 = df["Caller_Function"].astype(str).str.contains(function_filter, case=False, na=False)
+        mask2 = _contains_literal(df["Caller_Function"], function_filter)
         if module_filter:
-            mask2 &= df["Caller_Module"].astype(str).str.contains(module_filter, case=False, na=False)
+            mask2 &= _contains_module_filter(df["Caller_Module"], module_filter)
         related = df[mask2]
         if related.empty:
             return f"*No entries found matching '{function_filter}'.*"
@@ -572,7 +624,10 @@ def _render_flat_stacks(
         header_parts.append(f"Function: {function_filter}")
     header = "\n".join(header_parts)
     header += f"\nDenominator ({denominator}): {denominator_weight:,.0f}"
-    header += "\n*Tip: For inclusive/exclusive breakdown, re-load with `load_trace` to generate butterfly stacks.*"
+    warning = _stack_warning_text(trace)
+    if warning:
+        header += "\n" + warning
+    header += "\n*Tip: For inclusive/exclusive breakdown, load stack detail to generate butterfly stacks.*"
 
     return f"{header}\n\n{format_table(grouped, max_rows=max_rows)}"
 
@@ -706,8 +761,7 @@ def walk_stack(
     """
     trace = require_trace(trace_id)
     if _get_callers_df(trace) is None:
-        return ("*No caller/callee data available. Re-load the trace with "
-                "`load_trace` to generate butterfly stack analysis.*")
+        return _no_callers_message(trace)
 
     rows = _walk_stack_rows(
         trace, function_filter, module_filter, direction, branch_policy,
@@ -734,9 +788,9 @@ def _frame_weight(trace: TraceData, ref: tuple[str | None, str]) -> int:
     stacks_df = _get_stacks_df(trace)
     if stacks_df is None or stacks_df.empty:
         return 0
-    mask = stacks_df["Function"].astype(str).str.contains(function, case=False, na=False)
+    mask = _contains_literal(stacks_df["Function"], function)
     if module:
-        mask &= stacks_df["Module"].astype(str).str.contains(module, case=False, na=False)
+        mask &= _contains_module_filter(stacks_df["Module"], module)
     if not mask.any():
         return 0
     return int(stacks_df.loc[mask, "Inclusive"].max())
@@ -754,14 +808,14 @@ def _best_edge_weight(
         return 0.0, 0.0
 
     mask = (
-        callers_df["Target_Function"].astype(str).str.contains(source_function, case=False, na=False)
-        & callers_df["Caller_Function"].astype(str).str.contains(target_function, case=False, na=False)
+        _contains_literal(callers_df["Target_Function"], source_function)
+        & _contains_literal(callers_df["Caller_Function"], target_function)
         & callers_df["Direction"].astype(str).eq("caller")
     )
     if source_module:
-        mask &= callers_df["Target_Module"].astype(str).str.contains(source_module, case=False, na=False)
+        mask &= _contains_module_filter(callers_df["Target_Module"], source_module)
     if target_module:
-        mask &= callers_df["Caller_Module"].astype(str).str.contains(target_module, case=False, na=False)
+        mask &= _contains_module_filter(callers_df["Caller_Module"], target_module)
     matches = callers_df[mask]
     if matches.empty:
         return 0.0, 0.0
@@ -842,9 +896,12 @@ def count_stacks(
 
     header = "**Stack predicate count**\n"
     header += (
-        "Note: current xperf butterfly data is aggregate edge data, so this estimates "
+        "Note: current butterfly data is aggregate edge data, so this estimates "
         "sample counts rather than distinct raw stack instances.\n"
     )
+    warning = _stack_warning_text(trace)
+    if warning:
+        header += warning + "\n"
     if cpu_filter:
         header += "Note: cpu_filter only changes denominator; aggregate butterfly stacks are trace-wide.\n"
     if start_time is not None or end_time is not None:
@@ -910,6 +967,8 @@ def butterfly_chain(
         raise ValueError("direction must be one of: callers, callees, both")
     if output_format not in {"table", "csv", "wpa_csv"}:
         raise ValueError("output_format must be one of: table, csv, wpa_csv")
+    if _get_callers_df(trace) is None:
+        return _no_callers_message(trace)
 
     directions = ["callers", "callees"] if direction == "both" else [direction]
     all_sections: list[str] = []

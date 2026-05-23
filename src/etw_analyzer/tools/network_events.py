@@ -24,6 +24,7 @@ import pandas as pd
 
 from etw_analyzer.app import mcp
 from etw_analyzer.formatting.markdown import format_pct, format_table
+from etw_analyzer.native.aggregators.network import iter_enriched_network_batches
 from etw_analyzer.trace_state import TraceData, require_trace
 
 
@@ -59,6 +60,12 @@ def _five_tuple(row) -> str:
 def _ensure_dumper_ready(trace: TraceData) -> None:
     """Block until the background dumper has finished, if it's running."""
     trace.wait_for_dumper()
+    if getattr(trace, "mode", "xperf") == "native":
+        try:
+            from etw_analyzer.native.aggregators.network import enrich_network_events
+            enrich_network_events(trace)
+        except Exception:
+            pass
 
 
 def _apply_process_filter(df: pd.DataFrame, process_filter: str | None) -> pd.DataFrame:
@@ -94,6 +101,46 @@ def _has_columns(df: pd.DataFrame | None, *required: str) -> bool:
     return all(col in df.columns for col in required)
 
 
+def _network_batches(
+    trace: TraceData,
+    event_class: str,
+    columns: list[str],
+):
+    yield from iter_enriched_network_batches(
+        trace,
+        event_class,
+        columns=columns,
+    )
+
+
+def _timestamp_us(value) -> int | None:
+    try:
+        if pd.isna(value):
+            return None
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_int(value, default: int = 0) -> int:
+    try:
+        if pd.isna(value):
+            return default
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _update_time_range(entry: dict, timestamp) -> None:
+    ts = _timestamp_us(timestamp)
+    if ts is None:
+        return
+    if entry.get("tmin") is None or ts < entry["tmin"]:
+        entry["tmin"] = ts
+    if entry.get("tmax") is None or ts > entry["tmax"]:
+        entry["tmax"] = ts
+
+
 # ---------------------------------------------------------------------------
 # Tool: get_connection_summary
 # ---------------------------------------------------------------------------
@@ -119,69 +166,80 @@ def get_connection_summary(
     trace = require_trace(trace_id)
     _ensure_dumper_ready(trace)
 
-    recv = trace.tcpip_recv_df
-    send = trace.tcpip_send_df
-    rtx = trace.tcpip_retransmit_df
+    columns = [
+        "TimeStamp", "Process Name", "PID",
+        "LocalAddr", "LocalPort", "RemoteAddr", "RemotePort",
+        "Size", "RetransmitCount",
+    ]
+    aggregates: dict[str, dict] = {}
+    have_any = False
+    have_after_filter = False
+    for event_class, kind in (
+        ("TcpIp/Recv", "recv"),
+        ("TcpIp/Send", "send"),
+        ("TcpIp/Retransmit", "rtx"),
+    ):
+        for batch in _network_batches(trace, event_class, columns):
+            if not _has_columns(batch, "LocalAddr", "LocalPort", "RemoteAddr", "RemotePort"):
+                continue
+            have_any = True
+            filtered = _apply_process_filter(batch, process_filter)
+            if filtered.empty:
+                continue
+            have_after_filter = True
+            for _, row in filtered.iterrows():
+                tup = _five_tuple(row)
+                entry = aggregates.setdefault(
+                    tup,
+                    {
+                        "5-Tuple": tup,
+                        "Process": row.get("Process Name", ""),
+                        "Recv Bytes": 0,
+                        "Send Bytes": 0,
+                        "recv_pkts": 0,
+                        "send_pkts": 0,
+                        "Retransmits": 0,
+                        "tmin": None,
+                        "tmax": None,
+                    },
+                )
+                if not entry.get("Process") and row.get("Process Name"):
+                    entry["Process"] = row.get("Process Name", "")
+                size = _safe_int(row.get("Size", 0))
+                if kind == "recv":
+                    entry["Recv Bytes"] += size
+                    entry["recv_pkts"] += 1
+                elif kind == "send":
+                    entry["Send Bytes"] += size
+                    entry["send_pkts"] += 1
+                else:
+                    entry["Retransmits"] += _safe_int(row.get("RetransmitCount", 1), 1)
+                _update_time_range(entry, row.get("TimeStamp"))
 
-    have_any = any(
-        _has_columns(df, "LocalAddr", "LocalPort", "RemoteAddr", "RemotePort")
-        for df in (recv, send, rtx)
-    )
     if not have_any:
         return _NO_TCPIP_DATA_MSG
-
-    pieces = []
-    for df, kind in ((recv, "recv"), (send, "send"), (rtx, "rtx")):
-        if df is None or df.empty:
-            continue
-        if not _has_columns(df, "LocalAddr", "LocalPort", "RemoteAddr", "RemotePort"):
-            continue
-        filtered = _apply_process_filter(df, process_filter).copy()
-        if filtered.empty:
-            continue
-        filtered["_kind"] = kind
-        pieces.append(filtered)
-
-    if not pieces:
+    if not have_after_filter:
         msg = "*No matching TCP events"
         if process_filter:
             msg += f" for process filter `{process_filter}`"
         msg += ".*"
         return msg
 
-    combined = pd.concat(pieces, ignore_index=True, sort=False)
-
-    # Build 5-tuple key as a single string for grouping.
-    combined["FiveTuple"] = combined.apply(_five_tuple, axis=1)
-
     rows = []
-    for tup, group in combined.groupby("FiveTuple"):
-        recv_rows = group[group["_kind"] == "recv"]
-        send_rows = group[group["_kind"] == "send"]
-        rtx_rows = group[group["_kind"] == "rtx"]
-
-        recv_bytes = int(recv_rows["Size"].sum()) if "Size" in recv_rows.columns and not recv_rows.empty else 0
-        send_bytes = int(send_rows["Size"].sum()) if "Size" in send_rows.columns and not send_rows.empty else 0
-        recv_pkts = len(recv_rows)
-        send_pkts = len(send_rows)
-
-        # Retransmit count: sum RetransmitCount if present, else row count.
-        if not rtx_rows.empty and "RetransmitCount" in rtx_rows.columns:
-            rtx_count = int(rtx_rows["RetransmitCount"].sum())
-        else:
-            rtx_count = len(rtx_rows)
-
-        duration = _safe_duration(group["TimeStamp"]) if "TimeStamp" in group.columns else 0.0
-        proc_name = group["Process Name"].iloc[0] if "Process Name" in group.columns else ""
-
+    for entry in aggregates.values():
+        recv_pkts = entry.pop("recv_pkts")
+        send_pkts = entry.pop("send_pkts")
+        tmin = entry.pop("tmin")
+        tmax = entry.pop("tmax")
+        duration = ((tmax - tmin) / 1_000_000.0) if tmin is not None and tmax is not None else 0.0
         rows.append({
-            "5-Tuple": tup,
-            "Process": proc_name,
-            "Recv Bytes": recv_bytes,
-            "Send Bytes": send_bytes,
-            "Total Bytes": recv_bytes + send_bytes,
+            "5-Tuple": entry["5-Tuple"],
+            "Process": entry["Process"],
+            "Recv Bytes": entry["Recv Bytes"],
+            "Send Bytes": entry["Send Bytes"],
+            "Total Bytes": entry["Recv Bytes"] + entry["Send Bytes"],
             "Packets": recv_pkts + send_pkts,
-            "Retransmits": rtx_count,
+            "Retransmits": entry["Retransmits"],
             "Duration (s)": round(duration, 3),
         })
 
@@ -229,60 +287,72 @@ def get_udp_flow_summary(
     trace = require_trace(trace_id)
     _ensure_dumper_ready(trace)
 
-    recv = trace.udp_recv_df
-    send = trace.udp_send_df
+    columns = [
+        "TimeStamp", "Process Name", "PID",
+        "LocalAddr", "LocalPort", "RemoteAddr", "RemotePort",
+        "Size",
+    ]
+    aggregates: dict[str, dict] = {}
+    have_any = False
+    have_after_filter = False
+    for event_class, kind in (("UdpIp/Recv", "recv"), ("UdpIp/Send", "send")):
+        for batch in _network_batches(trace, event_class, columns):
+            if not _has_columns(batch, "LocalAddr", "LocalPort", "RemoteAddr", "RemotePort"):
+                continue
+            have_any = True
+            filtered = _apply_process_filter(batch, process_filter)
+            if filtered.empty:
+                continue
+            have_after_filter = True
+            for _, row in filtered.iterrows():
+                tup = _five_tuple(row)
+                entry = aggregates.setdefault(
+                    tup,
+                    {
+                        "5-Tuple": tup,
+                        "Process": row.get("Process Name", ""),
+                        "Recv Pkts": 0,
+                        "Send Pkts": 0,
+                        "Bytes": 0,
+                        "tmin": None,
+                        "tmax": None,
+                    },
+                )
+                if not entry.get("Process") and row.get("Process Name"):
+                    entry["Process"] = row.get("Process Name", "")
+                if kind == "recv":
+                    entry["Recv Pkts"] += 1
+                else:
+                    entry["Send Pkts"] += 1
+                entry["Bytes"] += _safe_int(row.get("Size", 0))
+                _update_time_range(entry, row.get("TimeStamp"))
 
-    have_any = any(
-        _has_columns(df, "LocalAddr", "LocalPort", "RemoteAddr", "RemotePort")
-        for df in (recv, send)
-    )
     if not have_any:
         return _NO_UDP_DATA_MSG
-
-    pieces = []
-    for df, kind in ((recv, "recv"), (send, "send")):
-        if df is None or df.empty:
-            continue
-        if not _has_columns(df, "LocalAddr", "LocalPort", "RemoteAddr", "RemotePort"):
-            continue
-        filtered = _apply_process_filter(df, process_filter).copy()
-        if filtered.empty:
-            continue
-        filtered["_kind"] = kind
-        pieces.append(filtered)
-
-    if not pieces:
+    if not have_after_filter:
         msg = "*No matching UDP events"
         if process_filter:
             msg += f" for process filter `{process_filter}`"
         msg += ".*"
         return msg
 
-    combined = pd.concat(pieces, ignore_index=True, sort=False)
-    combined["FiveTuple"] = combined.apply(_five_tuple, axis=1)
-
     rows = []
-    for tup, group in combined.groupby("FiveTuple"):
-        recv_rows = group[group["_kind"] == "recv"]
-        send_rows = group[group["_kind"] == "send"]
-
-        recv_pkts = len(recv_rows)
-        send_pkts = len(send_rows)
+    for entry in aggregates.values():
+        recv_pkts = entry["Recv Pkts"]
+        send_pkts = entry["Send Pkts"]
         packets = recv_pkts + send_pkts
-        size_col = group["Size"] if "Size" in group.columns else pd.Series([], dtype=int)
-        total_bytes = int(size_col.sum()) if not size_col.empty else 0
-
-        duration = _safe_duration(group["TimeStamp"]) if "TimeStamp" in group.columns else 0.0
+        tmin = entry["tmin"]
+        tmax = entry["tmax"]
+        duration = ((tmax - tmin) / 1_000_000.0) if tmin is not None and tmax is not None else 0.0
         pps = (packets / duration) if duration > 0 else 0.0
-        proc_name = group["Process Name"].iloc[0] if "Process Name" in group.columns else ""
 
         rows.append({
-            "5-Tuple": tup,
-            "Process": proc_name,
+            "5-Tuple": entry["5-Tuple"],
+            "Process": entry["Process"],
             "Recv Pkts": recv_pkts,
             "Send Pkts": send_pkts,
             "Total Pkts": packets,
-            "Bytes": total_bytes,
+            "Bytes": entry["Bytes"],
             "Duration (s)": round(duration, 3),
             "PPS": round(pps, 1),
         })
@@ -329,17 +399,45 @@ def get_tcp_retransmits(trace_id: str, top_n: int = 30) -> str:
     trace = require_trace(trace_id)
     _ensure_dumper_ready(trace)
 
-    rtx = trace.tcpip_retransmit_df
-    recv = trace.tcpip_recv_df
-    send = trace.tcpip_send_df
+    columns = [
+        "TimeStamp", "Process Name", "PID",
+        "LocalAddr", "LocalPort", "RemoteAddr", "RemotePort",
+        "Size", "RetransmitCount",
+    ]
+    pkt_counts: dict[str, int] = {}
+    have_tcp = False
+    for event_class in ("TcpIp/Recv", "TcpIp/Send"):
+        for batch in _network_batches(trace, event_class, columns):
+            if not _has_columns(batch, "LocalAddr", "LocalPort", "RemoteAddr", "RemotePort"):
+                continue
+            have_tcp = True
+            for _, row in batch.iterrows():
+                tup = _five_tuple(row)
+                pkt_counts[tup] = pkt_counts.get(tup, 0) + 1
 
-    if not _has_columns(rtx, "LocalAddr", "LocalPort", "RemoteAddr", "RemotePort"):
-        # No retransmits is not the same as no TCP data, but if neither
-        # recv nor send have data either, treat as "no TCP".
-        if not any(
-            _has_columns(df, "LocalAddr", "LocalPort", "RemoteAddr", "RemotePort")
-            for df in (recv, send)
-        ):
+    rtx_agg: dict[str, dict] = {}
+    have_rtx = False
+    for batch in _network_batches(trace, "TcpIp/Retransmit", columns):
+        if not _has_columns(batch, "LocalAddr", "LocalPort", "RemoteAddr", "RemotePort"):
+            continue
+        have_tcp = True
+        have_rtx = True
+        for _, row in batch.iterrows():
+            tup = _five_tuple(row)
+            entry = rtx_agg.setdefault(
+                tup,
+                {
+                    "5-Tuple": tup,
+                    "Process": row.get("Process Name", ""),
+                    "Retransmits": 0,
+                },
+            )
+            if not entry.get("Process") and row.get("Process Name"):
+                entry["Process"] = row.get("Process Name", "")
+            entry["Retransmits"] += _safe_int(row.get("RetransmitCount", 1), 1)
+
+    if not have_rtx:
+        if not have_tcp:
             return _NO_TCPIP_DATA_MSG
         return (
             "**TCP Retransmits**\n\n"
@@ -348,34 +446,16 @@ def get_tcp_retransmits(trace_id: str, top_n: int = 30) -> str:
             "there were simply no retransmissions.)"
         )
 
-    # Build per-tuple packet counts from recv + send first.
-    pkt_counts: dict[str, int] = {}
-    for df in (recv, send):
-        if df is None or df.empty:
-            continue
-        if not _has_columns(df, "LocalAddr", "LocalPort", "RemoteAddr", "RemotePort"):
-            continue
-        for _, row in df.iterrows():
-            tup = _five_tuple(row)
-            pkt_counts[tup] = pkt_counts.get(tup, 0) + 1
-
-    # Aggregate retransmits per tuple.
-    rtx_local = rtx.copy()
-    rtx_local["FiveTuple"] = rtx_local.apply(_five_tuple, axis=1)
-    if "RetransmitCount" not in rtx_local.columns:
-        rtx_local["RetransmitCount"] = 1
-
     rows = []
-    for tup, group in rtx_local.groupby("FiveTuple"):
-        rtx_count = int(group["RetransmitCount"].sum())
+    for tup, entry in rtx_agg.items():
+        rtx_count = int(entry["Retransmits"])
         base_pkts = pkt_counts.get(tup, 0)
         total_pkts = base_pkts + rtx_count
         rate = (rtx_count / total_pkts) if total_pkts > 0 else 0.0
-        proc_name = group["Process Name"].iloc[0] if "Process Name" in group.columns else ""
 
         rows.append({
             "5-Tuple": tup,
-            "Process": proc_name,
+            "Process": entry["Process"],
             "Retransmits": rtx_count,
             "Packets": total_pkts,
             "Rate": format_pct(rate * 100.0),
@@ -428,59 +508,40 @@ def get_per_process_socket_throughput(trace_id: str, top_n: int = 30) -> str:
     trace = require_trace(trace_id)
     _ensure_dumper_ready(trace)
 
-    tcp_recv = trace.tcpip_recv_df
-    tcp_send = trace.tcpip_send_df
-    udp_recv = trace.udp_recv_df
-    udp_send = trace.udp_send_df
-
     inputs = [
-        (tcp_recv, "tcp", "recv"),
-        (tcp_send, "tcp", "send"),
-        (udp_recv, "udp", "recv"),
-        (udp_send, "udp", "send"),
+        ("TcpIp/Recv", "tcp", "recv"),
+        ("TcpIp/Send", "tcp", "send"),
+        ("UdpIp/Recv", "udp", "recv"),
+        ("UdpIp/Send", "udp", "send"),
     ]
 
-    have_any = any(
-        df is not None and not df.empty and "Process Name" in df.columns
-        for df, _, _ in inputs
-    )
+    # Per-(process, pid, proto, dir): packet count, byte total, time range.
+    agg: dict[tuple, dict] = {}
+    have_any = False
+    columns = ["TimeStamp", "Process Name", "PID", "Size"]
+    for event_class, proto, direction in inputs:
+        for batch in _network_batches(trace, event_class, columns):
+            if batch.empty or "Process Name" not in batch.columns:
+                continue
+            have_any = True
+            for _, row in batch.iterrows():
+                key = (
+                    row.get("Process Name", ""),
+                    _safe_int(row.get("PID", 0)),
+                    proto,
+                    direction,
+                )
+                entry = agg.setdefault(key, {"pkts": 0, "bytes": 0, "tmin": None, "tmax": None})
+                entry["pkts"] += 1
+                entry["bytes"] += _safe_int(row.get("Size", 0))
+                _update_time_range(entry, row.get("TimeStamp"))
+
     if not have_any:
         return (
             "*No TCP or UDP socket event data in this trace.*\n\n"
             "Re-collect using `udp-perf/scripts/networking.wprp` to capture "
             "the TCPIP/UDP kernel providers."
         )
-
-    # Per-(process, pid, proto, dir): packet count, byte total, time range.
-    agg: dict[tuple, dict] = {}
-    for df, proto, direction in inputs:
-        if df is None or df.empty or "Process Name" not in df.columns:
-            continue
-        for _, row in df.iterrows():
-            key = (
-                row.get("Process Name", ""),
-                int(row.get("PID", 0) or 0),
-                proto,
-                direction,
-            )
-            entry = agg.setdefault(key, {"pkts": 0, "bytes": 0, "tmin": None, "tmax": None})
-            entry["pkts"] += 1
-            size = row.get("Size", 0)
-            try:
-                entry["bytes"] += int(size or 0)
-            except (TypeError, ValueError):
-                pass
-            ts = row.get("TimeStamp")
-            if ts is not None:
-                try:
-                    ts_int = int(ts)
-                except (TypeError, ValueError):
-                    ts_int = None
-                if ts_int is not None:
-                    if entry["tmin"] is None or ts_int < entry["tmin"]:
-                        entry["tmin"] = ts_int
-                    if entry["tmax"] is None or ts_int > entry["tmax"]:
-                        entry["tmax"] = ts_int
 
     # Flatten per process+PID.
     proc_rows: dict[tuple, dict] = {}

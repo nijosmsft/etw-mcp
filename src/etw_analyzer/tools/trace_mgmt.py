@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import json
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -81,6 +82,8 @@ def load_trace(
         symbol_path: NT symbol path (e.g. 'srv*C:\\symbols*https://msdl.microsoft.com/download/symbols').
                      If not set, uses _NT_SYMBOL_PATH env var.
         timeout_seconds: Max seconds per xperf invocation. Default: 300.
+                         Native ETW extraction currently runs to completion;
+                         non-default timeout values require mode="xperf".
         force: Delete cached exports and re-run xperf. Default: False.
         mode: Pipeline used to load the trace.
               ``"auto"`` (default — Phase N5) probes the in-process
@@ -107,16 +110,35 @@ def load_trace(
     # available on this host — surface that to the caller rather than
     # silently falling back to xperf, so they know to flip to
     # ``mode="xperf"`` or ``mode="auto"``.
-    from etw_analyzer.native.config import resolve_mode
+    from etw_analyzer.native.config import (
+        _native_was_forced,
+        apply_native_size_guardrail,
+        resolve_mode,
+    )
     try:
+        native_was_forced = _native_was_forced(mode)
         resolved_mode = resolve_mode(mode, etl_path=path)
+        resolved_mode, guardrail_notice = apply_native_size_guardrail(
+            mode,
+            resolved_mode,
+            path,
+        )
     except ValueError as e:
         return str(e)
     except RuntimeError as e:
         return str(e)
 
+    if resolved_mode == "native" and timeout_seconds != 300:
+        return (
+            "timeout_seconds is only supported for mode='xperf'. The native "
+            "ETW pipeline currently runs to completion because safe "
+            "cancellation is not implemented. Use mode='xperf' for timeout "
+            "enforcement, or leave timeout_seconds at its default for native."
+        )
+
     # Resolve symbol path
     sym_path = symbol_path or os.environ.get("_NT_SYMBOL_PATH")
+    load_notices: list[str] = [guardrail_notice] if guardrail_notice else []
 
     # Export directory next to the ETL file
     export_dir = path.parent / f".etw-export-{path.stem}"
@@ -132,31 +154,74 @@ def load_trace(
     # block.
     xperf = find_xperf()
     if xperf is None and resolved_mode != "native":
-        return (
+        prefix = f"{guardrail_notice}\n\n" if guardrail_notice else ""
+        return prefix + (
             "xperf.exe not found. Install Windows Performance Toolkit "
             "(part of Windows SDK/ADK) or add it to PATH.\n\n"
             "Expected at: C:\\Program Files (x86)\\Windows Kits\\10\\Windows Performance Toolkit\\xperf.exe"
         )
 
     # Check if we can skip re-export (cached parquet/csv files exist and are newer than ETL)
-    cached = _load_from_cache(export_dir, path)
+    cached = _load_from_cache(export_dir, path, mode=resolved_mode)
     if cached is not None:
-        errors: list[str] = []
-        _refresh_stack_cache_from_html(export_dir, cached, errors)
-        trace = TraceData(
-            trace_id=make_trace_id(path),
-            etl_path=path,
-            export_dir=export_dir,
-            symbol_path=sym_path,
-            mode=resolved_mode,
-            raw_csv=cached,
-            export_errors=errors,
+        return _register_cached_trace(
+            path,
+            export_dir,
+            sym_path,
+            resolved_mode,
+            cached,
+            load_notices,
+            from_cache=True,
         )
-        _populate_metadata(trace)
-        register_trace(trace)
-        _start_background_dumper(trace)
-        summary = _format_load_summary(trace)
-        return summary.replace("**Trace loaded:**", "**Trace loaded (from cache):**")
+
+    if resolved_mode == "native" and _native_worker_enabled():
+        worker_result = _load_native_with_worker(
+            path,
+            export_dir,
+            sym_path,
+        )
+        if worker_result.ok:
+            cached = _load_from_cache(export_dir, path, mode="native")
+            if cached is not None:
+                return _register_cached_trace(
+                    path,
+                    export_dir,
+                    sym_path,
+                    "native",
+                    cached,
+                    load_notices,
+                    from_cache=False,
+                )
+            worker_result.message = (
+                "native worker completed but the promoted cache could not be loaded"
+            )
+            try:
+                import shutil
+                shutil.rmtree(export_dir)
+            except Exception:
+                pass
+
+        if native_was_forced:
+            return _native_worker_load_failed(worker_result)
+        if xperf is not None:
+            load_notices.append(
+                "Native worker failed; falling back to mode='xperf': "
+                f"{worker_result.message}"
+            )
+            resolved_mode = "xperf"
+            cached = _load_from_cache(export_dir, path, mode="xperf")
+            if cached is not None:
+                return _register_cached_trace(
+                    path,
+                    export_dir,
+                    sym_path,
+                    "xperf",
+                    cached,
+                    load_notices,
+                    from_cache=True,
+                )
+        else:
+            return _native_worker_load_failed(worker_result)
 
     # Native fast path: skip the xperf export pipeline entirely. The
     # background dumper extraction (kicked off below) reads the trace via
@@ -169,7 +234,7 @@ def load_trace(
     if resolved_mode == "native":
         export_dir.mkdir(parents=True, exist_ok=True)
         results: dict[str, pd.DataFrame] = {}
-        errors: list[str] = []
+        errors: list[str] = list(load_notices)
 
         trace = TraceData(
             trace_id=make_trace_id(path),
@@ -192,9 +257,12 @@ def load_trace(
         # somehow didn't, fall back to the Phase N1 stub for
         # ``cpu_sampling`` so ``get_cpu_samples`` still has a row set.
         trace.wait_for_dumper()
+        if trace._dumper_error:
+            return _native_load_failed(trace, trace._dumper_error)
         if "cpu_sampling" not in trace.raw_csv:
             _synthesize_native_cpu_sampling(trace)
         _populate_metadata(trace)
+        _write_cache_manifest(trace.export_dir, trace.etl_path, trace.mode, trace.raw_csv)
 
         return _format_load_summary(trace)
 
@@ -212,7 +280,7 @@ def load_trace(
 
     # Run exports (parallel xperf actions, saves parquet + raw text)
     results: dict[str, pd.DataFrame] = {}
-    errors: list[str] = []
+    errors: list[str] = list(load_notices)
 
     try:
         file_paths = export_all_profiles(
@@ -243,9 +311,184 @@ def load_trace(
 
     _populate_metadata(trace)
     register_trace(trace)
+    _write_cache_manifest(
+        trace.export_dir,
+        trace.etl_path,
+        trace.mode,
+        trace.raw_csv,
+        dumper_stems=frozenset(),
+    )
     _start_background_dumper(trace)
 
     return _format_load_summary(trace)
+
+
+def _register_cached_trace(
+    path: Path,
+    export_dir: Path,
+    sym_path: str | None,
+    resolved_mode: str,
+    cached: dict[str, pd.DataFrame],
+    notices: list[str],
+    *,
+    from_cache: bool,
+) -> str:
+    """Register a trace from a validated on-disk cache."""
+
+    errors: list[str] = list(notices)
+    _refresh_stack_cache_from_html(export_dir, cached, errors)
+    trace = TraceData(
+        trace_id=make_trace_id(path),
+        etl_path=path,
+        export_dir=export_dir,
+        symbol_path=sym_path,
+        mode=resolved_mode,
+        raw_csv=cached,
+        export_errors=errors,
+        event_store=_open_native_event_store_from_cache(
+            export_dir,
+            path,
+            resolved_mode,
+        ),
+    )
+    _populate_metadata(trace)
+    register_trace(trace)
+    if resolved_mode == "xperf":
+        _write_cache_manifest(
+            trace.export_dir,
+            trace.etl_path,
+            trace.mode,
+            trace.raw_csv,
+            dumper_stems=frozenset(),
+        )
+    streaming_store = (
+        resolved_mode == "native"
+        and trace.event_store is not None
+        and _is_streaming_event_store_cache(export_dir)
+    )
+    if streaming_store:
+        missing = _streaming_missing_aggregates(trace.raw_csv)
+        if missing:
+            trace.export_errors.append(
+                "Native streaming event-store cache loaded; some low-risk "
+                "aggregate datasets are not present: " + ", ".join(missing)
+            )
+    else:
+        _start_background_dumper(trace)
+    if resolved_mode == "native" and not streaming_store:
+        trace.wait_for_dumper()
+        if trace._dumper_error:
+            return _native_load_failed(trace, trace._dumper_error)
+        if "cpu_sampling" not in trace.raw_csv:
+            _synthesize_native_cpu_sampling(trace)
+        _populate_metadata(trace)
+    summary = _format_load_summary(trace)
+    if from_cache:
+        return summary.replace("**Trace loaded:**", "**Trace loaded (from cache):**")
+    return summary
+
+
+def _open_native_event_store_from_cache(
+    export_dir: Path,
+    etl_path: Path,
+    mode: str,
+):
+    """Open the optional chunked event store referenced by a native v2 cache."""
+
+    if mode != "native":
+        return None
+    manifest_data = _read_cache_manifest(export_dir)
+    if manifest_data is None or not _is_native_v2_manifest(manifest_data):
+        return None
+    try:
+        from etw_analyzer.native import cache as native_cache
+        from etw_analyzer.native.event_store import NativeEventStore
+
+        manifest = native_cache.CacheManifest.from_dict(manifest_data)
+        native_cache.validate_manifest(
+            manifest,
+            export_dir,
+            etl_path,
+            mode="native",
+        )
+        return NativeEventStore.open_from_cache_manifest(export_dir, manifest)
+    except Exception:
+        return None
+
+
+def _is_streaming_event_store_cache(export_dir: Path) -> bool:
+    manifest_data = _read_cache_manifest(export_dir)
+    if manifest_data is None or not _is_native_v2_manifest(manifest_data):
+        return False
+    try:
+        from etw_analyzer.native import cache as native_cache
+
+        manifest = native_cache.CacheManifest.from_dict(manifest_data)
+        return manifest.strategy == native_cache.STREAMING_EVENT_STORE_STRATEGY
+    except Exception:
+        return False
+
+
+_STREAMING_LOW_RISK_AGGREGATES = frozenset({
+    "trace_metadata",
+    "cpu_sampling",
+    "cpu_timeline",
+    "dpc_isr",
+    "dpc_isr_per_cpu",
+    "process_info",
+    "sysconfig",
+    "tracestats",
+})
+
+
+def _streaming_missing_aggregates(raw_csv: dict[str, pd.DataFrame]) -> list[str]:
+    return sorted(name for name in _STREAMING_LOW_RISK_AGGREGATES if name not in raw_csv)
+
+
+def _native_worker_enabled() -> bool:
+    try:
+        from etw_analyzer.native.worker_supervisor import native_worker_enabled
+
+        return native_worker_enabled()
+    except Exception:
+        return False
+
+
+def _load_native_with_worker(
+    path: Path,
+    export_dir: Path,
+    sym_path: str | None,
+):
+    from etw_analyzer.native.worker_supervisor import run_native_worker_extraction
+
+    return run_native_worker_extraction(
+        etl_path=path,
+        export_dir=export_dir,
+        trace_id=make_trace_id(path),
+        symbol_path=sym_path,
+        requested_event_classes=_DUMPER_EVENT_CLASSES.keys(),
+    )
+
+
+def _native_worker_load_failed(worker_result) -> str:
+    """Return an actionable message for a failed native worker load."""
+
+    detail = worker_result.message
+    if getattr(worker_result, "failure_kind", None):
+        detail = f"{worker_result.failure_kind}: {detail}"
+    stderr_tail = getattr(worker_result, "stderr_tail", "")
+    if stderr_tail:
+        detail = f"{detail}\n\nWorker stderr tail:\n{stderr_tail[-2000:]}"
+    invalid_tail = getattr(worker_result, "invalid_stdout_tail", "")
+    if invalid_tail:
+        detail = f"{detail}\n\nInvalid worker stdout tail:\n{invalid_tail[-2000:]}"
+    return (
+        "Native ETW worker extraction failed: "
+        f"{detail}\n\n"
+        "No trace was loaded. Use mode='xperf' to fall back to the legacy "
+        "xperf pipeline, or unset WPR_MCP_NATIVE_WORKER to retry the "
+        "in-process native pipeline."
+    )
 
 
 def _refresh_stack_cache_from_html(
@@ -279,6 +522,25 @@ def _refresh_stack_cache_from_html(
             results["stacks_callers"] = callers_df
     except Exception as e:
         errors.append(f"stacks_callers: {e}")
+
+
+def _native_load_failed(trace: TraceData, error: str) -> str:
+    """Unregister a failed native load and return an actionable message."""
+    unregister_trace(trace.trace_id)
+    _remove_cache_manifest(trace.export_dir)
+    sym = getattr(trace, "symbolizer", None)
+    if sym is not None:
+        try:
+            sym.close()
+        except Exception:
+            pass
+    return (
+        "Native ETW extraction failed: "
+        f"{error}\n\n"
+        "No trace was loaded. Use mode='xperf' to fall back to the legacy "
+        "xperf pipeline, or retry with force=True after fixing the native "
+        "extraction error."
+    )
 
 
 # Background-extracted dumper event classes. Each entry maps the canonical
@@ -388,7 +650,11 @@ def _start_background_dumper(trace: TraceData) -> None:
     """
     import threading
 
+    cached_dumper_paths = _cached_dumper_paths_for_trace(trace)
+
     def _parquet_for(stem: str) -> Path:
+        if cached_dumper_paths is not None and stem in cached_dumper_paths:
+            return cached_dumper_paths[stem]
         return trace.export_dir / f"{stem}.parquet"
 
     with trace.lock:
@@ -404,6 +670,8 @@ def _start_background_dumper(trace: TraceData) -> None:
         # Glob-based ``_load_from_cache`` excludes these stems so they don't
         # leak into ``raw_csv``.
         for canonical, (attr, stem) in _DUMPER_EVENT_CLASSES.items():
+            if cached_dumper_paths is not None and stem not in cached_dumper_paths:
+                continue
             parquet = _parquet_for(stem)
             if getattr(trace, attr) is None and parquet.exists():
                 try:
@@ -420,6 +688,7 @@ def _start_background_dumper(trace: TraceData) -> None:
             return
 
     def _extract():
+        success = False
         try:
             # Only re-extract classes that weren't cached. A single
             # extraction pass services all of them — both pipelines
@@ -462,7 +731,7 @@ def _start_background_dumper(trace: TraceData) -> None:
                     "Thread/Start", "Thread/End",
                     "Thread/DCStart", "Thread/DCEnd",
                     "DiskIo/Read", "DiskIo/Write", "DiskIo/FlushBuffers",
-                    "SystemConfig",
+                    "EventTrace/Header", "SystemConfig",
                 })
 
                 stats_sink: list[ExtractStats] = []
@@ -472,7 +741,9 @@ def _start_background_dumper(trace: TraceData) -> None:
                     stats_sink=stats_sink,
                 )
                 if stats_sink:
-                    trace._native_extract_stats = stats_sink[-1]
+                    with trace.lock:
+                        trace._native_extract_stats = stats_sink[-1]
+                    _apply_native_metadata(trace)
 
                 # Build the per-trace Symbolizer and feed every
                 # ImageLoad row into it. Phase N3 only wires the
@@ -497,7 +768,7 @@ def _start_background_dumper(trace: TraceData) -> None:
                         "Thread/Start", "Thread/End",
                         "Thread/DCStart", "Thread/DCEnd",
                         "DiskIo/Read", "DiskIo/Write", "DiskIo/FlushBuffers",
-                        "SystemConfig",
+                        "EventTrace/Header", "SystemConfig",
                     )
                 }
                 for name, df in _native_aux.items():
@@ -520,20 +791,19 @@ def _start_background_dumper(trace: TraceData) -> None:
                     if canonical not in results:
                         continue
                     df = results[canonical]
+                    if df is None:
+                        continue
                     setattr(trace, attr, df)
-                    if not df.empty:
-                        trace.export_dir.mkdir(parents=True, exist_ok=True)
-                        try:
-                            _persist_dumper_parquet(df, _parquet_for(stem))
-                        except Exception:
-                            # Non-fatal: keep the in-memory DataFrame even if
-                            # we can't persist (e.g. disk full, readonly).
-                            # NOTE: failing here used to silently strand the
-                            # in-memory frame and lose it on cache rehydrate —
-                            # ``_persist_dumper_parquet`` now sanitizes
-                            # uint64 Stack columns before writing so this is
-                            # only hit on actual filesystem failures.
-                            pass
+                    trace.export_dir.mkdir(parents=True, exist_ok=True)
+                    try:
+                        _persist_dumper_parquet(df, _parquet_for(stem))
+                    except Exception:
+                        # Non-fatal: keep the in-memory DataFrame even if
+                        # we can't persist (e.g. disk full, readonly).
+                        # Empty DataFrames are intentionally persisted so a
+                        # trace with no events for a class does not re-run the
+                        # native/xperf dumper on every cache reload.
+                        pass
 
             # Phase N4: with the event-level DataFrames in place, run the
             # native-mode aggregators to populate ``trace.raw_csv`` with
@@ -542,10 +812,13 @@ def _start_background_dumper(trace: TraceData) -> None:
             # not block the trace from loading.
             if trace.mode == "native":
                 _run_native_aggregators(trace)
+            success = True
         except Exception as e:
             with trace.lock:
                 trace._dumper_error = str(e)
         finally:
+            if success:
+                _write_cache_manifest(trace.export_dir, trace.etl_path, trace.mode, trace.raw_csv)
             trace._dumper_ready.set()
 
     thread = threading.Thread(target=_extract, daemon=True, name="dumper-extract")
@@ -641,6 +914,7 @@ def _run_native_aggregators(trace: TraceData) -> None:
             build_process_info_text,
             build_diskio_text,
             build_tracestats_text,
+            enrich_network_events,
         )
         from etw_analyzer.native.aggregators.process_info import build_process_table
         from etw_analyzer.native.aggregators.stack_butterfly import aggregate_stack_callers
@@ -653,6 +927,28 @@ def _run_native_aggregators(trace: TraceData) -> None:
         ptable = build_process_table(trace)
         if ptable is not None and not ptable.empty:
             trace.raw_csv["_native_process_events"] = ptable
+    except Exception:
+        pass
+
+    # Enrich native manifest networking rows before tools/cache consumers
+    # read them: TCP send/recv usually carries only ConnId/TCB, while
+    # connect/rundown carries the 5-tuple.
+    try:
+        mutated_network = enrich_network_events(trace)
+        for canonical in mutated_network:
+            attr, stem = _DUMPER_EVENT_CLASSES.get(canonical, (None, None))
+            if not attr or not stem:
+                continue
+            df = getattr(trace, attr, None)
+            if df is None:
+                continue
+            try:
+                _persist_dumper_parquet(
+                    df,
+                    trace.export_dir / f"{stem}.parquet",
+                )
+            except Exception:
+                pass
     except Exception:
         pass
 
@@ -780,6 +1076,12 @@ def _run_native_aggregators(trace: TraceData) -> None:
             (trace.export_dir / filename).write_text(text, encoding="utf-8")
         except Exception:
             pass
+
+    # trace_metadata — authoritative header-derived duration / CPU count.
+    try:
+        _persist_df("trace_metadata", "trace_metadata", _native_metadata_dataframe(trace))
+    except Exception:
+        pass
 
     # cpu_sampling — the floor everything else needs.
     try:
@@ -955,10 +1257,20 @@ _PARQUET_EXCLUDED = frozenset({
     "quic_ack_recv",
 })
 
-# Datasets that MUST be present (and load successfully) for the cache to be
-# considered usable. Without cpu_sampling, most analysis tools have nothing
-# to chew on, so we treat it as the floor. Other datasets are best-effort.
-_PARQUET_REQUIRED = frozenset({"cpu_sampling"})
+# Cache manifest written after successful exports. Xperf continues to use the
+# v1 flat manifest. Native writes a v2 manifest via etw_analyzer.native.cache,
+# but v1 native manifests remain readable for compatibility.
+_CACHE_MANIFEST_FILENAME = "wpr-mcp-cache-manifest.json"
+_CACHE_SCHEMA_VERSION = 1
+
+# Datasets that MUST be present (and load successfully) for a cache to be
+# considered usable. Xperf needs cpu_sampling as the historical floor. Native
+# can have traces with no sampled-profile rows, so native completeness is
+# tracked by the per-event parquet set in the manifest instead.
+_CACHE_REQUIRED_DATASETS_BY_MODE = {
+    "xperf": frozenset({"cpu_sampling"}),
+    "native": frozenset(),
+}
 
 # Legacy exports may have written .csv instead of .parquet for the original
 # five datasets. Only fall back to CSV for these names, since we have no
@@ -978,7 +1290,394 @@ _TEXT_DATASETS = {
 }
 
 
-def _load_from_cache(export_dir: Path, etl_path: Path) -> dict[str, pd.DataFrame] | None:
+def _cache_manifest_path(export_dir: Path) -> Path:
+    return export_dir / _CACHE_MANIFEST_FILENAME
+
+
+def _etl_cache_identity(etl_path: Path) -> dict[str, int]:
+    stat = etl_path.stat()
+    return {
+        "etl_size": int(stat.st_size),
+        "etl_mtime_ns": int(stat.st_mtime_ns),
+    }
+
+
+def _read_cache_manifest(export_dir: Path) -> dict | None:
+    manifest_path = _cache_manifest_path(export_dir)
+    if not manifest_path.exists():
+        return None
+    try:
+        data = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _remove_cache_manifest(export_dir: Path) -> None:
+    try:
+        _cache_manifest_path(export_dir).unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def _is_native_v2_manifest(manifest: dict) -> bool:
+    if manifest.get("mode") != "native":
+        return False
+    try:
+        from etw_analyzer.native.cache import SCHEMA_VERSION as native_schema_version
+    except Exception:
+        return False
+    return manifest.get("schema_version") == native_schema_version
+
+
+def _required_dumper_stems_for_mode(mode: str) -> frozenset[str]:
+    if mode == "native":
+        return frozenset(stem for _, stem in _DUMPER_EVENT_CLASSES.values())
+    return frozenset()
+
+
+def _looks_like_legacy_xperf_cache(export_dir: Path) -> bool:
+    """Return True for pre-manifest xperf caches we can safely reload."""
+    return (
+        (export_dir / "profile-detail.txt").exists()
+        or (export_dir / "stack-butterfly.html").exists()
+    )
+
+
+def _manifest_matches_etl(manifest: dict, etl_path: Path) -> bool:
+    try:
+        identity = _etl_cache_identity(etl_path)
+    except OSError:
+        return False
+    try:
+        return (
+            int(manifest.get("etl_size", -1)) == identity["etl_size"]
+            and int(manifest.get("etl_mtime_ns", -1)) == identity["etl_mtime_ns"]
+        )
+    except (TypeError, ValueError):
+        return False
+
+
+def _cached_dumper_paths_for_trace(trace: TraceData) -> dict[str, Path] | None:
+    """Return dumper parquet paths valid for this trace mode.
+
+    ``None`` means pre-manifest xperf compatibility: allow any existing flat
+    dumper parquet. A concrete mapping means only those stems may be rehydrated.
+    """
+    manifest = _read_cache_manifest(trace.export_dir)
+    if manifest is None:
+        if trace.mode == "xperf" and _looks_like_legacy_xperf_cache(trace.export_dir):
+            return None
+        return {}
+
+    if _is_native_v2_manifest(manifest):
+        try:
+            from etw_analyzer.native import cache as native_cache
+
+            parsed = native_cache.CacheManifest.from_dict(manifest)
+            native_cache.validate_manifest(
+                parsed,
+                trace.export_dir,
+                trace.etl_path,
+                mode=trace.mode,
+            )
+            paths = {
+                dataset.name: native_cache.resolve_dataset_path(
+                    trace.export_dir,
+                    parsed,
+                    dataset,
+                )
+                for dataset in parsed.datasets
+                if dataset.kind == "dumper-parquet"
+                and dataset.materialize_on_load is False
+            }
+        except Exception:
+            return {}
+
+        required_stems = _required_dumper_stems_for_mode(trace.mode)
+        if required_stems and not required_stems.issubset(paths.keys()):
+            return {}
+        return {
+            stem: path
+            for stem, path in paths.items()
+            if path.exists()
+        }
+
+    if manifest.get("schema_version") != _CACHE_SCHEMA_VERSION:
+        return {}
+    if manifest.get("mode") != trace.mode:
+        return {}
+    if manifest.get("complete") is not True:
+        return {}
+    if not _manifest_matches_etl(manifest, trace.etl_path):
+        return {}
+    return {
+        str(name): trace.export_dir / f"{name}.parquet"
+        for name in manifest.get("dumper_datasets", [])
+        if isinstance(name, str)
+    }
+
+
+def _cached_dumper_stems_for_trace(trace: TraceData) -> frozenset[str] | None:
+    paths = _cached_dumper_paths_for_trace(trace)
+    if paths is None:
+        return None
+    return frozenset(paths)
+
+
+def _write_cache_manifest(
+    export_dir: Path,
+    etl_path: Path,
+    mode: str,
+    raw_csv: dict[str, pd.DataFrame],
+    dumper_stems: frozenset[str] | set[str] | None = None,
+) -> None:
+    """Write a mode-aware cache manifest when the cache is complete."""
+    if mode == "native":
+        _write_native_v2_cache_manifest(
+            export_dir,
+            etl_path,
+            raw_csv,
+            dumper_stems=dumper_stems,
+        )
+        return
+
+    if mode not in _CACHE_REQUIRED_DATASETS_BY_MODE:
+        return
+
+    try:
+        identity = _etl_cache_identity(etl_path)
+    except OSError:
+        return
+
+    persisted_datasets: list[str] = []
+    for name in raw_csv:
+        if name in _TEXT_DATASETS:
+            if (export_dir / _TEXT_DATASETS[name]).exists():
+                persisted_datasets.append(name)
+            continue
+        if name in _PARQUET_EXCLUDED:
+            continue
+        if (export_dir / f"{name}.parquet").exists():
+            persisted_datasets.append(name)
+
+    if dumper_stems is None:
+        persisted_dumper_stems = sorted(
+            stem
+            for _, stem in _DUMPER_EVENT_CLASSES.values()
+            if (export_dir / f"{stem}.parquet").exists()
+        )
+    else:
+        persisted_dumper_stems = sorted(
+            stem
+            for stem in dumper_stems
+            if (export_dir / f"{stem}.parquet").exists()
+        )
+
+    required_datasets = _CACHE_REQUIRED_DATASETS_BY_MODE[mode]
+    required_dumper_stems = _required_dumper_stems_for_mode(mode)
+    if not required_datasets.issubset(persisted_datasets):
+        return
+    if not required_dumper_stems.issubset(persisted_dumper_stems):
+        return
+
+    manifest = {
+        "schema_version": _CACHE_SCHEMA_VERSION,
+        "mode": mode,
+        "complete": True,
+        **identity,
+        "datasets": sorted(set(persisted_datasets)),
+        "dumper_datasets": persisted_dumper_stems,
+        "required_datasets": sorted(required_datasets),
+        "required_dumper_datasets": sorted(required_dumper_stems),
+    }
+
+    try:
+        export_dir.mkdir(parents=True, exist_ok=True)
+        _cache_manifest_path(export_dir).write_text(
+            json.dumps(manifest, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
+
+
+def _write_native_v2_cache_manifest(
+    export_dir: Path,
+    etl_path: Path,
+    raw_csv: dict[str, pd.DataFrame],
+    dumper_stems: frozenset[str] | set[str] | None = None,
+) -> None:
+    """Write the native cache v2 manifest for the current flat cache layout."""
+    try:
+        from etw_analyzer.native import cache as native_cache
+    except Exception:
+        return
+
+    datasets: list[native_cache.CacheDataset] = []
+    materialized_names: list[str] = []
+
+    for name, df in raw_csv.items():
+        if name in _TEXT_DATASETS:
+            filename = _TEXT_DATASETS[name]
+            if (export_dir / filename).exists():
+                datasets.append(native_cache.CacheDataset(
+                    name=name,
+                    kind="text",
+                    path=filename,
+                    row_count=len(df),
+                    materialize_on_load=True,
+                ))
+                materialized_names.append(name)
+            continue
+        if name in _PARQUET_EXCLUDED:
+            continue
+        parquet = export_dir / f"{name}.parquet"
+        if parquet.exists():
+            datasets.append(native_cache.CacheDataset(
+                name=name,
+                kind="parquet",
+                path=f"{name}.parquet",
+                row_count=len(df),
+                materialize_on_load=True,
+            ))
+            materialized_names.append(name)
+
+    if dumper_stems is None:
+        persisted_dumper_stems = sorted(
+            stem
+            for _, stem in _DUMPER_EVENT_CLASSES.values()
+            if (export_dir / f"{stem}.parquet").exists()
+        )
+    else:
+        persisted_dumper_stems = sorted(
+            stem
+            for stem in dumper_stems
+            if (export_dir / f"{stem}.parquet").exists()
+        )
+
+    required_datasets = _CACHE_REQUIRED_DATASETS_BY_MODE["native"]
+    required_dumper_stems = _required_dumper_stems_for_mode("native")
+    if not required_datasets.issubset(materialized_names):
+        return
+    if not required_dumper_stems.issubset(persisted_dumper_stems):
+        return
+
+    for stem in persisted_dumper_stems:
+        parquet = export_dir / f"{stem}.parquet"
+        datasets.append(native_cache.CacheDataset(
+            name=stem,
+            kind="dumper-parquet",
+            path=f"{stem}.parquet",
+            row_count=_parquet_row_count(parquet),
+            materialize_on_load=False,
+        ))
+
+    try:
+        manifest = native_cache.CacheManifest.materialized_small(
+            etl_path,
+            datasets,
+            native_store=native_cache.NativeStoreGeneration.flat(),
+        )
+        native_cache.write_manifest(export_dir, manifest)
+    except Exception:
+        pass
+
+
+def _parquet_row_count(path: Path) -> int | None:
+    try:
+        import pyarrow.parquet as pq
+
+        return int(pq.ParquetFile(path).metadata.num_rows)
+    except Exception:
+        return None
+
+
+def _load_native_v2_from_cache(
+    export_dir: Path,
+    etl_path: Path,
+    mode: str,
+    manifest_data: dict,
+) -> dict[str, pd.DataFrame] | None:
+    try:
+        from etw_analyzer.native import cache as native_cache
+        from etw_analyzer.native.event_store import (
+            NATIVE_EVENT_STORE_DATASET_KIND,
+            NativeEventStore,
+        )
+
+        manifest = native_cache.CacheManifest.from_dict(manifest_data)
+        native_cache.validate_manifest(
+            manifest,
+            export_dir,
+            etl_path,
+            mode=mode,
+        )
+
+        event_store = None
+        for dataset in manifest.datasets:
+            if dataset.kind == NATIVE_EVENT_STORE_DATASET_KIND:
+                event_store = NativeEventStore.open_from_cache_manifest(
+                    export_dir,
+                    manifest,
+                )
+                break
+        streaming_store = (
+            manifest.strategy == native_cache.STREAMING_EVENT_STORE_STRATEGY
+        )
+        if streaming_store and event_store is None:
+            return None
+
+        dumper_paths = {
+            dataset.name: native_cache.resolve_dataset_path(
+                export_dir,
+                manifest,
+                dataset,
+            )
+            for dataset in manifest.datasets
+            if dataset.kind == "dumper-parquet"
+            and dataset.materialize_on_load is False
+        }
+        required_stems = (
+            frozenset()
+            if streaming_store
+            else _required_dumper_stems_for_mode(mode)
+        )
+        if required_stems and not required_stems.issubset(dumper_paths.keys()):
+            return None
+        for stem in required_stems:
+            if not dumper_paths[stem].exists():
+                return None
+
+        results: dict[str, pd.DataFrame] = {}
+        for dataset in manifest.datasets:
+            if dataset.materialize_on_load is not True:
+                continue
+            path = native_cache.resolve_dataset_path(export_dir, manifest, dataset)
+            if not path.exists():
+                return None
+            if dataset.kind == "parquet":
+                results[dataset.name] = pd.read_parquet(path)
+            elif dataset.kind == "text":
+                results[dataset.name] = pd.DataFrame({
+                    "raw_text": [path.read_text(encoding="utf-8")]
+                })
+            else:
+                return None
+
+        required_datasets = _CACHE_REQUIRED_DATASETS_BY_MODE[mode]
+        if not required_datasets.issubset(results.keys()):
+            return None
+        return results
+    except Exception:
+        return None
+
+
+def _load_from_cache(
+    export_dir: Path,
+    etl_path: Path,
+    mode: str = "xperf",
+) -> dict[str, pd.DataFrame] | None:
     """Try to load previously exported data from the cache directory.
 
     Returns None if the cache is missing or stale (ETL is newer than cache).
@@ -988,31 +1687,82 @@ def _load_from_cache(export_dir: Path, etl_path: Path) -> dict[str, pd.DataFrame
     keyed by its filename stem, except names listed in _PARQUET_EXCLUDED which
     are owned by other code paths.
 
-    Freshness policy: the cache is considered fresh if all names in
-    _PARQUET_REQUIRED loaded successfully (currently just cpu_sampling). This
-    matches the previous behaviour where "no useful data" returned None, but
-    is now keyed on a documented required set rather than an implicit
-    "at least one" check.
+    Freshness policy: manifest-backed caches must match the requested mode,
+    schema version, ETL size, and ETL mtime. Legacy xperf caches without a
+    manifest are still accepted when xperf-only marker files are present.
     """
+    if mode not in _CACHE_REQUIRED_DATASETS_BY_MODE:
+        return None
     if not export_dir.exists():
         return None
 
-    # Staleness check: if ETL is newer than export dir, re-export
-    try:
-        etl_mtime = etl_path.stat().st_mtime
-        export_mtime = export_dir.stat().st_mtime
-        if etl_mtime > export_mtime:
+    manifest = _read_cache_manifest(export_dir)
+    if manifest is not None and _is_native_v2_manifest(manifest):
+        return _load_native_v2_from_cache(export_dir, etl_path, mode, manifest)
+
+    legacy_xperf = manifest is None
+    if manifest is None:
+        if mode != "xperf" or not _looks_like_legacy_xperf_cache(export_dir):
             return None
-    except OSError:
-        return None
+        # Staleness check for pre-manifest xperf caches.
+        try:
+            etl_mtime = etl_path.stat().st_mtime
+            export_mtime = export_dir.stat().st_mtime
+            if etl_mtime > export_mtime:
+                return None
+        except OSError:
+            return None
+        manifest_datasets: set[str] | None = None
+    else:
+        if manifest.get("schema_version") != _CACHE_SCHEMA_VERSION:
+            return None
+        if manifest.get("mode") != mode:
+            return None
+        if manifest.get("complete") is not True:
+            return None
+        if not _manifest_matches_etl(manifest, etl_path):
+            return None
+        manifest_datasets = {
+            str(name)
+            for name in manifest.get("datasets", [])
+            if isinstance(name, str)
+        }
+
+        required_stems = _required_dumper_stems_for_mode(mode)
+        if required_stems:
+            manifest_stems = {
+                str(name)
+                for name in manifest.get("dumper_datasets", [])
+                if isinstance(name, str)
+            }
+            if not required_stems.issubset(manifest_stems):
+                return None
+            for stem in required_stems:
+                if not (export_dir / f"{stem}.parquet").exists():
+                    return None
 
     results: dict[str, pd.DataFrame] = {}
 
     # Discover parquet datasets via glob — any *.parquet not in the exclusion
     # set is loaded as a dataset keyed by its filename stem.
-    for parquet_path in sorted(export_dir.glob("*.parquet")):
-        name = parquet_path.stem
+    if manifest_datasets is None:
+        parquet_names = {
+            parquet_path.stem
+            for parquet_path in export_dir.glob("*.parquet")
+            if parquet_path.stem not in _PARQUET_EXCLUDED
+        }
+    else:
+        parquet_names = {
+            name
+            for name in manifest_datasets
+            if name not in _TEXT_DATASETS and name not in _PARQUET_EXCLUDED
+        }
+
+    for name in sorted(parquet_names):
+        parquet_path = export_dir / f"{name}.parquet"
         if name in _PARQUET_EXCLUDED:
+            continue
+        if not parquet_path.exists():
             continue
         try:
             results[name] = pd.read_parquet(parquet_path)
@@ -1020,21 +1770,25 @@ def _load_from_cache(export_dir: Path, etl_path: Path) -> dict[str, pd.DataFrame
             pass
 
     # Backward-compat: see _LEGACY_CSV_DATASETS at module scope.
-    for name in _LEGACY_CSV_DATASETS:
-        if name in results:
-            continue
-        csv_path = export_dir / f"{name}.csv"
-        if csv_path.exists():
-            try:
-                results[name] = load_csv(csv_path)
-            except Exception:
-                pass
+    if legacy_xperf:
+        for name in _LEGACY_CSV_DATASETS:
+            if name in results:
+                continue
+            csv_path = export_dir / f"{name}.csv"
+            if csv_path.exists():
+                try:
+                    results[name] = load_csv(csv_path)
+                except Exception:
+                    pass
 
-    # Freshness gate: every required dataset must have loaded.
-    if not _PARQUET_REQUIRED.issubset(results.keys()):
-        return None
-
-    for key, filename in _TEXT_DATASETS.items():
+    text_datasets = _TEXT_DATASETS
+    if manifest_datasets is not None:
+        text_datasets = {
+            key: filename
+            for key, filename in _TEXT_DATASETS.items()
+            if key in manifest_datasets
+        }
+    for key, filename in text_datasets.items():
         txt_path = export_dir / filename
         if txt_path.exists():
             try:
@@ -1042,23 +1796,110 @@ def _load_from_cache(export_dir: Path, etl_path: Path) -> dict[str, pd.DataFrame
             except Exception:
                 pass
 
+    required_datasets = _CACHE_REQUIRED_DATASETS_BY_MODE[mode]
+    if not required_datasets.issubset(results.keys()):
+        return None
+
     return results
+
+
+def _native_metadata_rows(trace: TraceData) -> list[dict]:
+    """Return native ETL header metadata rows from the latest extraction."""
+    stats = getattr(trace, "_native_extract_stats", None)
+    metadata = getattr(stats, "logfile_metadata", None) or []
+    rows: list[dict] = []
+    for item in metadata:
+        start = int(getattr(item, "start_time_utc_100ns", 0) or 0)
+        end = int(getattr(item, "end_time_utc_100ns", 0) or 0)
+        duration = getattr(item, "duration_seconds", None)
+        if duration is None and start > 0 and end > start:
+            duration = (end - start) / 10_000_000.0
+        rows.append({
+            "NumberOfProcessors": int(getattr(item, "number_of_processors", 0) or 0),
+            "StartTime": start,
+            "EndTime": end,
+            "DurationSeconds": float(duration) if duration is not None else None,
+            "PerfFreq": int(getattr(item, "perf_freq", 0) or 0),
+            "TimerResolution": int(getattr(item, "timer_resolution_100ns", 0) or 0),
+            "CpuSpeedInMHz": int(getattr(item, "cpu_speed_mhz", 0) or 0),
+            "EventsLost": int(getattr(item, "events_lost", 0) or 0),
+            "BuffersLost": int(getattr(item, "buffers_lost", 0) or 0),
+            "BuffersWritten": int(getattr(item, "buffers_written", 0) or 0),
+            "PointerSize": int(getattr(item, "pointer_size", 0) or 0),
+        })
+    return rows
+
+
+def _native_metadata_dataframe(trace: TraceData) -> pd.DataFrame | None:
+    rows = _native_metadata_rows(trace)
+    if rows:
+        return pd.DataFrame(rows)
+    df = trace.raw_csv.get("trace_metadata")
+    if df is not None and not df.empty:
+        return df
+    return None
+
+
+def _numeric_metadata_column(df: pd.DataFrame, column: str) -> pd.Series:
+    if column not in df.columns:
+        return pd.Series(dtype="float64")
+    return pd.to_numeric(df[column], errors="coerce").dropna()
+
+
+def _apply_native_metadata(trace: TraceData) -> None:
+    """Populate native-mode metadata from ETL logfile headers."""
+    if trace.mode != "native":
+        return
+
+    df = trace.raw_csv.get("trace_metadata")
+    if df is None or df.empty:
+        df = _native_metadata_dataframe(trace)
+        if df is not None and not df.empty:
+            with trace.lock:
+                trace.raw_csv["trace_metadata"] = df
+    if df is None or df.empty:
+        return
+
+    cpu_values = _numeric_metadata_column(df, "NumberOfProcessors")
+    cpu_values = cpu_values[cpu_values > 0]
+    if not cpu_values.empty:
+        trace.cpu_count = int(cpu_values.max())
+
+    duration_values = _numeric_metadata_column(df, "DurationSeconds")
+    duration_values = duration_values[duration_values > 0]
+    if not duration_values.empty:
+        trace.duration_seconds = float(duration_values.max())
+    else:
+        starts = _numeric_metadata_column(df, "StartTime")
+        ends = _numeric_metadata_column(df, "EndTime")
+        starts = starts[starts > 0]
+        ends = ends[ends > 0]
+        if not starts.empty and not ends.empty and float(ends.max()) > float(starts.min()):
+            trace.duration_seconds = (float(ends.max()) - float(starts.min())) / 10_000_000.0
+
+    freq_values = _numeric_metadata_column(df, "PerfFreq")
+    freq_values = freq_values[freq_values > 0]
+    if not freq_values.empty:
+        trace.timestamp_frequency = float(freq_values.iloc[0])
 
 
 def _populate_metadata(trace: TraceData) -> None:
     """Extract metadata from loaded DataFrames."""
+    _apply_native_metadata(trace)
+    allow_inferred_metadata = trace.mode != "native"
+
     for name, df in trace.raw_csv.items():
         trace.event_counts[name] = len(df)
 
-        # Try to find CPU count from CPU column
-        if trace.cpu_count is None and "CPU" in df.columns:
+        # xperf data lacks a dedicated metadata row, so keep the historical
+        # best-effort inference there. Native traces use TRACE_LOGFILE_HEADER.
+        if allow_inferred_metadata and trace.cpu_count is None and "CPU" in df.columns:
             try:
                 trace.cpu_count = int(df["CPU"].max()) + 1
             except (ValueError, TypeError):
                 pass
 
-        # Try to find trace duration from timestamp column
-        if trace.duration_seconds is None:
+        if allow_inferred_metadata and trace.duration_seconds is None:
             for col in ["TimeStamp", "Time", "Timestamp (s)"]:
                 if col in df.columns:
                     try:
@@ -1068,6 +1909,10 @@ def _populate_metadata(trace: TraceData) -> None:
                             break
                     except Exception:
                         pass
+
+    if trace.event_store is not None:
+        for name, dataset in trace.event_store.manifest.datasets.items():
+            trace.event_counts[f"event_store:{name}"] = dataset.row_count
 
 
 def _format_load_summary(trace: TraceData) -> str:
@@ -1093,6 +1938,22 @@ def _format_load_summary(trace: TraceData) -> str:
             cols_preview += f", ... (+{len(df.columns) - 6} more)"
         lines.append(f"- `{name}`: {len(df):,} rows — columns: {cols_preview}")
 
+    if trace.event_store is not None:
+        lines.append("")
+        lines.append("**Native event store:**")
+        for name, dataset in sorted(trace.event_store.manifest.datasets.items()):
+            lines.append(
+                f"- `{name}`: {dataset.row_count:,} rows across "
+                f"{len(dataset.parts)} chunk(s)"
+            )
+        if _is_streaming_event_store_cache(trace.export_dir):
+            lines.append(
+                "Streaming event chunks are loaded without materializing raw "
+                "events. Low-risk aggregate datasets are loaded when present; "
+                "stack aggregates are built lazily when SampledProfile stack "
+                "lists were captured."
+            )
+
     if trace.export_errors:
         lines.append("")
         lines.append("**Export warnings:**")
@@ -1100,10 +1961,25 @@ def _format_load_summary(trace: TraceData) -> str:
             lines.append(f"- {err}")
 
     lines.append("")
-    lines.append(
-        f"Ready for analysis. Pass `trace_id=\"{trace.trace_id}\"` to analysis tools "
-        "such as `get_cpu_samples`, `get_hot_functions`, and `get_dpc_summary`."
-    )
+    if trace.event_store is not None and _is_streaming_event_store_cache(trace.export_dir):
+        missing = _streaming_missing_aggregates(trace.raw_csv)
+        if missing:
+            lines.append(
+                f"Ready for event-store-aware analysis. Pass `trace_id=\"{trace.trace_id}\"`; "
+                "aggregate tools may report limited data for missing datasets: "
+                + ", ".join(missing)
+            )
+        else:
+            lines.append(
+                f"Ready for analysis. Pass `trace_id=\"{trace.trace_id}\"` to analysis tools "
+                "such as `get_cpu_samples`, `get_per_cpu_summary`, `get_dpc_summary`, "
+                "and `get_hot_stacks`."
+            )
+    else:
+        lines.append(
+            f"Ready for analysis. Pass `trace_id=\"{trace.trace_id}\"` to analysis tools "
+            "such as `get_cpu_samples`, `get_hot_functions`, and `get_dpc_summary`."
+        )
 
     return "\n".join(lines)
 

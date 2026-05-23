@@ -112,9 +112,15 @@ class TraceData:
     # when resolving SampledProfile stacks.
     symbolizer: Any = field(default=None, repr=False)
 
+    # Phase 3 native large-ETL scaffolding: optional chunked event store.
+    # This is opened from native cache-v2 manifests and is intentionally
+    # separate from ``raw_csv`` so event chunks are not materialized on load.
+    event_store: Any = field(default=None, repr=False)
+
     # Metadata
     duration_seconds: float | None = None
     cpu_count: int | None = None
+    timestamp_frequency: float | None = None
     event_counts: dict[str, int] = field(default_factory=dict)
     export_errors: list[str] = field(default_factory=list)
 

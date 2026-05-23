@@ -6,18 +6,20 @@ Output DataFrame columns (matching :func:`parsing.wpa_exporter._parse_profile_de
 
 Algorithm:
     1. Start from the per-sample SampledProfile DataFrame
-       (``trace.dumper_df``). Each row already has Weight, CPU, PID.
+       (``trace.dumper_df``). ``Weight`` matches xperf dumper Count;
+       native rows also carry ``ProfileWeight`` for xperf profile-detail
+       parity.
     2. Symbolize the ``InstructionPointer`` of each sample via
        ``trace.symbolizer.bulk_resolve`` — this is the leaf frame of the
        sampled call stack, i.e. exactly what xperf's ``-detail`` action
        reports.
     3. Split the resolved string ``module!function+0x…`` into Module and
        Function columns.
-    4. Look up the process name via the Process/DCStart/Start events
-       harvested into ``trace.raw_csv['_native_process_map']`` (an
-       internal optimisation populated when this aggregator runs).
-    5. Group by (Process Name, PID, Module, Function), sum Weight,
-       compute % Weight.
+    4. Resolve SampledProfile ``PayloadThreadId`` through native Thread
+       rundown/start rows when the event-header PID is the kernel sentinel,
+       then look up the process name from Process/DCStart/Start rows.
+    5. Group by (Process Name, PID, Module, Function), sum
+       ``ProfileWeight`` when present (else ``Weight``), compute % Weight.
 
 Symbolization is the expensive step here. We deduplicate IPs first so
 ``bulk_resolve`` only pays the dbghelp cost once per unique address —
@@ -27,6 +29,7 @@ typical traces collapse 10M samples into <50K unique IPs.
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, Optional
 
 import pandas as pd
@@ -72,7 +75,12 @@ def aggregate_cpu_sampling(trace: "TraceData") -> Optional[pd.DataFrame]:
     if dumper is None or dumper.empty:
         return None
 
-    df = dumper
+    df = enrich_sampled_profile_attribution(dumper, getattr(trace, "raw_csv", {}) or {})
+    if df is not dumper:
+        try:
+            trace.dumper_df = df
+        except Exception:
+            pass
 
     # Symbolize once per unique IP. If we have no symbolizer the values
     # in Module / Function stay blank — that matches the Phase N1
@@ -116,10 +124,12 @@ def aggregate_cpu_sampling(trace: "TraceData") -> Optional[pd.DataFrame]:
     modules = modules.fillna("").replace("", "unknown")
     functions = functions.fillna("")
 
-    # Resolve process name. The native SampledProfile decoder leaves
-    # ``Process Name`` blank because the process->name mapping isn't in
-    # the sample's payload — it has to come from Process/DCStart events.
-    # Build the lookup table on demand and merge.
+    # Resolve process name. Native SampledProfile carries the sampled
+    # thread ID, not a trustworthy event-header PID; the enrichment above
+    # maps PayloadThreadId -> ProcessId and then PID -> process name from
+    # Thread/DCStart + Process/DCStart/Start rows. The lookup below also
+    # covers xperf-like DataFrames that already have real PIDs but blank
+    # names.
     pid_to_name = _build_pid_to_name_map(trace)
     if pid_to_name and "PID" in df.columns:
         process_names = df["PID"].map(pid_to_name)
@@ -133,10 +143,11 @@ def aggregate_cpu_sampling(trace: "TraceData") -> Optional[pd.DataFrame]:
         else:
             process_names = pd.Series(["unknown"] * len(df))
 
+    weight_col = "ProfileWeight" if "ProfileWeight" in df.columns else "Weight"
     agg_input = pd.DataFrame({
         "Process Name": process_names.astype(str).values,
         "PID": df["PID"].values if "PID" in df.columns else 0,
-        "Weight": df["Weight"].values if "Weight" in df.columns else 1,
+        "Weight": df[weight_col].values if weight_col in df.columns else 1,
         "Module": modules.astype(str).values,
         "Function": functions.astype(str).values,
     })
@@ -163,13 +174,25 @@ def _build_pid_to_name_map(trace: "TraceData") -> dict[int, str]:
     does — see :func:`tools.trace_mgmt` wiring). Falls back to an
     in-memory ``_native_process_events`` slot.
     """
+    raw_csv = getattr(trace, "raw_csv", {}) or {}
+    return _build_pid_to_name_map_from_raw_csv(raw_csv)
+
+
+def _build_pid_to_name_map_from_raw_csv(
+    raw_csv: Mapping[str, pd.DataFrame],
+) -> dict[int, str]:
     pid_map: dict[int, str] = {}
     for key in (
         "_native_process_events",
+        "Process/DCStart",
+        "Process/Start",
+        "Process/DCEnd",
+        "Process/End",
+        "Process/Defunct",
         "process",
         "process_info",
     ):
-        candidate = trace.raw_csv.get(key) if hasattr(trace, "raw_csv") else None
+        candidate = raw_csv.get(key)
         if candidate is None or candidate.empty:
             continue
         if "ProcessId" not in candidate.columns and "PID" not in candidate.columns:
@@ -186,4 +209,124 @@ def _build_pid_to_name_map(trace: "TraceData") -> dict[int, str]:
     return pid_map
 
 
-__all__ = ["aggregate_cpu_sampling"]
+def _build_tid_to_pid_map_from_raw_csv(
+    raw_csv: Mapping[str, pd.DataFrame],
+) -> dict[int, int]:
+    tid_map: dict[int, int] = {}
+    for key in (
+        "Thread/DCStart",
+        "Thread/Start",
+        "Thread/DCEnd",
+        "Thread/End",
+    ):
+        candidate = raw_csv.get(key)
+        if candidate is None or candidate.empty:
+            continue
+        if "ThreadId" not in candidate.columns or "ProcessId" not in candidate.columns:
+            continue
+        sort_cols = ["TimeStamp"] if "TimeStamp" in candidate.columns else None
+        rows = candidate.sort_values(sort_cols) if sort_cols else candidate
+        for _, row in rows.iterrows():
+            try:
+                tid = int(row["ThreadId"])
+                pid = int(row["ProcessId"])
+            except (ValueError, TypeError):
+                continue
+            if tid <= 0 or pid < 0:
+                continue
+            # Prefer DCStart/Start records over teardown events and keep
+            # the earliest row per class for stable attribution when TIDs
+            # are reused inside very short traces.
+            tid_map.setdefault(tid, pid)
+    return tid_map
+
+
+def _blank_process_name_mask(series: pd.Series) -> pd.Series:
+    values = series.fillna("").astype(str).str.strip()
+    return values.isin(("", "unknown", "<unknown>"))
+
+
+def enrich_sampled_profile_attribution(
+    samples: pd.DataFrame,
+    raw_csv: Mapping[str, pd.DataFrame],
+) -> pd.DataFrame:
+    """Return SampledProfile rows with xperf-equivalent PID/process fields.
+
+    Native PerfInfo/SampledProfile events commonly use the kernel
+    ``0xFFFFFFFF`` ProcessId sentinel in the event header. The payload's
+    thread id is the reliable attribution key, so we resolve
+    ``PayloadThreadId`` through Thread/DCStart/Start rows and then resolve
+    the resulting PID through Process/DCStart/Start rows.
+    """
+
+    if samples is None or samples.empty:
+        return samples
+
+    tid_to_pid = _build_tid_to_pid_map_from_raw_csv(raw_csv)
+    pid_to_name = _build_pid_to_name_map_from_raw_csv(raw_csv)
+
+    df = samples.copy()
+    changed = False
+
+    if "PayloadThreadId" in df.columns and tid_to_pid:
+        resolved_pid = pd.to_numeric(df["PayloadThreadId"], errors="coerce").map(tid_to_pid)
+        if "PID" in df.columns:
+            current_pid = pd.to_numeric(df["PID"], errors="coerce")
+            needs_pid = (
+                current_pid.isna()
+                | (current_pid <= 0)
+                | (current_pid == 0xFFFFFFFF)
+            )
+            fillable = needs_pid & resolved_pid.notna()
+            if fillable.any():
+                df.loc[fillable, "PID"] = resolved_pid[fillable].astype("int64")
+                changed = True
+        else:
+            df["PID"] = resolved_pid.fillna(0).astype("int64")
+            changed = True
+
+    if pid_to_name and "PID" in df.columns:
+        resolved_name = pd.to_numeric(df["PID"], errors="coerce").map(pid_to_name)
+        if "Process Name" in df.columns:
+            blank = _blank_process_name_mask(df["Process Name"])
+            fillable = blank & resolved_name.notna()
+            if fillable.any():
+                df.loc[fillable, "Process Name"] = resolved_name[fillable].astype(str)
+                changed = True
+        else:
+            df["Process Name"] = resolved_name.fillna("unknown").astype(str)
+            changed = True
+
+    if "Weight" in df.columns:
+        weights = pd.to_numeric(df["Weight"], errors="coerce").fillna(1)
+        weights = weights.where(weights > 0, 1).astype("int64")
+        if not weights.equals(df["Weight"]):
+            df["Weight"] = weights
+            changed = True
+    if "ProfileWeight" in df.columns:
+        weights = pd.to_numeric(df["ProfileWeight"], errors="coerce").fillna(1)
+        weights = weights.where(weights > 0, 1).astype("int64")
+        if not weights.equals(df["ProfileWeight"]):
+            df["ProfileWeight"] = weights
+            changed = True
+
+    if "PID" in df.columns:
+        current_pid = pd.to_numeric(df["PID"], errors="coerce")
+        sentinel = current_pid == 0xFFFFFFFF
+        if sentinel.any():
+            df.loc[sentinel, "PID"] = -1
+            changed = True
+
+    if "Process Name" in df.columns:
+        blank = _blank_process_name_mask(df["Process Name"])
+        if blank.any():
+            df.loc[blank, "Process Name"] = "Unknown"
+            changed = True
+
+    return df if changed else samples
+
+
+__all__ = [
+    "aggregate_cpu_sampling",
+    "enrich_sampled_profile_attribution",
+]

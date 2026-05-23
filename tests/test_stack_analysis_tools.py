@@ -5,6 +5,7 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
+from etw_analyzer.native.event_store import EventStoreTimebase, NativeEventStoreWriter
 from etw_analyzer.trace_state import TraceData, clear_traces, register_trace
 from etw_analyzer.tools.stack_analysis import (
     butterfly_chain,
@@ -13,6 +14,14 @@ from etw_analyzer.tools.stack_analysis import (
     get_hot_stacks,
     walk_stack,
 )
+
+
+class _FakeSymbolizer:
+    def __init__(self, mapping):
+        self._mapping = mapping
+
+    def bulk_resolve(self, addrs):
+        return {int(addr): self._mapping.get(int(addr), "") for addr in addrs}
 
 
 @pytest.fixture(autouse=True)
@@ -185,3 +194,154 @@ def test_butterfly_chain_table_and_csv():
     assert "Denominator (active_cpus)" in table_output
     assert "IppResolveNeighbor" in table_output
     assert csv_output.startswith("Depth,Frame,Frame Hits")
+
+
+def test_get_function_callers_uses_literal_function_filter():
+    callers = pd.DataFrame({
+        "Target_Module": ["driver.sys"],
+        "Target_Function": ["*SpecialRoutine"],
+        "Direction": ["caller"],
+        "Caller_Module": ["caller.sys"],
+        "Caller_Function": ["CallerRoutine"],
+        "Weight": [42],
+        "Total %": [4.2],
+        "Parent %": [100.0],
+        "Exclusive": [1],
+    })
+    register_trace(TraceData(
+        trace_id="trace_literal",
+        etl_path=Path("C:\\traces\\literal.etl"),
+        export_dir=Path("C:\\traces\\.etw-export-literal"),
+        raw_csv={"stacks_callers": callers},
+        duration_seconds=1.0,
+        cpu_count=1,
+    ))
+
+    output = get_function_callers("trace_literal", "*SpecialRoutine")
+
+    assert "CallerRoutine" in output
+    assert "driver.sys!*SpecialRoutine" in output
+
+
+def _register_event_store_stack_trace(tmp_path: Path, *, with_stacks: bool = True) -> str:
+    export_dir = tmp_path / ".etw-export-event-store-stack"
+    writer = NativeEventStoreWriter(
+        export_dir,
+        run_id="stack-tools",
+        timebase=EventStoreTimebase(qpc_origin=1_000, perf_freq=1_000_000),
+        staging=False,
+    )
+    writer.append(
+        "image",
+        {
+            "EventSequence": 1,
+            "TimeStampQpc": 1_000,
+            "CPU": 0,
+            "ProcessId": 4,
+            "ImageBase": 0x1000,
+            "ImageSize": 0x1000,
+            "FileName": r"C:\Windows\System32\drivers\driver.sys",
+            "Type": "DCStart",
+        },
+    )
+    writer.append(
+        "image",
+        {
+            "EventSequence": 2,
+            "TimeStampQpc": 1_000,
+            "CPU": 0,
+            "ProcessId": 4,
+            "ImageBase": 0x3000,
+            "ImageSize": 0x1000,
+            "FileName": r"C:\Windows\System32\ntoskrnl.exe",
+            "Type": "DCStart",
+        },
+    )
+    stacks = [
+        [0x1010, 0x1020, 0x3010],
+        [0x1010, 0x1020],
+        [0x1010, 0x1020],
+    ]
+    for index, stack in enumerate(stacks, start=3):
+        writer.append(
+            "sampled_profile",
+            {
+                "EventSequence": index,
+                "TimeStampQpc": 1_000 + index,
+                "CPU": index % 2,
+                "ProcessId": 1234,
+                "ThreadId": 5678,
+                "PayloadThreadId": 5678,
+                "InstructionPointer": 0x1010,
+                "Weight": 1,
+                "ProfileWeight": 1,
+                "Stack": stack if with_stacks else None,
+            },
+        )
+    store = writer.commit()
+    trace_id = "trace_event_store_stack"
+    trace = TraceData(
+        trace_id=trace_id,
+        etl_path=tmp_path / "stack.etl",
+        export_dir=export_dir,
+        mode="native",
+        raw_csv={
+            "cpu_sampling": pd.DataFrame({
+                "Process Name": ["server.exe"],
+                "PID": [1234],
+                "Weight": [3],
+                "% Weight": [100.0],
+                "Module": ["driver.sys"],
+                "Function": ["Leaf"],
+            }),
+            "cpu_timeline": pd.DataFrame({
+                "StartTime": [0],
+                "EndTime": [1_000_000],
+                "Cpu 0": [10.0],
+                "Cpu 1": [10.0],
+            }),
+        },
+        duration_seconds=1.0,
+        cpu_count=2,
+        event_store=store,
+    )
+    trace.symbolizer = _FakeSymbolizer({
+        0x1010: "driver.sys!Leaf+0x0",
+        0x1020: "driver.sys!Caller+0x0",
+        0x3010: "ntoskrnl.exe!Root+0x0",
+    })
+    register_trace(trace)
+    return trace_id
+
+
+def test_stack_tools_smoke_on_event_store_only_trace(tmp_path: Path):
+    trace_id = _register_event_store_stack_trace(tmp_path)
+
+    hot = get_hot_stacks(trace_id, function_filter="Leaf", min_weight_pct=0)
+    callers = get_function_callers(trace_id, "Leaf")
+    walk = walk_stack(trace_id, "Leaf", max_depth=3)
+    chain = butterfly_chain(trace_id, "Leaf", denominator="trace")
+    count = count_stacks(
+        trace_id,
+        contains=[("driver.sys", "Leaf"), ("driver.sys", "Caller")],
+    )
+
+    assert "Inclusive" in hot
+    assert "Leaf" in hot
+    assert "Caller" in callers
+    assert "Root" in walk
+    assert "Caller" in chain
+    assert "Matching Samples" in count
+    assert "3" in count
+
+
+def test_summary_profile_without_stacks_reports_no_stack_data(tmp_path: Path):
+    trace_id = _register_event_store_stack_trace(tmp_path, with_stacks=False)
+
+    hot = get_hot_stacks(trace_id, min_weight_pct=0)
+    callers = get_function_callers(trace_id, "Leaf")
+
+    assert "exclusive weight only" in hot
+    assert "No SampledProfile stack lists" in hot
+    assert "No caller/callee data available" in callers
+    assert "No SampledProfile stack lists" in callers

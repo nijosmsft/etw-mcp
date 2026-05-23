@@ -20,11 +20,13 @@ Native consumer emits two kinds of events for each DPC:
 * opcode 66 (``PerfInfo/ThreadedDPC``) — DPC *start* marker; carries
   the routine address.
 * opcode 68 (``PerfInfo/DPC``) — DPC *end* marker; carries the same
-  routine and an ``InitialTime`` (QPC of the start).
+  routine and an ``InitialTime`` for the start.
 
 Per design §7.2 we pair start + end events by ``(CPU, Routine)`` to
-get the duration, then bucket per module. The module name comes from
-the symbolizer (the DPC routine address → ``module!func``).
+get the duration, then bucket per module. Current native extraction
+normalizes timestamps to relative microseconds; stale/raw-QPC inputs are
+detected and converted through the ETL QPC frequency. The module name
+comes from the symbolizer (the DPC routine address → ``module!func``).
 
 The bucket boundaries match xperf's defaults — log-spaced from 0us up
 to >32ms — so downstream tools that expect the xperf shape can be
@@ -134,6 +136,93 @@ def _to_uint64_series(col: pd.Series) -> pd.Series:
     return pd.Series(out, index=col.index, dtype="object")
 
 
+def _positive_float(value: object) -> float | None:
+    try:
+        val = float(value)
+    except (TypeError, ValueError):
+        return None
+    if val > 0:
+        return val
+    return None
+
+
+def _metadata_perf_frequency(trace: "TraceData") -> float | None:
+    raw_csv = getattr(trace, "raw_csv", {}) or {}
+    metadata_df = raw_csv.get("trace_metadata")
+    if metadata_df is not None and not metadata_df.empty and "PerfFreq" in metadata_df.columns:
+        values = pd.to_numeric(metadata_df["PerfFreq"], errors="coerce")
+        values = values[values > 0]
+        if not values.empty:
+            return float(values.iloc[0])
+
+    stats = getattr(trace, "_native_extract_stats", None)
+    logfile_metadata = getattr(stats, "logfile_metadata", None) or []
+    for item in logfile_metadata:
+        val = _positive_float(getattr(item, "perf_freq", None))
+        if val:
+            return val
+    return None
+
+
+def _timestamp_frequency_hz(trace: "TraceData") -> float:
+    """Return the QPC/timestamp frequency used by native PerfInfo events."""
+    val = _positive_float(getattr(trace, "timestamp_frequency", None))
+    if val:
+        return val
+    val = _metadata_perf_frequency(trace)
+    if val:
+        return val
+    return 10_000_000.0
+
+
+def _metadata_duration_seconds(trace: "TraceData") -> float | None:
+    raw_csv = getattr(trace, "raw_csv", {}) or {}
+    metadata_df = raw_csv.get("trace_metadata")
+    if metadata_df is not None and not metadata_df.empty and "DurationSeconds" in metadata_df.columns:
+        values = pd.to_numeric(metadata_df["DurationSeconds"], errors="coerce")
+        values = values[values > 0]
+        if not values.empty:
+            return float(values.iloc[0])
+    stats = getattr(trace, "_native_extract_stats", None)
+    logfile_metadata = getattr(stats, "logfile_metadata", None) or []
+    durations = [
+        _positive_float(getattr(item, "duration_seconds", None))
+        for item in logfile_metadata
+    ]
+    durations = [d for d in durations if d]
+    return max(durations) if durations else None
+
+
+def _timestamps_are_relative_microseconds(
+    trace: "TraceData",
+    timestamps: pd.Series,
+    initials: pd.Series,
+) -> bool:
+    if getattr(trace, "mode", None) != "native":
+        return False
+    duration_s = _positive_float(getattr(trace, "duration_seconds", None))
+    if duration_s is None:
+        duration_s = _metadata_duration_seconds(trace)
+    if duration_s is None:
+        return False
+    values = pd.concat([timestamps, initials], ignore_index=True)
+    values = pd.to_numeric(values, errors="coerce").dropna()
+    if values.empty:
+        return False
+    duration_us = duration_s * 1_000_000.0
+    tolerance_us = max(1_000_000.0, duration_us * 0.05)
+    return float(values.min()) >= -tolerance_us and float(values.max()) <= duration_us + tolerance_us
+
+
+def _dpc_durations_us(trace: "TraceData", dpc_df: pd.DataFrame) -> pd.Series:
+    timestamps = pd.to_numeric(dpc_df["TimeStamp"], errors="coerce")
+    initials = pd.to_numeric(dpc_df["InitialTime"], errors="coerce")
+    durations = timestamps - initials
+    if not _timestamps_are_relative_microseconds(trace, timestamps, initials):
+        durations = durations * 1_000_000.0 / _timestamp_frequency_hz(trace)
+    return durations.fillna(0).clip(lower=0).round().astype("int64")
+
+
 def _gather_dpc_events(trace: "TraceData") -> pd.DataFrame:
     """Concatenate every DPC/ISR class DataFrame into one frame.
 
@@ -150,6 +239,14 @@ def _gather_dpc_events(trace: "TraceData") -> pd.DataFrame:
     if combined is not None and not combined.empty:
         return combined
 
+    structured = raw_csv.get("dpc_isr")
+    if (
+        structured is not None
+        and not structured.empty
+        and {"TimeStamp", "CPU", "Routine", "InitialTime"}.issubset(structured.columns)
+    ):
+        return structured
+
     for cls in _DPC_CLASSES:
         df = raw_csv.get(cls)
         if df is not None and not df.empty:
@@ -161,36 +258,8 @@ def _gather_dpc_events(trace: "TraceData") -> pd.DataFrame:
     return pd.concat(rows, ignore_index=True, sort=False)
 
 
-def aggregate_dpc_isr(trace: "TraceData") -> Optional[pd.DataFrame]:
-    """Build the per-module DPC/ISR duration histogram DataFrame.
-
-    Returns ``None`` when no DPC/ISR events have been decoded.
-    """
-    dpc_df = _gather_dpc_events(trace)
-    if dpc_df.empty:
-        return None
-    required = {"TimeStamp", "CPU", "Routine", "InitialTime"}
-    if not required.issubset(dpc_df.columns):
-        return None
-
-    # Compute duration per event. PerfInfo emits InitialTime = QPC at
-    # routine start, TimeStamp = QPC at end. xperf reports duration in
-    # microseconds; convert via the QPC frequency if known, otherwise
-    # use a 10 MHz fallback (Windows default on most systems).
-    qpc_hz = getattr(trace, "qpc_frequency_hz", None) or 10_000_000
-    durations_qpc = (
-        pd.to_numeric(dpc_df["TimeStamp"], errors="coerce")
-        - pd.to_numeric(dpc_df["InitialTime"], errors="coerce")
-    )
-    durations_us = (durations_qpc * 1_000_000 / qpc_hz).fillna(0).clip(lower=0).astype("int64")
-
-    # Symbolize the Routine to a module label. Kernel addresses live in
-    # the upper half of the 64-bit space (``0xFFFF...``), so we must keep
-    # the column as uint64 — ``astype("int64")`` overflows to negative
-    # and the resulting addresses don't match any registered module,
-    # which is why the verification report saw "(unknown)" for every DPC.
+def _modules_for_routines(trace: "TraceData", routine_col: pd.Series) -> pd.Series:
     symbolizer = getattr(trace, "symbolizer", None)
-    routine_col = _to_uint64_series(dpc_df["Routine"])
     unique_routines = routine_col.dropna().unique().tolist()
     label_map: dict[int, str] = {}
     if symbolizer is not None and unique_routines:
@@ -198,18 +267,100 @@ def aggregate_dpc_isr(trace: "TraceData") -> Optional[pd.DataFrame]:
             label_map = symbolizer.bulk_resolve([int(r) for r in unique_routines])
         except Exception:
             label_map = {}
-    modules = (
-        routine_col
-        .map(label_map)
-        .fillna("")
-        .map(_module_from_label)
-        .fillna("unknown")
-    )
 
-    work = pd.DataFrame({
+    def _label_for(value: object) -> str:
+        if value is None:
+            return ""
+        try:
+            return label_map.get(int(value), "")
+        except (TypeError, ValueError):
+            return ""
+
+    return routine_col.map(_label_for).map(_module_from_label).fillna("unknown")
+
+
+def _build_native_dpc_work_frame(trace: "TraceData") -> pd.DataFrame | None:
+    """Return per-event native DPC rows with Module, CPU, and DurUs columns."""
+    dpc_df = _gather_dpc_events(trace)
+    if dpc_df.empty:
+        return None
+    required = {"TimeStamp", "CPU", "Routine", "InitialTime"}
+    if not required.issubset(dpc_df.columns):
+        return None
+
+    durations_us = _dpc_durations_us(trace, dpc_df)
+    cpus = pd.to_numeric(dpc_df["CPU"], errors="coerce").fillna(-1).astype("int64")
+
+    routine_col = _to_uint64_series(dpc_df["Routine"])
+    modules = _modules_for_routines(trace, routine_col)
+
+    return pd.DataFrame({
         "Module": modules.values,
+        "CPU": cpus.values,
         "DurUs": durations_us.values,
     })
+
+
+def _duration_column(df: pd.DataFrame) -> str | None:
+    for col in ("DPC_us", "DPC Time (us)", "Duration_us", "Duration (us)", "DurUs"):
+        if col in df.columns:
+            return col
+    return None
+
+
+def build_dpc_per_cpu_dataframe(trace: "TraceData") -> Optional[pd.DataFrame]:
+    """Build per-(module, CPU) DPC duration rows from native structured data."""
+    raw_csv = getattr(trace, "raw_csv", {}) or {}
+    for key in ("dpc_isr_per_cpu", "dpc_per_cpu", "dpc_isr"):
+        df = raw_csv.get(key)
+        if df is None or df.empty or not {"Module", "CPU"}.issubset(df.columns):
+            continue
+        dur_col = _duration_column(df)
+        if dur_col is None:
+            continue
+        work = pd.DataFrame({
+            "Module": df["Module"].astype(str),
+            "CPU": pd.to_numeric(df["CPU"], errors="coerce").fillna(-1).astype("int64"),
+            "DurUs": pd.to_numeric(df[dur_col], errors="coerce").fillna(0).clip(lower=0),
+        })
+        work = work[work["CPU"] >= 0]
+        if work.empty:
+            continue
+        grouped = (
+            work.groupby(["Module", "CPU"], as_index=False)["DurUs"]
+            .sum()
+            .rename(columns={"DurUs": "DPC_us"})
+        )
+        grouped["Count"] = 0
+        duration_us = int((getattr(trace, "duration_seconds", None) or 1.0) * 1_000_000) or 1
+        grouped["Pct"] = grouped["DPC_us"].astype(float) / duration_us * 100.0
+        return grouped
+
+    work = _build_native_dpc_work_frame(trace)
+    if work is None or work.empty:
+        return None
+    work = work[work["CPU"] >= 0]
+    if work.empty:
+        return None
+
+    grouped = (
+        work.groupby(["Module", "CPU"], dropna=False)
+        .agg(DPC_us=("DurUs", "sum"), Count=("DurUs", "size"))
+        .reset_index()
+    )
+    duration_us = int((getattr(trace, "duration_seconds", None) or 1.0) * 1_000_000) or 1
+    grouped["Pct"] = grouped["DPC_us"].astype(float) / duration_us * 100.0
+    return grouped
+
+
+def aggregate_dpc_isr(trace: "TraceData") -> Optional[pd.DataFrame]:
+    """Build the per-module DPC/ISR duration histogram DataFrame.
+
+    Returns ``None`` when no DPC/ISR events have been decoded.
+    """
+    work = _build_native_dpc_work_frame(trace)
+    if work is None or work.empty:
+        return None
 
     # Bucket and count.
     bucket_rows: dict[tuple[str, int, int], int] = defaultdict(int)
@@ -275,43 +426,9 @@ def build_dpc_isr_raw_text(trace: "TraceData") -> Optional[str]:
     ``_per_cpu_dpc_rows`` parses for per-CPU NIC-DPC affinity. We
     generate one line per module covering every CPU 0..max(CPU).
     """
-    dpc_df = _gather_dpc_events(trace)
-    if dpc_df.empty:
+    work = _build_native_dpc_work_frame(trace)
+    if work is None or work.empty:
         return None
-    required = {"TimeStamp", "CPU", "Routine", "InitialTime"}
-    if not required.issubset(dpc_df.columns):
-        return None
-
-    qpc_hz = getattr(trace, "qpc_frequency_hz", None) or 10_000_000
-
-    timestamps = pd.to_numeric(dpc_df["TimeStamp"], errors="coerce")
-    initials = pd.to_numeric(dpc_df["InitialTime"], errors="coerce")
-    durations_us = ((timestamps - initials) * 1_000_000 / qpc_hz).fillna(0).clip(lower=0).astype("int64")
-
-    cpus = pd.to_numeric(dpc_df["CPU"], errors="coerce").fillna(-1).astype("int64")
-
-    symbolizer = getattr(trace, "symbolizer", None)
-    routine_col = _to_uint64_series(dpc_df["Routine"])
-    unique_routines = routine_col.dropna().unique().tolist()
-    label_map: dict[int, str] = {}
-    if symbolizer is not None and unique_routines:
-        try:
-            label_map = symbolizer.bulk_resolve([int(r) for r in unique_routines])
-        except Exception:
-            label_map = {}
-    modules = (
-        routine_col
-        .map(label_map)
-        .fillna("")
-        .map(_module_from_label)
-        .fillna("unknown")
-    )
-
-    work = pd.DataFrame({
-        "Module": modules.values,
-        "CPU": cpus.values,
-        "DurUs": durations_us.values,
-    })
     work = work[work["CPU"] >= 0]
     if work.empty:
         return None
@@ -380,4 +497,4 @@ def build_dpc_isr_raw_text(trace: "TraceData") -> Optional[str]:
     return "\n".join(lines) + "\n"
 
 
-__all__ = ["aggregate_dpc_isr", "build_dpc_isr_raw_text"]
+__all__ = ["aggregate_dpc_isr", "build_dpc_isr_raw_text", "build_dpc_per_cpu_dataframe"]

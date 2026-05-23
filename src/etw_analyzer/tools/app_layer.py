@@ -1,10 +1,8 @@
 """Phase 5 application-layer tools (HTTP.sys + MsQuic).
 
-Tools over the HTTP.sys and MsQuic event DataFrames populated by the
-background dumper extraction (see
-:func:`etw_analyzer.tools.trace_mgmt._start_background_dumper` and the
-``_handle_http_*`` / ``_handle_quic_*`` handlers in
-:mod:`etw_analyzer.parsing.wpa_exporter`).
+Tools over the HTTP.sys and MsQuic event DataFrames populated by xperf or
+native extraction, with lazy native event-store scans when full-detail
+streaming captured app-layer chunks.
 
 Five tools are exposed:
 
@@ -21,20 +19,23 @@ Five tools are exposed:
   connections above the 25 ms p99 threshold.
 
 All tools follow the project conventions: ``@mcp.tool()``, ``trace_id``
-first, markdown-string return, no emojis. Each tool waits for the
-background dumper extraction before reading, and returns a friendly
-"no data — re-collect with networking.wprp" markdown when the relevant
-DataFrame is missing or empty.
+first, markdown-string return, no emojis. Each tool waits for any
+background dumper extraction before reading, prefers existing materialized
+DataFrames, then falls back to bounded event-store scans. If an exact
+lifecycle join or percentile would exceed the bounded in-memory limit, the
+tool declines with guidance instead of approximating silently.
 """
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 import pandas as pd
 
 from etw_analyzer.app import mcp
 from etw_analyzer.formatting.markdown import format_table
+from etw_analyzer.native.accessors import iter_event_batches
 from etw_analyzer.trace_state import TraceData, require_trace
 
 
@@ -43,14 +44,20 @@ _NO_HTTP_DATA_MSG = (
     "Re-collect with `udp-perf/scripts/networking.wprp` — the "
     "`Microsoft-Windows-HttpService` provider must be enabled to record "
     "the HTTP.sys request lifecycle. Standard `xdptrace.wprp` traces do "
-    "not include HttpService events."
+    "not include HttpService events. Native event-store caches include "
+    "these app-layer classes only with "
+    "`WPR_MCP_NATIVE_STREAMING_PROFILE=all`; the default `summary` profile "
+    "intentionally skips them."
 )
 
 _NO_QUIC_DATA_MSG = (
     "*No MsQuic event data in this trace.*\n\n"
     "Re-collect with `udp-perf/scripts/networking.wprp` — the "
     "`Microsoft-Quic` provider must be enabled to record QUIC connection "
-    "state. Standard `xdptrace.wprp` traces do not include MsQuic events."
+    "state. Standard `xdptrace.wprp` traces do not include MsQuic events. "
+    "Native event-store caches include these app-layer classes only with "
+    "`WPR_MCP_NATIVE_STREAMING_PROFILE=all`; the default `summary` profile "
+    "intentionally skips them."
 )
 
 
@@ -59,6 +66,10 @@ _NO_QUIC_DATA_MSG = (
 # the TCP RFC suggests for the comparable mechanism — QUIC operators use
 # the same number as a smoke-test signal.
 _ACK_DELAY_FLAG_THRESHOLD_US = 25_000
+
+_APP_EVENT_ROW_LIMIT = 500_000
+_APP_EXACT_VALUE_LIMIT = 500_000
+_APP_BATCH_SIZE = 65_536
 
 
 # ---------------------------------------------------------------------------
@@ -70,17 +81,128 @@ def _ensure_dumper_ready(trace: TraceData) -> None:
     trace.wait_for_dumper()
 
 
-def _has_rows(df: pd.DataFrame | None) -> bool:
-    return df is not None and not df.empty
+class _ExactLimitExceeded(ValueError):
+    def __init__(self, label: str, limit: int, unit: str) -> None:
+        super().__init__(
+            f"{label} exceeded the exact {unit} limit of {limit:,}"
+        )
+        self.label = label
+        self.limit = limit
+        self.unit = unit
 
 
-def _apply_process_filter(df: pd.DataFrame, process_filter: str | None) -> pd.DataFrame:
-    if not process_filter or df.empty or "Process Name" not in df.columns:
-        return df
-    mask = df["Process Name"].astype(str).str.contains(
-        process_filter, case=False, na=False
+def _analysis_too_large(title: str, exc: _ExactLimitExceeded) -> str:
+    return (
+        f"**{title}**\n\n"
+        f"*Exact app-layer analysis declined: {exc}. Narrow the trace, "
+        "use a shorter capture, or add a more selective filter before "
+        "rerunning. No approximate summary was produced.*"
     )
-    return df[mask]
+
+
+def _iter_limited_records(
+    trace: TraceData,
+    event_class: str,
+    *,
+    columns: list[str] | None = None,
+    limit: int = _APP_EVENT_ROW_LIMIT,
+):
+    seen = 0
+    for batch in iter_event_batches(
+        trace,
+        event_class,
+        columns=columns,
+        batch_size=_APP_BATCH_SIZE,
+    ):
+        if batch.empty:
+            continue
+        seen += len(batch)
+        if seen > limit:
+            raise _ExactLimitExceeded(event_class, limit, "row")
+        for row in batch.to_dict("records"):
+            yield row
+
+
+def _event_has_rows(
+    trace: TraceData,
+    event_class: str,
+    *,
+    columns: list[str] | None = None,
+) -> bool:
+    for batch in iter_event_batches(
+        trace,
+        event_class,
+        columns=columns,
+        batch_size=1,
+    ):
+        if not batch.empty:
+            return True
+    return False
+
+
+def _to_int(value: Any, default: Any = 0) -> Any:
+    if value is None:
+        return default
+    try:
+        if pd.isna(value):
+            return default
+    except (TypeError, ValueError):
+        pass
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+
+
+def _to_str(value: Any) -> str:
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    return str(value)
+
+
+def _event_time_us(row: dict[str, Any]) -> int:
+    timestamp = _to_int(row.get("TimeStamp"), None)
+    if timestamp is not None:
+        return timestamp
+    return _to_int(row.get("TimeStampQpc"))
+
+
+def _matches_filter(value: Any, text_filter: str | None) -> bool:
+    if not text_filter:
+        return True
+    return text_filter.lower() in _to_str(value).lower()
+
+
+def _record_process_matches(row: dict[str, Any], process_filter: str | None) -> bool:
+    return _matches_filter(row.get("Process Name", ""), process_filter)
+
+
+def _check_exact_value_limit(count: int, label: str) -> None:
+    if count > _APP_EXACT_VALUE_LIMIT:
+        raise _ExactLimitExceeded(label, _APP_EXACT_VALUE_LIMIT, "value")
+
+
+def _exact_percentile(values: list[int], q: float) -> int:
+    if not values:
+        return 0
+    ordered = sorted(values)
+    rank = max(1, math.ceil(float(q) * len(ordered)))
+    return int(ordered[min(rank - 1, len(ordered) - 1)])
+
+
+def _format_exact_percentile_line(label: str, values: list[int]) -> str:
+    return (
+        f"{label} exact p50/p95/p99/max (us): "
+        f"{_exact_percentile(values, 0.50):,} / "
+        f"{_exact_percentile(values, 0.95):,} / "
+        f"{_exact_percentile(values, 0.99):,} / "
+        f"{max(values):,}"
+    )
 
 
 def _fnv1a_hash(data: bytes) -> int:
@@ -141,10 +263,11 @@ def get_http_requests(
     """Per-HTTP-request lifecycle summary: URL, verb, status, latency.
 
     Joins HTTP.sys ``Recv`` (request received) and ``Send`` (response sent)
-    events by ``RequestId``, optionally enriches with ``Deliver`` to
-    compute app-pool handoff time. Output sorted by total latency
-    (recv -> send) descending. Requests still in flight at trace end show
-    a blank status and latency.
+    events by ``RequestId``, optionally enriches with ``Deliver`` and
+    ``Close``. Output is sorted by total latency (recv -> send)
+    descending. Summary percentiles are exact nearest-rank over bounded
+    materialized or event-store rows; huge traces are declined instead of
+    approximated silently.
 
     Args:
         trace_id: ID returned by load_trace.
@@ -154,74 +277,136 @@ def get_http_requests(
     trace = require_trace(trace_id)
     _ensure_dumper_ready(trace)
 
-    recv = trace.http_recv_df
-    send = trace.http_send_df
-    deliver = trace.http_deliver_df
-
-    if not _has_rows(recv):
-        return _NO_HTTP_DATA_MSG
-
-    # Build a per-RequestId record. Recv is the anchor (URL + verb live
-    # only there); Send and Deliver are joined in by RequestId.
-    recv_local = recv.copy()
-    if url_filter and "Url" in recv_local.columns:
-        recv_local = recv_local[
-            recv_local["Url"].astype(str).str.contains(url_filter, case=False, na=False)
-        ]
-        if recv_local.empty:
-            return f"*No HTTP requests match URL filter `{url_filter}`.*"
-
-    # Pre-index Send / Deliver by RequestId for fast lookup. If multiple
-    # rows share a RequestId (e.g. chunked send), use the first one we
-    # see — Recv -> earliest Send is the meaningful response time.
-    send_by_rid: dict[int, dict[str, Any]] = {}
-    if _has_rows(send):
-        for _, row in send.iterrows():
-            rid = int(row.get("RequestId", 0) or 0)
-            if rid and rid not in send_by_rid:
+    try:
+        # Pre-index Send / Deliver / Close by RequestId for fast exact joins.
+        # If multiple Send rows share a RequestId (for example chunked
+        # responses), use the earliest Send as the response-completion point.
+        send_by_rid: dict[int, dict[str, Any]] = {}
+        for row in _iter_limited_records(
+            trace,
+            "http_send",
+            columns=[
+                "RequestId", "TimeStamp", "TimeStampQpc",
+                "StatusCode", "ContentLength",
+            ],
+        ):
+            rid = _to_int(row.get("RequestId"))
+            if not rid:
+                continue
+            ts = _event_time_us(row)
+            current = send_by_rid.get(rid)
+            if current is None or ts < current["TimeStamp"]:
                 send_by_rid[rid] = {
-                    "TimeStamp": int(row.get("TimeStamp", 0) or 0),
-                    "StatusCode": int(row.get("StatusCode", 0) or 0),
-                    "ContentLength": int(row.get("ContentLength", 0) or 0),
+                    "TimeStamp": ts,
+                    "StatusCode": _to_int(row.get("StatusCode")),
+                    "ContentLength": _to_int(row.get("ContentLength")),
                 }
 
-    deliver_by_rid: dict[int, int] = {}
-    if _has_rows(deliver):
-        for _, row in deliver.iterrows():
-            rid = int(row.get("RequestId", 0) or 0)
-            if rid and rid not in deliver_by_rid:
-                deliver_by_rid[rid] = int(row.get("TimeStamp", 0) or 0)
+        deliver_by_rid: dict[int, int] = {}
+        for row in _iter_limited_records(
+            trace,
+            "http_deliver",
+            columns=["RequestId", "TimeStamp", "TimeStampQpc"],
+        ):
+            rid = _to_int(row.get("RequestId"))
+            if not rid:
+                continue
+            ts = _event_time_us(row)
+            if rid not in deliver_by_rid or ts < deliver_by_rid[rid]:
+                deliver_by_rid[rid] = ts
 
-    rows: list[dict[str, Any]] = []
-    for _, row in recv_local.iterrows():
-        rid = int(row.get("RequestId", 0) or 0)
-        if rid == 0:
-            continue
-        recv_ts = int(row.get("TimeStamp", 0) or 0)
-        verb = row.get("Verb", "")
-        url = row.get("Url", "")
+        close_by_rid: dict[int, int] = {}
+        for row in _iter_limited_records(
+            trace,
+            "http_close",
+            columns=["RequestId", "TimeStamp", "TimeStampQpc"],
+        ):
+            rid = _to_int(row.get("RequestId"))
+            if not rid:
+                continue
+            ts = _event_time_us(row)
+            if rid not in close_by_rid or ts < close_by_rid[rid]:
+                close_by_rid[rid] = ts
 
-        send_info = send_by_rid.get(rid)
-        send_ts = send_info["TimeStamp"] if send_info else 0
-        status = send_info["StatusCode"] if send_info else 0
-        recv_to_send_us = (send_ts - recv_ts) if send_info and send_ts >= recv_ts else 0
+        rows: list[dict[str, Any]] = []
+        recv_seen = 0
+        recv_matched_filter = 0
+        recv_to_send_latencies: list[int] = []
+        deliver_to_send_latencies: list[int] = []
 
-        deliver_ts = deliver_by_rid.get(rid, 0)
-        deliver_to_send_us = (
-            (send_ts - deliver_ts) if deliver_ts and send_info and send_ts >= deliver_ts else 0
-        )
+        for row in _iter_limited_records(
+            trace,
+            "http_recv",
+            columns=[
+                "RequestId", "ConnectionId", "TimeStamp", "TimeStampQpc",
+                "Verb", "Url", "Process Name", "PID", "ThreadID", "CPU",
+            ],
+        ):
+            recv_seen += 1
+            if not _matches_filter(row.get("Url", ""), url_filter):
+                continue
+            recv_matched_filter += 1
+            rid = _to_int(row.get("RequestId"))
+            if not rid:
+                continue
+            recv_ts = _event_time_us(row)
+            verb = _to_str(row.get("Verb"))
+            url = _to_str(row.get("Url"))
 
-        rows.append({
-            "RequestId": rid,
-            "Verb": verb,
-            "Url": url,
-            "Status": status if status else "",
-            "Recv->Send (us)": recv_to_send_us if send_info else "",
-            "Deliver->Send (us)": deliver_to_send_us if deliver_ts and send_info else "",
-            "_sort": recv_to_send_us,
-        })
+            send_info = send_by_rid.get(rid)
+            send_ts = send_info["TimeStamp"] if send_info else 0
+            status = send_info["StatusCode"] if send_info else 0
+            recv_to_send_us = (
+                send_ts - recv_ts
+                if send_info and send_ts >= recv_ts
+                else 0
+            )
+            if send_info:
+                recv_to_send_latencies.append(recv_to_send_us)
+                _check_exact_value_limit(
+                    len(recv_to_send_latencies),
+                    "HTTP Recv->Send latencies",
+                )
+
+            deliver_ts = deliver_by_rid.get(rid, 0)
+            deliver_to_send_us = (
+                send_ts - deliver_ts
+                if deliver_ts and send_info and send_ts >= deliver_ts
+                else 0
+            )
+            if deliver_ts and send_info:
+                deliver_to_send_latencies.append(deliver_to_send_us)
+                _check_exact_value_limit(
+                    len(deliver_to_send_latencies),
+                    "HTTP Deliver->Send latencies",
+                )
+
+            close_ts = close_by_rid.get(rid, 0)
+            recv_to_close_us = (
+                close_ts - recv_ts
+                if close_ts and close_ts >= recv_ts
+                else 0
+            )
+
+            rows.append({
+                "RequestId": rid,
+                "Verb": verb,
+                "Url": url,
+                "Status": status if status else "",
+                "Recv->Send (us)": recv_to_send_us if send_info else "",
+                "Deliver->Send (us)": deliver_to_send_us if deliver_ts and send_info else "",
+                "Recv->Close (us)": recv_to_close_us if close_ts else "",
+                "ContentLength": send_info["ContentLength"] if send_info else "",
+                "_sort": recv_to_send_us or recv_to_close_us,
+            })
+    except _ExactLimitExceeded as exc:
+        return _analysis_too_large("HTTP Requests", exc)
 
     if not rows:
+        if recv_seen == 0:
+            return _NO_HTTP_DATA_MSG
+        if url_filter and recv_matched_filter == 0:
+            return f"*No HTTP requests match URL filter `{url_filter}`.*"
         return "*No HTTP request records reconstructed (RequestId join produced no rows).*"
 
     result_df = pd.DataFrame(rows).sort_values(
@@ -229,13 +414,26 @@ def get_http_requests(
     ).reset_index(drop=True)
     result_df = result_df.drop(columns=["_sort"])
 
-    in_flight = int(sum(1 for r in rows if not r["Status"]))
+    in_flight = int(
+        sum(1 for r in rows if not r["Status"] and not r["Recv->Close (us)"])
+    )
 
     lines = [
         "**HTTP Requests**",
         "",
         f"Requests observed: {len(result_df):,}",
     ]
+    if recv_to_send_latencies:
+        lines.append(f"Responses completed: {len(recv_to_send_latencies):,}")
+        lines.append(
+            _format_exact_percentile_line("Recv->Send", recv_to_send_latencies)
+        )
+    if deliver_to_send_latencies:
+        lines.append(
+            _format_exact_percentile_line(
+                "Deliver->Send", deliver_to_send_latencies
+            )
+        )
     if in_flight:
         lines.append(f"Requests in flight at trace end (no Send seen): {in_flight:,}")
     if url_filter:
@@ -255,12 +453,12 @@ def get_http_requests(
 def get_http_queue_depth(trace_id: str, top_n: int = 20) -> str:
     """Per-URL-group queue depth (peak, average) and total requests.
 
-    Approximates concurrent in-flight requests per UrlGroupId by walking
+    Computes concurrent in-flight requests per UrlGroupId by walking
     the Recv -> Deliver -> Send -> Close events ordered by timestamp.
     For each event we adjust a running counter (+1 on Deliver, -1 on
-    Send or Close) and track the maximum and mean. Connections without a
-    Deliver event (Recv-only) are excluded from the per-group totals
-    because we cannot attribute them to a URL group.
+    Send or Close) and track the maximum, time-weighted mean, and exact
+    nearest-rank completion latency percentiles. Requests without a Deliver
+    event are excluded because they cannot be attributed to a URL group.
 
     Args:
         trace_id: ID returned by load_trace.
@@ -269,73 +467,84 @@ def get_http_queue_depth(trace_id: str, top_n: int = 20) -> str:
     trace = require_trace(trace_id)
     _ensure_dumper_ready(trace)
 
-    deliver = trace.http_deliver_df
-    send = trace.http_send_df
-    close = trace.http_close_df
+    try:
+        # Map RequestId -> UrlGroupId via the Deliver event. Deliver is the
+        # queue entry point for per-URL-group depth accounting.
+        rid_to_urlgroup: dict[int, int] = {}
+        deliver_ts_by_rid: dict[int, int] = {}
+        events: list[tuple[int, int, int]] = []  # (ts, url_group, delta)
+        deliver_seen = 0
 
-    if not _has_rows(deliver):
-        if not _has_rows(trace.http_recv_df):
-            return _NO_HTTP_DATA_MSG
-        return (
-            "**HTTP Queue Depth**\n\n"
-            "*No HttpService/Deliver events in this trace — cannot attribute "
-            "requests to URL groups.*"
-        )
-
-    # Map RequestId -> UrlGroupId via the Deliver event.
-    rid_to_urlgroup: dict[int, int] = {}
-    deliver_events: list[tuple[int, int, str]] = []  # (ts, url_group, "deliver")
-    for _, row in deliver.iterrows():
-        rid = int(row.get("RequestId", 0) or 0)
-        ug = int(row.get("UrlGroupId", 0) or 0)
-        ts = int(row.get("TimeStamp", 0) or 0)
-        if rid:
+        for row in _iter_limited_records(
+            trace,
+            "http_deliver",
+            columns=["RequestId", "UrlGroupId", "TimeStamp", "TimeStampQpc"],
+        ):
+            rid = _to_int(row.get("RequestId"))
+            ug = _to_int(row.get("UrlGroupId"))
+            ts = _event_time_us(row)
+            if not rid:
+                continue
+            deliver_seen += 1
             rid_to_urlgroup[rid] = ug
-            deliver_events.append((ts, ug, "deliver"))
+            deliver_ts_by_rid[rid] = ts
+            if ug:
+                events.append((ts, ug, +1))
 
-    # Stream Send / Close events with their resolved UrlGroupId.
-    completion_events: list[tuple[int, int, str]] = []
-    for df, kind in ((send, "send"), (close, "close")):
-        if not _has_rows(df):
-            continue
-        for _, row in df.iterrows():
-            rid = int(row.get("RequestId", 0) or 0)
+        if deliver_seen == 0:
+            if not _event_has_rows(trace, "http_recv", columns=["RequestId"]):
+                return _NO_HTTP_DATA_MSG
+            return (
+                "**HTTP Queue Depth**\n\n"
+                "*No HttpService/Deliver events in this trace — cannot attribute "
+                "requests to URL groups.*"
+            )
+
+        completion_by_rid: dict[int, tuple[int, str]] = {}
+        for row in _iter_limited_records(
+            trace,
+            "http_send",
+            columns=["RequestId", "TimeStamp", "TimeStampQpc"],
+        ):
+            rid = _to_int(row.get("RequestId"))
+            if not rid:
+                continue
+            ts = _event_time_us(row)
+            current = completion_by_rid.get(rid)
+            if current is None or ts < current[0]:
+                completion_by_rid[rid] = (ts, "send")
+
+        # Use Send when available; fall back to Close if no Send (rare).
+        for row in _iter_limited_records(
+            trace,
+            "http_close",
+            columns=["RequestId", "TimeStamp", "TimeStampQpc"],
+        ):
+            rid = _to_int(row.get("RequestId"))
+            if not rid or rid in completion_by_rid:
+                continue
+            completion_by_rid[rid] = (_event_time_us(row), "close")
+
+        latencies_by_group: dict[int, list[int]] = {}
+        latency_count = 0
+        for rid, (ts, _kind) in completion_by_rid.items():
             ug = rid_to_urlgroup.get(rid, 0)
             if ug == 0:
                 continue
-            ts = int(row.get("TimeStamp", 0) or 0)
-            completion_events.append((ts, ug, kind))
-
-    # For depth analysis we only want a single "completion" per request to
-    # avoid double-counting Send + Close for the same lifecycle. Track which
-    # RequestIds have already been completed.
-    events: list[tuple[int, int, int]] = []  # (ts, url_group, delta)
-    completed_rids: set[int] = set()
-
-    for _, row in deliver.iterrows():
-        rid = int(row.get("RequestId", 0) or 0)
-        ug = int(row.get("UrlGroupId", 0) or 0)
-        ts = int(row.get("TimeStamp", 0) or 0)
-        if rid and ug:
-            events.append((ts, ug, +1))
-
-    # Use Send when available; fall back to Close if no Send (rare).
-    for df, kind in ((send, "send"), (close, "close")):
-        if not _has_rows(df):
-            continue
-        for _, row in df.iterrows():
-            rid = int(row.get("RequestId", 0) or 0)
-            if rid in completed_rids:
-                continue
-            ug = rid_to_urlgroup.get(rid, 0)
-            if ug == 0:
-                continue
-            ts = int(row.get("TimeStamp", 0) or 0)
             events.append((ts, ug, -1))
-            completed_rids.add(rid)
+            deliver_ts = deliver_ts_by_rid.get(rid)
+            if deliver_ts is not None and ts >= deliver_ts:
+                latencies_by_group.setdefault(ug, []).append(ts - deliver_ts)
+                latency_count += 1
+                _check_exact_value_limit(
+                    latency_count,
+                    "HTTP queue completion latencies",
+                )
+    except _ExactLimitExceeded as exc:
+        return _analysis_too_large("HTTP Queue Depth", exc)
 
     # Sort by timestamp and walk per URL group.
-    events.sort(key=lambda e: e[0])
+    events.sort(key=lambda e: (e[0], -e[2]))
     per_group: dict[int, dict[str, Any]] = {}
     current_depth: dict[int, int] = {}
 
@@ -389,6 +598,7 @@ def get_http_queue_depth(trace_id: str, top_n: int = 20) -> str:
             span = 0
         integral = integral_for_group.get(ug, 0)
         avg_depth = (integral / span) if span > 0 else 0.0
+        latencies = latencies_by_group.get(ug, [])
 
         rows.append({
             "UrlGroupId": ug,
@@ -396,6 +606,8 @@ def get_http_queue_depth(trace_id: str, top_n: int = 20) -> str:
             "Avg Depth": round(avg_depth, 2),
             "Deliveries": rec["deliveries"],
             "Completions": rec["completions"],
+            "Latency p50 (us)": _exact_percentile(latencies, 0.50) if latencies else "",
+            "Latency p99 (us)": _exact_percentile(latencies, 0.99) if latencies else "",
         })
 
     result_df = pd.DataFrame(rows).sort_values(
@@ -426,9 +638,10 @@ def get_quic_connections(
     """Per-MsQuic-connection summary: lifetime, packets, bytes, losses.
 
     For each ConnectionId, aggregates Created / Closed timestamps,
-    PacketRecv / PacketSend counts and byte totals, and approximates
-    packet loss by counting gaps in the received-PacketNumber sequence
-    (max_pn - len(distinct_pns)). Sorted by total packets descending.
+    PacketRecv / PacketSend counts and byte totals, and estimates packet
+    loss exactly from gaps in the distinct received-PacketNumber sequence.
+    Sorted by total packets descending; huge packet-number sets are
+    declined instead of approximated silently.
 
     Args:
         trace_id: ID returned by load_trace.
@@ -439,80 +652,98 @@ def get_quic_connections(
     trace = require_trace(trace_id)
     _ensure_dumper_ready(trace)
 
-    created = trace.quic_conn_created_df
-    closed = trace.quic_conn_closed_df
-    recv = trace.quic_packet_recv_df
-    send = trace.quic_packet_send_df
+    try:
+        # Build per-ConnectionId aggregators. Start from Created so we
+        # capture peer / process context; fall back to a default row for
+        # connections that only appear in PacketRecv/Send when no process
+        # filter is active.
+        conns: dict[int, dict[str, Any]] = {}
+        have_any = False
 
-    have_any = any(
-        _has_rows(df) for df in (created, closed, recv, send)
-    )
-    if not have_any:
-        return _NO_QUIC_DATA_MSG
-
-    # Build per-ConnectionId aggregator. Start from Created so we capture
-    # peer / process context; fall back to a default row for connections
-    # that only appear in PacketRecv/Send (e.g. trace started mid-flight).
-    conns: dict[int, dict[str, Any]] = {}
-
-    if _has_rows(created):
-        for _, row in _apply_process_filter(created, process_filter).iterrows():
-            cid = int(row.get("ConnectionId", 0) or 0)
+        for row in _iter_limited_records(
+            trace,
+            "quic_conn_created",
+            columns=[
+                "ConnectionId", "TimeStamp", "TimeStampQpc",
+                "Process Name", "CID", "LocalAddr", "RemoteAddr",
+            ],
+        ):
+            have_any = True
+            if not _record_process_matches(row, process_filter):
+                continue
+            cid = _to_int(row.get("ConnectionId"))
             if not cid:
                 continue
-            rec = conns.setdefault(cid, {
-                "ConnectionId": cid,
-                "Process": row.get("Process Name", ""),
-                "RemoteAddr": row.get("RemoteAddr", ""),
-                "LocalAddr": row.get("LocalAddr", ""),
-                "CID": row.get("CID", ""),
-                "CreatedTs": int(row.get("TimeStamp", 0) or 0),
-                "ClosedTs": 0,
-                "RecvPackets": 0,
-                "SendPackets": 0,
-                "RecvBytes": 0,
-                "SendBytes": 0,
-                "RecvPns": set(),
+            rec = conns.setdefault(cid, _make_default_conn_record(cid))
+            rec.update({
+                "Process": _to_str(row.get("Process Name")),
+                "RemoteAddr": _to_str(row.get("RemoteAddr")),
+                "LocalAddr": _to_str(row.get("LocalAddr")),
+                "CID": _to_str(row.get("CID")),
+                "CreatedTs": _event_time_us(row),
             })
 
-    if _has_rows(closed):
-        for _, row in closed.iterrows():
-            cid = int(row.get("ConnectionId", 0) or 0)
-            if not cid or cid not in conns:
+        eligible: set[int] | None = set(conns.keys()) if process_filter else None
+
+        for row in _iter_limited_records(
+            trace,
+            "quic_conn_closed",
+            columns=["ConnectionId", "TimeStamp", "TimeStampQpc", "Process Name"],
+        ):
+            have_any = True
+            cid = _to_int(row.get("ConnectionId"))
+            if not cid:
                 continue
-            conns[cid]["ClosedTs"] = int(row.get("TimeStamp", 0) or 0)
+            if eligible is not None and cid not in eligible:
+                continue
+            rec = conns.setdefault(cid, _make_default_conn_record(cid))
+            rec["ClosedTs"] = _event_time_us(row)
+            if not rec["Process"]:
+                rec["Process"] = _to_str(row.get("Process Name"))
 
-    # Only include connections matching the process filter, plus those
-    # for which only packet events exist. Build the eligible set up front
-    # from the (possibly filtered) Created list. When no filter is given
-    # we don't restrict at all — packet-only connections still surface.
-    eligible: set[int] | None = None
-    if process_filter and _has_rows(created):
-        eligible = set(conns.keys())
-
-    if _has_rows(recv):
-        for _, row in recv.iterrows():
-            cid = int(row.get("ConnectionId", 0) or 0)
+        pn_value_count = 0
+        for row in _iter_limited_records(
+            trace,
+            "quic_packet_recv",
+            columns=["ConnectionId", "PacketNumber", "Size", "CPU"],
+        ):
+            have_any = True
+            cid = _to_int(row.get("ConnectionId"))
             if not cid:
                 continue
             if eligible is not None and cid not in eligible:
                 continue
             rec = conns.setdefault(cid, _make_default_conn_record(cid))
             rec["RecvPackets"] += 1
-            rec["RecvBytes"] += int(row.get("Size", 0) or 0)
-            pn = int(row.get("PacketNumber", 0) or 0)
-            rec["RecvPns"].add(pn)
+            rec["RecvBytes"] += _to_int(row.get("Size"))
+            pn = _to_int(row.get("PacketNumber"), None)
+            if pn is not None and pn not in rec["RecvPns"]:
+                rec["RecvPns"].add(pn)
+                pn_value_count += 1
+                _check_exact_value_limit(
+                    pn_value_count,
+                    "QUIC received packet-number set",
+                )
 
-    if _has_rows(send):
-        for _, row in send.iterrows():
-            cid = int(row.get("ConnectionId", 0) or 0)
+        for row in _iter_limited_records(
+            trace,
+            "quic_packet_send",
+            columns=["ConnectionId", "PacketNumber", "Size"],
+        ):
+            have_any = True
+            cid = _to_int(row.get("ConnectionId"))
             if not cid:
                 continue
             if eligible is not None and cid not in eligible:
                 continue
             rec = conns.setdefault(cid, _make_default_conn_record(cid))
             rec["SendPackets"] += 1
-            rec["SendBytes"] += int(row.get("Size", 0) or 0)
+            rec["SendBytes"] += _to_int(row.get("Size"))
+    except _ExactLimitExceeded as exc:
+        return _analysis_too_large("MsQuic Connections", exc)
+
+    if not have_any:
+        return _NO_QUIC_DATA_MSG
 
     if not conns:
         msg = "*No matching MsQuic connections"
@@ -542,6 +773,7 @@ def get_quic_connections(
             "ConnectionId": cid,
             "Process": rec["Process"],
             "Peer": rec["RemoteAddr"],
+            "CID": rec["CID"],
             "Lifetime (us)": lifetime_us,
             "Recv Pkts": rec["RecvPackets"],
             "Send Pkts": rec["SendPackets"],
@@ -603,8 +835,8 @@ def get_quic_cid_distribution(trace_id: str, top_n: int = 30) -> str:
     CPU). Connections without a CID (e.g. trace started mid-flow) are
     grouped under bucket -1.
 
-    The CPU count is taken from the maximum CPU observed in
-    ``quic_packet_recv_df``. With CPUMAP / cpuredirect on, every
+    The CPU count is taken from the maximum CPU observed in PacketRecv
+    events. With CPUMAP / cpuredirect on, every
     connection in a single hash bucket should pin to one CPU; a bucket
     showing many CPUs means the steering is not working or many distinct
     connections happen to share that bucket.
@@ -616,32 +848,42 @@ def get_quic_cid_distribution(trace_id: str, top_n: int = 30) -> str:
     trace = require_trace(trace_id)
     _ensure_dumper_ready(trace)
 
-    created = trace.quic_conn_created_df
-    recv = trace.quic_packet_recv_df
+    try:
+        have_any = False
 
-    if not _has_rows(created) and not _has_rows(recv):
-        return _NO_QUIC_DATA_MSG
-
-    # Build ConnectionId -> CID map. Only Created events carry the CID.
-    cid_by_conn: dict[int, str] = {}
-    if _has_rows(created):
-        for _, row in created.iterrows():
-            conn = int(row.get("ConnectionId", 0) or 0)
-            cid = str(row.get("CID", ""))
+        # Build ConnectionId -> CID map. Only Created events carry the CID.
+        cid_by_conn: dict[int, str] = {}
+        for row in _iter_limited_records(
+            trace,
+            "quic_conn_created",
+            columns=["ConnectionId", "CID"],
+        ):
+            have_any = True
+            conn = _to_int(row.get("ConnectionId"))
+            cid = _to_str(row.get("CID"))
             if conn and cid and conn not in cid_by_conn:
                 cid_by_conn[conn] = cid
 
-    # Build ConnectionId -> set(CPU) from PacketRecv events.
-    cpus_by_conn: dict[int, set[int]] = {}
-    cpu_max = 0
-    if _has_rows(recv):
-        for _, row in recv.iterrows():
-            conn = int(row.get("ConnectionId", 0) or 0)
-            cpu = int(row.get("CPU", -1))
+        # Build ConnectionId -> set(CPU) from PacketRecv events.
+        cpus_by_conn: dict[int, set[int]] = {}
+        cpu_max = 0
+        for row in _iter_limited_records(
+            trace,
+            "quic_packet_recv",
+            columns=["ConnectionId", "CPU"],
+        ):
+            have_any = True
+            conn = _to_int(row.get("ConnectionId"))
+            cpu = _to_int(row.get("CPU"), -1)
             if conn and cpu >= 0:
                 cpus_by_conn.setdefault(conn, set()).add(cpu)
                 if cpu > cpu_max:
                     cpu_max = cpu
+    except _ExactLimitExceeded as exc:
+        return _analysis_too_large("MsQuic CID Distribution", exc)
+
+    if not have_any:
+        return _NO_QUIC_DATA_MSG
 
     cpu_count = cpu_max + 1 if cpu_max > 0 else 1
 
@@ -699,10 +941,11 @@ def get_quic_ack_delays(
 ) -> str:
     """Per-connection AckDelay percentiles (p50/p99/p999).
 
-    Computes AckDelay (in microseconds) percentiles from
-    ``quic_ack_recv_df.AckDelay`` per ConnectionId. Connections with
-    p99 >= 25 ms are flagged in the summary as exhibiting poor delayed-ACK
-    behavior (the TCP-spec-derived smoke-test threshold).
+    Computes exact nearest-rank AckDelay (in microseconds) percentiles
+    from materialized or event-store AckReceived rows per ConnectionId.
+    Connections with p99 >= 25 ms are flagged in the summary as exhibiting
+    poor delayed-ACK behavior (the TCP-spec-derived smoke-test threshold).
+    Huge AckDelay groups are declined instead of approximated silently.
 
     Args:
         trace_id: ID returned by load_trace.
@@ -714,33 +957,55 @@ def get_quic_ack_delays(
     trace = require_trace(trace_id)
     _ensure_dumper_ready(trace)
 
-    ack = trace.quic_ack_recv_df
-    if not _has_rows(ack):
-        return _NO_QUIC_DATA_MSG
-
-    # Resolve Process Name per connection via Created records (optional).
-    process_by_conn: dict[int, str] = {}
-    if process_filter and _has_rows(trace.quic_conn_created_df):
-        for _, row in trace.quic_conn_created_df.iterrows():
-            conn = int(row.get("ConnectionId", 0) or 0)
+    try:
+        # Resolve Process Name per connection via Created records. This is
+        # optional for display, but required when process_filter is provided.
+        process_by_conn: dict[int, str] = {}
+        have_quic_lifecycle = False
+        for row in _iter_limited_records(
+            trace,
+            "quic_conn_created",
+            columns=["ConnectionId", "Process Name"],
+        ):
+            have_quic_lifecycle = True
+            conn = _to_int(row.get("ConnectionId"))
             if conn:
-                process_by_conn[conn] = str(row.get("Process Name", ""))
+                process_by_conn[conn] = _to_str(row.get("Process Name"))
 
-    # Group AckDelay by ConnectionId.
-    groups: dict[int, list[int]] = {}
-    for _, row in ack.iterrows():
-        conn = int(row.get("ConnectionId", 0) or 0)
-        if not conn:
-            continue
-        if process_filter:
-            proc = process_by_conn.get(conn, "")
-            if process_filter.lower() not in proc.lower():
+        # Group AckDelay by ConnectionId. Values are kept exactly and
+        # percentiles below use nearest-rank over the sorted observations.
+        groups: dict[int, list[int]] = {}
+        ack_seen = False
+        ack_value_count = 0
+        for row in _iter_limited_records(
+            trace,
+            "quic_ack_recv",
+            columns=["ConnectionId", "AckDelay", "LargestAcknowledged"],
+        ):
+            ack_seen = True
+            conn = _to_int(row.get("ConnectionId"))
+            if not conn:
                 continue
-        try:
-            delay = int(row.get("AckDelay", 0) or 0)
-        except (TypeError, ValueError):
-            continue
-        groups.setdefault(conn, []).append(delay)
+            if process_filter:
+                proc = process_by_conn.get(conn, "")
+                if process_filter.lower() not in proc.lower():
+                    continue
+            delay = _to_int(row.get("AckDelay"), None)
+            if delay is None:
+                continue
+            groups.setdefault(conn, []).append(delay)
+            ack_value_count += 1
+            _check_exact_value_limit(
+                ack_value_count,
+                "QUIC AckDelay observations",
+            )
+    except _ExactLimitExceeded as exc:
+        return _analysis_too_large("MsQuic Ack Delays", exc)
+
+    if not ack_seen:
+        if have_quic_lifecycle:
+            return "*No MsQuic AckReceived events in this trace.*"
+        return _NO_QUIC_DATA_MSG
 
     if not groups:
         msg = "*No MsQuic AckReceived events"
@@ -752,8 +1017,9 @@ def get_quic_ack_delays(
     rows: list[dict[str, Any]] = []
     flagged_count = 0
     for conn, delays in groups.items():
-        s = pd.Series(delays, dtype="float64")
-        p99 = float(s.quantile(0.99))
+        p50 = _exact_percentile(delays, 0.50)
+        p99 = _exact_percentile(delays, 0.99)
+        p999 = _exact_percentile(delays, 0.999)
         flagged = p99 >= _ACK_DELAY_FLAG_THRESHOLD_US
         if flagged:
             flagged_count += 1
@@ -761,9 +1027,9 @@ def get_quic_ack_delays(
             "ConnectionId": conn,
             "Process": process_by_conn.get(conn, ""),
             "Acks": len(delays),
-            "p50 (us)": round(float(s.quantile(0.50)), 1),
-            "p99 (us)": round(p99, 1),
-            "p999 (us)": round(float(s.quantile(0.999)), 1),
+            "p50 (us)": p50,
+            "p99 (us)": p99,
+            "p999 (us)": p999,
             "Flag": "HIGH" if flagged else "",
         })
 
@@ -775,6 +1041,7 @@ def get_quic_ack_delays(
         "**MsQuic Ack Delays**",
         "",
         f"Connections with Ack data: {len(result_df):,}",
+        "Percentiles: exact nearest-rank over observed AckDelay values.",
     ]
     if flagged_count:
         lines.append(

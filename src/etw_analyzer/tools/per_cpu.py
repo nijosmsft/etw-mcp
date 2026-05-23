@@ -16,7 +16,7 @@ import pandas as pd
 
 
 def _get_cpu_timeline_df(trace: TraceData) -> pd.DataFrame | None:
-    """Get the cpu_timeline DataFrame (from xperf -a profile -util).
+    """Get the cpu_timeline DataFrame.
 
     This dataset has columns: StartTime, EndTime, Cpu 0, Cpu 1, ..., Cpu N
     where each Cpu column contains utilization % for that time bucket.
@@ -47,7 +47,7 @@ def get_per_cpu_summary(
 ) -> str:
     """Get per-CPU utilization breakdown.
 
-    Uses xperf's per-CPU utilization timeline data to show average
+    Uses per-CPU utilization timeline data to show average
     utilization per CPU. Identifies hot CPUs (RSS, CPUMAP targets)
     vs idle CPUs.
 
@@ -73,7 +73,7 @@ def _per_cpu_from_timeline(
     end_time: float | None,
     max_rows: int,
 ) -> str:
-    """Build per-CPU summary from xperf -a profile -util data."""
+    """Build per-CPU summary from utilization timeline data."""
     # Columns: StartTime, EndTime, Cpu 0, Cpu 1, ...
     # Times are in microseconds
     start_col = _find_col(df, ["StartTime", "Start Time"]) or "StartTime"
@@ -151,7 +151,7 @@ def _per_cpu_from_timeline(
         f"\n**Active CPUs:** {active_cpus}/{total_cpus}"
     )
 
-    return f"**Per-CPU Summary** (from xperf utilization data)\n\n{format_table(result, max_rows=max_rows)}{footer}"
+    return f"**Per-CPU Summary** (from utilization data)\n\n{format_table(result, max_rows=max_rows)}{footer}"
 
 
 def _per_cpu_from_sampling(
@@ -161,7 +161,10 @@ def _per_cpu_from_sampling(
     max_rows: int,
 ) -> str:
     """Fallback: build per-CPU summary from cpu_sampling data (less precise)."""
-    df = _get_sampling_df(trace)
+    try:
+        df = _get_sampling_df(trace)
+    except ValueError as e:
+        return f"*{e}*"
 
     weight_col = _find_col(df, ["Weight", "Count", "Sample Count"]) or "Weight"
     cpu_col = _find_col(df, ["CPU", "Cpu"]) or "CPU"
@@ -200,7 +203,7 @@ def get_cpu_timeline(
     end_time: float | None = None,
     max_rows: int = 60,
 ) -> str:
-    """Get per-CPU utilization timeline from xperf profile data.
+    """Get per-CPU utilization timeline.
 
     Shows per-CPU utilization % for each time bucket. Use to identify
     which CPUs are hot (RSS queues, CPUMAP targets) vs idle, and find
@@ -209,7 +212,7 @@ def get_cpu_timeline(
     Args:
         trace_id: ID returned by load_trace.
         cpu_filter: CPU range filter, e.g. '0-15' for RSS CPUs only.
-        bucket_seconds: Not used (xperf buckets are fixed at trace granularity). Kept for API compat.
+        bucket_seconds: Used by sampling fallback; utilization timelines keep their source bucket size.
         start_time: Start of analysis window (seconds from trace start).
         end_time: End of analysis window (seconds from trace start).
         max_rows: Maximum time buckets to show. Default: 60.
@@ -231,7 +234,7 @@ def _timeline_from_util(
     end_time: float | None,
     max_rows: int,
 ) -> str:
-    """Build timeline from xperf -a profile -util data."""
+    """Build timeline from utilization data."""
     start_col = _find_col(df, ["StartTime", "Start Time"]) or "StartTime"
     end_col = _find_col(df, ["EndTime", "End Time"]) or "EndTime"
 
@@ -319,7 +322,10 @@ def _timeline_from_sampling(
     max_rows: int,
 ) -> str:
     """Fallback: build timeline from cpu_sampling data."""
-    df = _get_sampling_df(trace)
+    try:
+        df = _get_sampling_df(trace)
+    except ValueError as e:
+        return f"*{e}*"
 
     weight_col = _find_col(df, ["Weight", "Count", "Sample Count"]) or "Weight"
     cpu_col = _find_col(df, ["CPU", "Cpu"]) or "CPU"

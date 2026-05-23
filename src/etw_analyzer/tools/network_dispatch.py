@@ -1,8 +1,9 @@
 """Phase 2 dispatch-quality tools — answer RSS/SWRSS/CPUMAP correctness questions.
 
-These tools aggregate over data the trace already has (``dpc_isr``, ``dpc_isr_raw``
-per-CPU text, and the dumper-populated SampledProfile DataFrame), so they cost
-nothing beyond what ``load_trace`` already extracted.
+These tools aggregate over data the trace already has (``dpc_isr`` structured
+data, optional ``dpc_isr_raw`` per-CPU text, and the dumper-populated
+SampledProfile DataFrame), so they cost nothing beyond what ``load_trace``
+already extracted.
 
 Each tool answers one concrete dispatch question:
 
@@ -33,6 +34,7 @@ from etw_analyzer.networking import (
     NETWORK_MODULES_ALL,
     NETWORK_USER_MODULES,
 )
+from etw_analyzer.native.aggregators.dpcisr import build_dpc_per_cpu_dataframe
 from etw_analyzer.trace_state import TraceData, require_trace
 
 
@@ -116,29 +118,68 @@ def _per_cpu_dpc_rows(raw_text: str) -> list[dict]:
     return rows
 
 
+def _structured_per_cpu_dpc_rows(trace: TraceData) -> list[dict]:
+    """Return per-CPU DPC rows from native structured event data."""
+    per_cpu = build_dpc_per_cpu_dataframe(trace)
+    if per_cpu is None or per_cpu.empty:
+        return []
+
+    df = per_cpu.copy()
+    required = {"Module", "CPU", "DPC_us"}
+    if not required.issubset(df.columns):
+        return []
+    df["CPU"] = pd.to_numeric(df["CPU"], errors="coerce").fillna(-1).astype("int64")
+    df["DPC_us"] = pd.to_numeric(df["DPC_us"], errors="coerce").fillna(0).astype("int64")
+    if "Pct" in df.columns:
+        df["Pct"] = pd.to_numeric(df["Pct"], errors="coerce").fillna(0.0)
+    else:
+        df["Pct"] = 0.0
+    df = df[(df["CPU"] >= 0) & (df["DPC_us"] > 0)]
+    if df.empty:
+        return []
+
+    return [
+        {
+            "Module": str(row["Module"]),
+            "CPU": int(row["CPU"]),
+            "DPC_us": int(row["DPC_us"]),
+            "Pct": float(row["Pct"]),
+        }
+        for _, row in df.iterrows()
+    ]
+
+
+def _per_cpu_dpc_dataframe(trace: TraceData) -> pd.DataFrame:
+    """Return per-CPU DPC rows from raw text or native structured data."""
+    raw_df = trace.raw_csv.get("dpc_isr_raw")
+    if raw_df is not None and "raw_text" in raw_df.columns and not raw_df.empty:
+        rows = _per_cpu_dpc_rows(str(raw_df.iloc[0]["raw_text"]))
+        if rows:
+            return pd.DataFrame(rows)
+
+    rows = _structured_per_cpu_dpc_rows(trace)
+    if rows:
+        return pd.DataFrame(rows)
+    return pd.DataFrame()
+
+
 def _nic_dpc_cpu_set(
     trace: TraceData,
     modules: frozenset[str] = NETWORK_KERNEL_MODULES,
 ) -> tuple[set[int], pd.DataFrame]:
-    """Return (CPU set, raw per-CPU rows) where networking DPCs fired.
+    """Return (CPU set, per-CPU rows) where networking DPCs fired.
 
     "Heavy networking DPC" is defined inclusively: any CPU that handled a DPC
     from a kernel networking module counts. Tunable via the ``modules`` arg.
 
     Returns:
         ``(cpus, df)`` where ``cpus`` is the set of CPU IDs and ``df`` is the
-        parsed per-CPU DPC DataFrame (handy for downstream tools). Both are
-        empty when ``dpc_isr_raw`` is missing.
+        per-CPU DPC DataFrame (handy for downstream tools). Both are empty
+        when no per-CPU DPC data is available.
     """
-    raw_df = trace.raw_csv.get("dpc_isr_raw")
-    if raw_df is None or "raw_text" not in raw_df.columns or raw_df.empty:
+    df = _per_cpu_dpc_dataframe(trace)
+    if df.empty:
         return set(), pd.DataFrame()
-
-    rows = _per_cpu_dpc_rows(str(raw_df.iloc[0]["raw_text"]))
-    if not rows:
-        return set(), pd.DataFrame()
-
-    df = pd.DataFrame(rows)
     net_mask = df["Module"].apply(lambda m: _module_in_set(m, modules))
     cpus = set(int(c) for c in df.loc[net_mask, "CPU"].unique().tolist())
     return cpus, df
@@ -172,8 +213,8 @@ def get_rss_dispatch_quality(
       the NIC DPC CPUs but the receiver is parked elsewhere — the gap CPUMAP
       / SWRSS is designed to close.
 
-    Source data: ``dpc_isr_raw`` per-CPU DPC text + the background-extracted
-    ``dumper_df`` (SampledProfile events). The dumper extraction is started
+    Source data: per-CPU DPC data + the background-extracted ``dumper_df``
+    (SampledProfile events). The dumper extraction is started
     by ``load_trace``; this tool blocks on ``wait_for_dumper()`` if it's still
     running.
 
@@ -193,7 +234,7 @@ def get_rss_dispatch_quality(
 
     if not nic_cpus:
         return (
-            "*No networking-module DPCs found in `dpc_isr_raw`.* "
+            "*No networking-module DPCs found in DPC/ISR data.* "
             "Trace may have been collected without DPC/ISR kernel flags."
         )
 
@@ -291,11 +332,9 @@ def get_per_nic_queue_arrivals(
     Compares against the system's total CPU count to highlight the classic
     "only 8 of 80 CPUs are getting traffic" RSS bottleneck.
 
-    Source data: ``dpc_isr_raw`` (the raw ``xperf -a dpcisr`` text), parsed
-    into per-(module, CPU) rows. The unit is per-CPU DPC time in
-    microseconds, not absolute DPC counts — xperf doesn't emit per-CPU
-    counts in the histogram output. Time is a tight proxy for count
-    distribution in practice.
+    Source data: per-(module, CPU) DPC rows from either raw dpcisr text or
+    native structured DPC events. The unit is per-CPU DPC time in
+    microseconds, not absolute DPC counts.
 
     Args:
         trace_id: ID returned by load_trace.
@@ -305,21 +344,15 @@ def get_per_nic_queue_arrivals(
     """
     trace = require_trace(trace_id)
 
-    raw_df = trace.raw_csv.get("dpc_isr_raw")
-    if raw_df is None or "raw_text" not in raw_df.columns or raw_df.empty:
+    df = _per_cpu_dpc_dataframe(trace)
+    if df.empty:
         return (
-            "*No DPC/ISR raw text in trace.* "
+            "*No per-CPU DPC data in trace.* "
             "Re-collect with `wpr -start GeneralProfile` or a profile that "
             "includes the DPC/ISR kernel flag."
         )
 
-    rows = _per_cpu_dpc_rows(str(raw_df.iloc[0]["raw_text"]))
-    if not rows:
-        return "*Per-CPU DPC data is empty.*"
-
-    df = pd.DataFrame(rows)
-
-    nic_mask = df["Module"].astype(str).str.contains(nic_module, case=False, na=False)
+    nic_mask = df["Module"].astype(str).str.contains(nic_module, case=False, na=False, regex=False)
     nic_df = df[nic_mask]
     if nic_df.empty:
         modules_seen = sorted(df["Module"].unique().tolist())

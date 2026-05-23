@@ -16,6 +16,14 @@ from etw_analyzer.tools.network_dispatch import (
 from etw_analyzer.trace_state import TraceData, clear_traces, register_trace
 
 
+class _FakeSymbolizer:
+    def __init__(self, mapping):
+        self._mapping = mapping
+
+    def bulk_resolve(self, addrs):
+        return {int(a): self._mapping.get(int(a), "") for a in addrs}
+
+
 @pytest.fixture(autouse=True)
 def clean_trace_registry():
     clear_traces()
@@ -69,6 +77,9 @@ def _register_trace(
     raw_csv: dict[str, pd.DataFrame],
     dumper_df: pd.DataFrame | None = None,
     cpu_count: int | None = None,
+    symbolizer: object | None = None,
+    timestamp_frequency: float | None = None,
+    duration_seconds: float | None = None,
 ) -> None:
     trace = TraceData(
         trace_id=trace_id,
@@ -76,7 +87,11 @@ def _register_trace(
         export_dir=Path(f"C:\\traces\\.etw-export-{trace_id}"),
         raw_csv=raw_csv,
         cpu_count=cpu_count,
+        timestamp_frequency=timestamp_frequency,
+        duration_seconds=duration_seconds,
     )
+    if symbolizer is not None:
+        trace.symbolizer = symbolizer
     if dumper_df is not None:
         trace.dumper_df = dumper_df
         # Signal the wait-for-dumper event so tools don't block.
@@ -193,7 +208,28 @@ class TestPerNicQueueArrivals:
     def test_missing_dpc_isr_raw(self):
         _register_trace("trace_empty", raw_csv={}, cpu_count=4)
         out = get_per_nic_queue_arrivals("trace_empty")
-        assert "No DPC/ISR raw text" in out
+        assert "No per-CPU DPC data" in out
+
+    def test_native_structured_dpc_events_without_raw_text(self):
+        _register_trace(
+            "trace_q",
+            raw_csv={
+                "_native_dpc_events": pd.DataFrame([
+                    {"TimeStamp": 200, "InitialTime": 100, "Routine": 0x1, "CPU": 1},
+                    {"TimeStamp": 500, "InitialTime": 200, "Routine": 0x1, "CPU": 6},
+                ]),
+            },
+            cpu_count=8,
+            symbolizer=_FakeSymbolizer({0x1: "mlx5.sys!DpcRoutine+0x0"}),
+            timestamp_frequency=1_000_000,
+            duration_seconds=1.0,
+        )
+
+        out = get_per_nic_queue_arrivals("trace_q", nic_module="mlx5")
+
+        assert "2 of 8" in out
+        assert "| 1 |" in out
+        assert "| 6 |" in out
 
 
 # ---------------------------------------------------------------------------
@@ -342,6 +378,40 @@ class TestRssDispatchQuality:
         )
         out = get_rss_dispatch_quality("trace_nodpc")
         assert "No networking-module DPCs" in out
+
+    def test_native_structured_dpc_events_feed_rss_quality(self):
+        rows = []
+        for i in range(120):
+            rows.append({
+                "TimeStamp": i, "Process Name": "good.exe", "PID": 1,
+                "CPU": 0, "Module": "tcpip.sys", "Function": "UdpRecv",
+                "Weight": 1,
+            })
+        for i in range(120):
+            rows.append({
+                "TimeStamp": 1000 + i, "Process Name": "bad.exe", "PID": 2,
+                "CPU": 3, "Module": "tcpip.sys", "Function": "UdpRecv",
+                "Weight": 1,
+            })
+        _register_trace(
+            "trace_native_disp",
+            raw_csv={
+                "_native_dpc_events": pd.DataFrame([
+                    {"TimeStamp": 200, "InitialTime": 100, "Routine": 0x1, "CPU": 0},
+                ]),
+            },
+            dumper_df=_build_dumper_df(rows),
+            cpu_count=4,
+            symbolizer=_FakeSymbolizer({0x1: "mlx5.sys!DpcRoutine+0x0"}),
+            timestamp_frequency=1_000_000,
+            duration_seconds=1.0,
+        )
+
+        out = get_rss_dispatch_quality("trace_native_disp", min_samples=100)
+
+        assert "good.exe" in out
+        assert "bad.exe" in out
+        assert "No networking-module DPCs" not in out
 
 
 # ---------------------------------------------------------------------------

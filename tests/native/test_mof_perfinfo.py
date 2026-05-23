@@ -45,6 +45,7 @@ class TestSampledProfile:
         assert row["CPU"] == 79
         assert row["PID"] == 1234
         assert row["Weight"] == 1
+        assert row["ProfileWeight"] == 1
         assert row["InstructionPointer"] == 0xFFFFF806B09383AC
         assert row["PayloadThreadId"] == 8260
 
@@ -54,13 +55,22 @@ class TestSampledProfile:
         row = decode_sampled_profile(payload, hdr={"ProcessorNumber": 0})
         assert row is not None
         assert row["Weight"] == 1
+        assert row["ProfileWeight"] == 1
 
     def test_large_count_preserved(self):
-        """Count>1 (multi-sample compression) must survive verbatim."""
+        """Small Count>1 (multi-sample compression) must survive verbatim."""
         payload = struct.pack("<QII", 0x1234, 8260, 7)
         row = decode_sampled_profile(payload, hdr={"ProcessorNumber": 1})
         assert row is not None
         assert row["Weight"] == 7
+        assert row["ProfileWeight"] == 7
+
+    def test_encoded_profile_weight_matches_xperf_semantics(self):
+        payload = struct.pack("<QII", 0x1234, 8260, 0x500001)
+        row = decode_sampled_profile(payload, hdr={"ProcessorNumber": 1})
+        assert row is not None
+        assert row["Weight"] == 1
+        assert row["ProfileWeight"] == 0x50000
 
     def test_too_short_returns_none(self):
         for bad_len in (0, 1, 8, 15):
@@ -74,7 +84,7 @@ class TestSampledProfile:
         expected_keys = {
             "TimeStamp", "Process Name", "PID", "CPU",
             "Module", "Function", "Weight",
-            "InstructionPointer", "PayloadThreadId",
+            "ProfileWeight", "InstructionPointer", "PayloadThreadId",
         }
         assert expected_keys == set(row.keys())
 

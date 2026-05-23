@@ -18,12 +18,16 @@ pointing at ``udp-perf/scripts/networking.wprp``.
 
 from __future__ import annotations
 
+from collections import deque
+from collections.abc import Iterator
+import heapq
 from typing import Any
 
 import pandas as pd
 
 from etw_analyzer.app import mcp
 from etw_analyzer.formatting.markdown import format_table
+from etw_analyzer.native.accessors import has_trace_event_dataset, iter_event_batches
 from etw_analyzer.parsing.packet_decode import decode_packet_headers
 from etw_analyzer.trace_state import TraceData, require_trace
 
@@ -35,6 +39,19 @@ _NO_PACKET_CAPTURE_MSG = (
     "record frame bytes. Standard `xdptrace.wprp` traces do not include "
     "packet captures."
 )
+
+_PACKET_BATCH_SIZE = 65_536
+_PACKET_COLUMNS = [
+    "TimeStamp",
+    "Direction",
+    "MiniportName",
+    "PacketBytes",
+    "Size",
+    "Process Name",
+    "PID",
+    "ThreadID",
+    "CPU",
+]
 
 
 # ---------------------------------------------------------------------------
@@ -68,6 +85,57 @@ def _packet_capture_ready(df: pd.DataFrame | None) -> bool:
     return "PacketBytes" in df.columns
 
 
+def _project_packet_columns(
+    df: pd.DataFrame,
+    columns: list[str] | None,
+) -> pd.DataFrame:
+    if columns is None:
+        return df.reset_index(drop=True)
+    keep = [column for column in columns if column in df.columns]
+    if "TimeStamp" in df.columns and "TimeStamp" not in keep:
+        keep.append("TimeStamp")
+    return df[keep].reset_index(drop=True)
+
+
+def _packet_capture_batches(
+    trace: TraceData,
+    *,
+    columns: list[str] | None = None,
+    batch_size: int = _PACKET_BATCH_SIZE,
+    sort_by_time: bool = False,
+) -> Iterator[pd.DataFrame]:
+    """Yield packet-capture rows without forcing event-store materialization."""
+
+    materialized = trace.packet_capture_df
+    if isinstance(materialized, pd.DataFrame):
+        df = _project_packet_columns(materialized, columns)
+        if sort_by_time and "TimeStamp" in df.columns and not df.empty:
+            ts = pd.to_numeric(df["TimeStamp"], errors="coerce")
+            df = df.assign(_sort_ts=ts).sort_values("_sort_ts").drop(columns=["_sort_ts"])
+        safe_batch_size = max(1, int(batch_size or _PACKET_BATCH_SIZE))
+        for start in range(0, len(df), safe_batch_size):
+            yield df.iloc[start:start + safe_batch_size].reset_index(drop=True)
+        return
+
+    for batch in iter_event_batches(
+        trace,
+        "packet_capture",
+        columns=columns,
+        batch_size=batch_size,
+    ):
+        if sort_by_time and "TimeStamp" in batch.columns and not batch.empty:
+            ts = pd.to_numeric(batch["TimeStamp"], errors="coerce")
+            batch = batch.assign(_sort_ts=ts).sort_values("_sort_ts").drop(columns=["_sort_ts"])
+        yield batch.reset_index(drop=True)
+
+
+def _packet_capture_available(trace: TraceData) -> bool:
+    materialized = trace.packet_capture_df
+    if isinstance(materialized, pd.DataFrame):
+        return _packet_capture_ready(materialized)
+    return has_trace_event_dataset(trace, "packet_capture")
+
+
 def _apply_process_filter(df: pd.DataFrame, process_filter: str | None) -> pd.DataFrame:
     """Case-insensitive substring filter on Process Name."""
     if not process_filter or df.empty or "Process Name" not in df.columns:
@@ -98,38 +166,7 @@ def _decoded_with_five_tuple(df: pd.DataFrame) -> pd.DataFrame:
 
     for _, row in out.iterrows():
         decoded = _decode_row(row.get("PacketBytes", ""))
-        src = decoded.get("ip.src", "")
-        dst = decoded.get("ip.dst", "")
-        proto_num = decoded.get("ip.proto")
-        if proto_num == 6:
-            proto = "tcp"
-            sport = int(decoded.get("tcp.src_port", 0))
-            dport = int(decoded.get("tcp.dst_port", 0))
-        elif proto_num == 17:
-            proto = "udp"
-            sport = int(decoded.get("udp.src_port", 0))
-            dport = int(decoded.get("udp.dst_port", 0))
-        elif proto_num == 1:
-            proto = "icmp"
-            sport = 0
-            dport = 0
-        elif proto_num == 58:
-            proto = "icmpv6"
-            sport = 0
-            dport = 0
-        elif proto_num is not None:
-            proto = f"proto-{int(proto_num)}"
-            sport = 0
-            dport = 0
-        else:
-            proto = "other"
-            sport = 0
-            dport = 0
-
-        if src and dst:
-            five = f"{src}:{sport} -> {dst}:{dport}/{proto}"
-        else:
-            five = "undecoded"
+        src, dst, sport, dport, proto, five = _decoded_tuple_fields(decoded)
 
         srcs.append(src)
         dsts.append(dst)
@@ -145,6 +182,42 @@ def _decoded_with_five_tuple(df: pd.DataFrame) -> pd.DataFrame:
     out["_proto"] = protos
     out["_five_tuple"] = tuples
     return out
+
+
+def _decoded_tuple_fields(decoded: dict[str, Any]) -> tuple[str, str, int, int, str, str]:
+    src = decoded.get("ip.src", "")
+    dst = decoded.get("ip.dst", "")
+    proto_num = decoded.get("ip.proto")
+    if proto_num == 6:
+        proto = "tcp"
+        sport = int(decoded.get("tcp.src_port", 0))
+        dport = int(decoded.get("tcp.dst_port", 0))
+    elif proto_num == 17:
+        proto = "udp"
+        sport = int(decoded.get("udp.src_port", 0))
+        dport = int(decoded.get("udp.dst_port", 0))
+    elif proto_num == 1:
+        proto = "icmp"
+        sport = 0
+        dport = 0
+    elif proto_num == 58:
+        proto = "icmpv6"
+        sport = 0
+        dport = 0
+    elif proto_num is not None:
+        proto = f"proto-{int(proto_num)}"
+        sport = 0
+        dport = 0
+    else:
+        proto = "other"
+        sport = 0
+        dport = 0
+
+    if src and dst:
+        five = f"{src}:{sport} -> {dst}:{dport}/{proto}"
+    else:
+        five = "undecoded"
+    return str(src), str(dst), int(sport), int(dport), proto, five
 
 
 def _parse_five_tuple_query(query: str) -> dict[str, Any] | None:
@@ -290,35 +363,56 @@ def get_packet_capture_summary(
     trace = require_trace(trace_id)
     _ensure_dumper_ready(trace)
 
-    df = trace.packet_capture_df
-    if not _packet_capture_ready(df):
+    if not _packet_capture_available(trace):
         return _NO_PACKET_CAPTURE_MSG
 
-    df = _apply_process_filter(df, process_filter)
-    if df.empty:
+    aggregates: dict[str, dict[str, Any]] = {}
+    saw_packets = False
+    saw_after_filter = False
+    columns = [
+        "Direction", "PacketBytes", "Size", "Process Name",
+    ]
+    for batch in _packet_capture_batches(trace, columns=columns):
+        if not _packet_capture_ready(batch):
+            continue
+        saw_packets = saw_packets or not batch.empty
+        batch = _apply_process_filter(batch, process_filter)
+        if batch.empty:
+            continue
+        saw_after_filter = True
+        for _, row in batch.iterrows():
+            decoded = _decode_row(row.get("PacketBytes", ""))
+            *_unused, five_tuple = _decoded_tuple_fields(decoded)
+            entry = aggregates.setdefault(
+                five_tuple,
+                {
+                    "5-Tuple": five_tuple,
+                    "Recv Pkts": 0,
+                    "Send Pkts": 0,
+                    "Total Pkts": 0,
+                    "Total Bytes": 0,
+                },
+            )
+            direction = str(row.get("Direction", ""))
+            if direction == "Recv":
+                entry["Recv Pkts"] += 1
+            elif direction == "Send":
+                entry["Send Pkts"] += 1
+            entry["Total Pkts"] += 1
+            try:
+                entry["Total Bytes"] += int(row.get("Size", 0) or 0)
+            except (TypeError, ValueError):
+                pass
+
+    if not saw_packets:
+        return _NO_PACKET_CAPTURE_MSG
+    if not saw_after_filter:
         return f"*No packets match process filter `{process_filter}`.*"
 
-    decoded = _decoded_with_five_tuple(df)
-
-    rows: list[dict[str, Any]] = []
-    for tup, group in decoded.groupby("_five_tuple"):
-        recv = int((group.get("Direction", pd.Series(dtype=str)) == "Recv").sum())
-        send = int((group.get("Direction", pd.Series(dtype=str)) == "Send").sum())
-        total = len(group)
-        size_col = pd.to_numeric(group["Size"], errors="coerce").fillna(0) if "Size" in group.columns else pd.Series([])
-        total_bytes = int(size_col.sum()) if not size_col.empty else 0
-        rows.append({
-            "5-Tuple": tup,
-            "Recv Pkts": recv,
-            "Send Pkts": send,
-            "Total Pkts": total,
-            "Total Bytes": total_bytes,
-        })
-
-    if not rows:
+    if not aggregates:
         return _NO_PACKET_CAPTURE_MSG
 
-    result_df = pd.DataFrame(rows).sort_values(
+    result_df = pd.DataFrame(list(aggregates.values())).sort_values(
         "Total Bytes", ascending=False
     ).reset_index(drop=True)
 
@@ -365,8 +459,7 @@ def get_packet_timeline(
     trace = require_trace(trace_id)
     _ensure_dumper_ready(trace)
 
-    df = trace.packet_capture_df
-    if not _packet_capture_ready(df):
+    if not _packet_capture_available(trace):
         return _NO_PACKET_CAPTURE_MSG
 
     query = _parse_five_tuple_query(five_tuple)
@@ -377,44 +470,53 @@ def get_packet_timeline(
             "`10.0.0.1:5000-10.0.0.2:6000`.*"
         )
 
-    decoded = _decoded_with_five_tuple(df)
-    mask = decoded.apply(lambda row: _five_tuples_match(row, query), axis=1)
-    matched = decoded[mask]
-    if matched.empty:
-        return f"*No packets match 5-tuple `{five_tuple}`.*"
-
-    # Build per-row display: TimeStamp, Direction, decoded L4 fields, Size.
     rows: list[dict[str, Any]] = []
-    for _, row in matched.iterrows():
-        decoded_row = _decode_row(row.get("PacketBytes", ""))
-        proto = row["_proto"]
-        if proto == "tcp":
-            flags = decoded_row.get("tcp.flags", [])
-            l4_fields = (
-                f"seq={decoded_row.get('tcp.seq', 0)} "
-                f"ack={decoded_row.get('tcp.ack', 0)} "
-                f"flags={'+'.join(flags) if flags else '-'}"
-            )
-        elif proto == "udp":
-            l4_fields = f"length={decoded_row.get('udp.length', 0)}"
-        elif proto in ("icmp", "icmpv6"):
-            prefix = proto
-            l4_fields = (
-                f"type={decoded_row.get(f'{prefix}.type', 0)} "
-                f"code={decoded_row.get(f'{prefix}.code', 0)}"
-            )
-        else:
-            l4_fields = ""
+    columns = ["TimeStamp", "Direction", "PacketBytes", "Size"]
+    for batch in _packet_capture_batches(trace, columns=columns):
+        if not _packet_capture_ready(batch):
+            continue
+        for _, row in batch.iterrows():
+            decoded_row = _decode_row(row.get("PacketBytes", ""))
+            src, dst, sport, dport, proto, _five = _decoded_tuple_fields(decoded_row)
+            match_row = {
+                "_src": src,
+                "_dst": dst,
+                "_src_port": sport,
+                "_dst_port": dport,
+                "_proto": proto,
+            }
+            if not _five_tuples_match(match_row, query):
+                continue
+            if proto == "tcp":
+                flags = decoded_row.get("tcp.flags", [])
+                l4_fields = (
+                    f"seq={decoded_row.get('tcp.seq', 0)} "
+                    f"ack={decoded_row.get('tcp.ack', 0)} "
+                    f"flags={'+'.join(flags) if flags else '-'}"
+                )
+            elif proto == "udp":
+                l4_fields = f"length={decoded_row.get('udp.length', 0)}"
+            elif proto in ("icmp", "icmpv6"):
+                prefix = proto
+                l4_fields = (
+                    f"type={decoded_row.get(f'{prefix}.type', 0)} "
+                    f"code={decoded_row.get(f'{prefix}.code', 0)}"
+                )
+            else:
+                l4_fields = ""
 
-        rows.append({
-            "TimeStamp": row.get("TimeStamp", 0),
-            "Direction": row.get("Direction", ""),
-            "Proto": proto,
-            "Src": f"{row['_src']}:{row['_src_port']}",
-            "Dst": f"{row['_dst']}:{row['_dst_port']}",
-            "L4 Fields": l4_fields,
-            "Size": int(row.get("Size", 0) or 0),
-        })
+            rows.append({
+                "TimeStamp": row.get("TimeStamp", 0),
+                "Direction": row.get("Direction", ""),
+                "Proto": proto,
+                "Src": f"{src}:{sport}",
+                "Dst": f"{dst}:{dport}",
+                "L4 Fields": l4_fields,
+                "Size": int(row.get("Size", 0) or 0),
+            })
+
+    if not rows:
+        return f"*No packets match 5-tuple `{five_tuple}`.*"
 
     timeline_df = pd.DataFrame(rows).sort_values("TimeStamp").reset_index(drop=True)
     lines = [
@@ -479,6 +581,19 @@ def _flow_label(src: str, dst: str, sport: int, dport: int, proto: str) -> str:
     return f"{src}:{sport} -> {dst}:{dport}/{proto}"
 
 
+def _packet_timestamp(row) -> int | None:
+    try:
+        value = row.get("TimeStamp", 0)
+    except AttributeError:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 @mcp.tool()
 def get_send_recv_latency(trace_id: str, top_n: int = 20) -> str:
     """Match Send → Recv packet pairs and report per-flow latency percentiles.
@@ -510,37 +625,85 @@ def get_send_recv_latency(trace_id: str, top_n: int = 20) -> str:
     trace = require_trace(trace_id)
     _ensure_dumper_ready(trace)
 
-    df = trace.packet_capture_df
-    if not _packet_capture_ready(df):
+    if not _packet_capture_available(trace):
         return _NO_PACKET_CAPTURE_MSG
 
-    if "Direction" not in df.columns or "TimeStamp" not in df.columns:
-        return _NO_PACKET_CAPTURE_MSG
+    # Stream in timestamp order. Keep only unmatched sends whose expiry is
+    # inside the bounded matching window, and match them when the corresponding
+    # recv arrives. Materialized xperf traces are globally sorted first; native
+    # event-store chunks are sorted per batch and can undercount if chunks are
+    # globally out of order.
+    pending_sends: dict[tuple, deque[tuple[int, dict[str, Any]]]] = {}
+    expiry_heap: list[tuple[int, tuple, int]] = []
+    per_flow_latencies: dict[str, list[int]] = {}
+    saw_send = False
+    saw_recv = False
 
-    # Index by matching key for Recv packets; for each Send, search for the
-    # earliest Recv with the same key and a positive small delta.
-    recv_index: dict[tuple, list[tuple[int, str, dict[str, Any]]]] = {}
-    send_rows: list[tuple[int, tuple, dict[str, Any]]] = []
+    def _evict_expired(now_ts: int) -> None:
+        while expiry_heap and expiry_heap[0][0] < now_ts:
+            _expires_at, key, send_ts = heapq.heappop(expiry_heap)
+            queue = pending_sends.get(key)
+            if not queue:
+                continue
+            while queue and queue[0][0] < now_ts - _MATCH_WINDOW_US:
+                queue.popleft()
+            if not queue:
+                pending_sends.pop(key, None)
 
-    for _, row in df.iterrows():
-        packet_hex = row.get("PacketBytes", "")
-        decoded = _decode_row(packet_hex)
-        if not decoded:
+    columns = ["TimeStamp", "Direction", "PacketBytes"]
+    for batch in _packet_capture_batches(trace, columns=columns, sort_by_time=True):
+        if not _packet_capture_ready(batch):
             continue
-        key = _matching_key(row, decoded)
-        if key is None:
+        if "Direction" not in batch.columns or "TimeStamp" not in batch.columns:
             continue
-        try:
-            ts = int(row.get("TimeStamp", 0))
-        except (TypeError, ValueError):
-            continue
-        direction = row.get("Direction", "")
-        if direction == "Recv":
-            recv_index.setdefault(key, []).append((ts, str(row.get("MiniportName", "")), decoded))
-        elif direction == "Send":
-            send_rows.append((ts, key, decoded))
+        for _, row in batch.iterrows():
+            ts = _packet_timestamp(row)
+            if ts is None:
+                continue
+            _evict_expired(ts)
+            decoded = _decode_row(row.get("PacketBytes", ""))
+            if not decoded:
+                continue
+            key = _matching_key(row, decoded)
+            if key is None:
+                continue
+            direction = str(row.get("Direction", "")).lower()
+            if direction == "send":
+                saw_send = True
+                pending_sends.setdefault(key, deque()).append((ts, decoded))
+                heapq.heappush(expiry_heap, (ts + _MATCH_WINDOW_US, key, ts))
+                continue
+            if direction != "recv":
+                continue
+            saw_recv = True
+            candidates = pending_sends.get(key)
+            if not candidates:
+                continue
+            while candidates and ts - candidates[0][0] > _MATCH_WINDOW_US:
+                candidates.popleft()
+            if not candidates:
+                pending_sends.pop(key, None)
+                continue
+            send_ts, send_decoded = candidates.popleft()
+            if not candidates:
+                pending_sends.pop(key, None)
+            if send_ts > ts:
+                continue
+            latency_us = ts - send_ts
+            proto_str = "tcp" if key[0] == "tcp" else "udp"
+            if proto_str == "tcp":
+                sport = send_decoded.get("tcp.src_port", 0)
+                dport = send_decoded.get("tcp.dst_port", 0)
+            else:
+                sport = send_decoded.get("udp.src_port", 0)
+                dport = send_decoded.get("udp.dst_port", 0)
+            flow_label = _flow_label(
+                send_decoded.get("ip.src", ""), send_decoded.get("ip.dst", ""),
+                int(sport or 0), int(dport or 0), proto_str,
+            )
+            per_flow_latencies.setdefault(flow_label, []).append(latency_us)
 
-    if not send_rows or not recv_index:
+    if not saw_send or not saw_recv:
         return (
             "*No matched Send/Recv pairs in packet capture data.*\n\n"
             "Either the trace contains only one direction, or the matching "
@@ -548,45 +711,6 @@ def get_send_recv_latency(trace_id: str, top_n: int = 20) -> str:
             "send and recv (common on a multi-NIC setup where the IPID is "
             "rewritten in transit)."
         )
-
-    # Sort recv lists by timestamp so we can binary-search.
-    for key in recv_index:
-        recv_index[key].sort(key=lambda x: x[0])
-
-    # Per-flow latency aggregation. Flow label = canonical send tuple.
-    per_flow_latencies: dict[str, list[int]] = {}
-
-    for send_ts, key, send_decoded in send_rows:
-        candidates = recv_index.get(key)
-        if not candidates:
-            continue
-        # Find the first recv ts >= send_ts within window. Linear scan is
-        # fine for our scales (sub-million-packet traces).
-        match_ts: int | None = None
-        for recv_ts, _miniport, _recv_decoded in candidates:
-            if recv_ts < send_ts:
-                continue
-            if recv_ts - send_ts > _MATCH_WINDOW_US:
-                break
-            match_ts = recv_ts
-            break
-
-        if match_ts is None:
-            continue
-
-        latency_us = match_ts - send_ts
-        proto_str = "tcp" if key[0] == "tcp" else "udp"
-        if proto_str == "tcp":
-            sport = send_decoded.get("tcp.src_port", 0)
-            dport = send_decoded.get("tcp.dst_port", 0)
-        else:
-            sport = send_decoded.get("udp.src_port", 0)
-            dport = send_decoded.get("udp.dst_port", 0)
-        flow_label = _flow_label(
-            send_decoded.get("ip.src", ""), send_decoded.get("ip.dst", ""),
-            int(sport or 0), int(dport or 0), proto_str,
-        )
-        per_flow_latencies.setdefault(flow_label, []).append(latency_us)
 
     if not per_flow_latencies:
         return (
@@ -623,6 +747,11 @@ def get_send_recv_latency(trace_id: str, top_n: int = 20) -> str:
         "*Latency is one-way Send→Recv elapsed microseconds. Meaningful on "
         "loopback and PTP-synced two-NIC setups; on unsynchronized multi-NIC "
         "systems the floor is dominated by clock skew.*",
+        "",
+        "*Native event-store scans use bounded timestamp-order matching and "
+        "evict candidates after the match window. If packet-capture chunks are "
+        "globally out of order, pair counts can be under-reported; xperf/"
+        "materialized traces are sorted before matching.*",
         "",
         format_table(result_df, max_rows=top_n),
     ]
@@ -717,29 +846,34 @@ def decode_packet(trace_id: str, timestamp_us: float) -> str:
     trace = require_trace(trace_id)
     _ensure_dumper_ready(trace)
 
-    df = trace.packet_capture_df
-    if not _packet_capture_ready(df):
+    if not _packet_capture_available(trace):
         return _NO_PACKET_CAPTURE_MSG
 
-    if "TimeStamp" not in df.columns:
-        return _NO_PACKET_CAPTURE_MSG
+    best_row: dict[str, Any] | None = None
+    best_delta: float | None = None
+    target = float(timestamp_us)
+    columns = ["TimeStamp", "Direction", "MiniportName", "PacketBytes", "Size"]
+    for batch in _packet_capture_batches(trace, columns=columns):
+        if not _packet_capture_ready(batch) or "TimeStamp" not in batch.columns:
+            continue
+        for _, row in batch.iterrows():
+            ts = _packet_timestamp(row)
+            if ts is None:
+                continue
+            delta = abs(float(ts) - target)
+            if best_delta is None or delta < best_delta:
+                best_delta = delta
+                best_row = row.to_dict()
 
-    timestamps = pd.to_numeric(df["TimeStamp"], errors="coerce")
-    valid = timestamps.dropna()
-    if valid.empty:
+    if best_row is None:
         return "*No packets with parseable timestamps in this trace.*"
 
-    target = float(timestamp_us)
-    diffs = (valid - target).abs()
-    closest_idx = diffs.idxmin()
-    row = df.loc[closest_idx]
-
-    packet_hex = row.get("PacketBytes", "")
+    packet_hex = best_row.get("PacketBytes", "")
     decoded = _decode_row(packet_hex)
-    actual_ts = int(row.get("TimeStamp", 0) or 0)
-    direction = row.get("Direction", "")
-    miniport = row.get("MiniportName", "")
-    size = int(row.get("Size", 0) or 0)
+    actual_ts = int(best_row.get("TimeStamp", 0) or 0)
+    direction = best_row.get("Direction", "")
+    miniport = best_row.get("MiniportName", "")
+    size = int(best_row.get("Size", 0) or 0)
 
     lines = [
         "**Decoded Packet**",

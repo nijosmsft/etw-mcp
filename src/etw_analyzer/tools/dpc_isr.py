@@ -1,4 +1,4 @@
-"""DPC/ISR analysis tools — based on xperf -a dpcisr histogram output."""
+"""DPC/ISR analysis tools over histogram and per-CPU DPC data."""
 
 from __future__ import annotations
 
@@ -7,6 +7,8 @@ from etw_analyzer.trace_state import TraceData, require_trace
 from etw_analyzer.formatting.markdown import format_table, format_pct
 
 import pandas as pd
+
+from etw_analyzer.native.aggregators.dpcisr import build_dpc_per_cpu_dataframe
 
 
 def _get_dpc_df(trace: TraceData) -> pd.DataFrame:
@@ -58,7 +60,13 @@ def get_dpc_summary(
 
     # Apply module filter
     if module_filter:
-        df = df[df["Module"].astype(str).str.contains(module_filter, case=False, na=False)]
+        use_regex = "|" in module_filter or "\\" in module_filter
+        df = df[df["Module"].astype(str).str.contains(
+            module_filter,
+            case=False,
+            na=False,
+            regex=use_regex,
+        )]
 
     if df.empty:
         return f"*No DPC/ISR events for module '{module_filter}'.*"
@@ -134,9 +142,9 @@ def get_dpc_per_cpu(
 ) -> str:
     """Get per-CPU DPC information.
 
-    Note: xperf dpcisr output includes per-CPU usage in the raw text.
-    This tool extracts it from the raw dpcisr output if available,
-    otherwise falls back to CPU sampling data filtered to DPC context.
+    Uses raw dpcisr text when available, otherwise derives per-CPU usage
+    from native structured DPC events. If neither is present, falls back to
+    CPU sampling data filtered to DPC-like modules.
 
     Args:
         trace_id: ID returned by load_trace.
@@ -153,12 +161,82 @@ def get_dpc_per_cpu(
         if result is not None:
             return result
 
+    # Native mode may have structured DPC events but no xperf-format raw text.
+    result = _structured_per_cpu_dpc(trace, module_filter, max_rows)
+    if result is not None:
+        return result
+
     # Fall back to CPU sampling data if available
     cpu_df = trace.raw_csv.get("cpu_sampling")
     if cpu_df is not None and "Module" in cpu_df.columns:
         return _dpc_from_sampling(cpu_df, module_filter, max_rows)
 
     return "*No per-CPU DPC data available.*"
+
+
+def _structured_per_cpu_dpc(
+    trace: TraceData,
+    module_filter: str | None,
+    max_rows: int,
+) -> str | None:
+    """Render native structured DPC events as per-CPU DPC usage."""
+    per_cpu = build_dpc_per_cpu_dataframe(trace)
+    if per_cpu is None or per_cpu.empty:
+        return None
+
+    df = per_cpu.copy()
+    if module_filter:
+        df = df[df["Module"].astype(str).str.contains(module_filter, case=False, na=False, regex=False)]
+    if df.empty:
+        return None
+
+    df["DPC_us"] = pd.to_numeric(df["DPC_us"], errors="coerce").fillna(0)
+    df["CPU"] = pd.to_numeric(df["CPU"], errors="coerce").fillna(-1).astype("int64")
+    if "Pct" in df.columns:
+        df["Pct"] = pd.to_numeric(df["Pct"], errors="coerce").fillna(0.0)
+    else:
+        df["Pct"] = 0.0
+    df = df[(df["CPU"] >= 0) & (df["DPC_us"] > 0)]
+    if df.empty:
+        return None
+
+    lines_out = ["**DPC Per-CPU Usage**", ""]
+    rows = []
+    for module, group in df.groupby("Module", dropna=False):
+        total_usec = float(group["DPC_us"].sum())
+        if total_usec <= 0:
+            continue
+        top = group.sort_values("DPC_us", ascending=False).iloc[0]
+        rows.append({
+            "Module": module,
+            "Total DPC (us)": f"{int(total_usec):,}",
+            "Active CPUs": int(group["CPU"].nunique()),
+            "Top CPU": f"CPU {int(top['CPU'])} ({float(top['Pct']):.1f}%)",
+            "_sort": total_usec,
+        })
+
+    if not rows:
+        return None
+
+    result = pd.DataFrame(rows).sort_values("_sort", ascending=False).drop(columns=["_sort"])
+    lines_out.append(format_table(result, max_rows=max_rows))
+
+    top_module = str(result.iloc[0]["Module"])
+    cpu_rows = (
+        df[df["Module"].astype(str) == top_module]
+        .sort_values("DPC_us", ascending=False)
+        .head(max_rows)
+    )
+    if not cpu_rows.empty:
+        display = pd.DataFrame({
+            "CPU": cpu_rows["CPU"].astype(int),
+            "DPC Time (us)": cpu_rows["DPC_us"].astype(int).map(lambda v: f"{v:,}"),
+            "% of CPU": cpu_rows["Pct"].map(lambda v: f"{float(v):.2f}%"),
+        })
+        lines_out.append(f"\n**{top_module} per-CPU detail:**")
+        lines_out.append(format_table(display, max_rows=max_rows))
+
+    return "\n".join(lines_out)
 
 
 def _parse_per_cpu_dpc(raw_text: str, module_filter: str | None) -> str | None:
@@ -251,7 +329,7 @@ def _dpc_from_sampling(cpu_df: pd.DataFrame, module_filter: str | None, max_rows
     # This is approximate — CPU sampling data doesn't have DPC-specific columns
     # but modules like xdp.sys, ndis.sys are primarily DPC context
     if module_filter:
-        cpu_df = cpu_df[cpu_df["Module"].astype(str).str.contains(module_filter, case=False, na=False)]
+        cpu_df = cpu_df[cpu_df["Module"].astype(str).str.contains(module_filter, case=False, na=False, regex=False)]
 
     if cpu_df.empty:
         return "*No matching samples.*"

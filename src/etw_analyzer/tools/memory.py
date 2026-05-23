@@ -40,14 +40,7 @@ def _get_pool_df(trace: TraceData) -> pd.DataFrame:
         except Exception:
             pass
 
-    raise ValueError(
-        "No pool allocation data available. The trace must be collected with "
-        "pool profiling enabled:\n"
-        "  wpr -start Pool -filemode; Start-Sleep 1; wpr -stop C:\\traces\\pool-trace.etl\n"
-        "Or combine with CPU profiling:\n"
-        "  wpr -start \"C:\\xdp-test\\xdptrace.wprp!CpuCswitchSample\" "
-        "-start Pool -filemode; Start-Sleep 1; wpr -stop C:\\traces\\trace.etl"
-    )
+    return pd.DataFrame()
 
 
 @mcp.tool()
@@ -76,6 +69,14 @@ def get_memory_pools(
     """
     trace = require_trace(trace_id)
     df = _get_pool_df(trace)
+    if df.empty:
+        return (
+            "*No pool allocation data available.*\n\n"
+            "Pool analysis is xperf-only and requires a trace collected with "
+            "pool profiling enabled, for example:\n"
+            "  wpr -start Pool -filemode; Start-Sleep 1; "
+            "wpr -stop C:\\traces\\pool-trace.etl"
+        )
 
     # Apply filters
     if tag_filter:

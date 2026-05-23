@@ -16,6 +16,7 @@ from unittest.mock import patch
 import pandas as pd
 import pytest
 
+from etw_analyzer.native.event_store import EventStoreTimebase, NativeEventStoreWriter
 from etw_analyzer.parsing.wpa_exporter import (
     EVENT_HANDLERS,
     _handle_afd_close,
@@ -239,12 +240,15 @@ def _register_synthetic(
     afd_accept=None,
     afd_close=None,
     ndis_drops=None,
+    event_store=None,
+    mode="xperf",
 ) -> TraceData:
     """Register a TraceData with pre-populated event DataFrames."""
     trace = TraceData(
         trace_id=trace_id,
         etl_path=Path(f"C:\\fake\\{trace_id}.etl"),
         export_dir=Path(f"C:\\fake\\.etw-export-{trace_id}"),
+        mode=mode,
         tcpip_connect_df=tcpip_connect,
         tcpip_accept_df=tcpip_accept,
         afd_recv_df=afd_recv,
@@ -253,6 +257,7 @@ def _register_synthetic(
         afd_accept_df=afd_accept,
         afd_close_df=afd_close,
         ndis_drops_df=ndis_drops,
+        event_store=event_store,
     )
     trace._dumper_ready.set()
     register_trace(trace)
@@ -545,6 +550,84 @@ class TestSocketAffinityCheck:
         _register_synthetic("aff4")
         out = get_socket_affinity_check("aff4")
         assert "No AFD socket event data" in out
+
+
+def _store_header(sequence: int, qpc: int, *, pid: int = 1234, cpu: int = 4) -> dict:
+    return {
+        "EventSequence": sequence,
+        "TimeStampQpc": qpc,
+        "CPU": cpu,
+        "Process Name": "server.exe",
+        "PID": pid,
+        "ThreadID": 5678,
+    }
+
+
+class TestNetworkExtraEventStore:
+    def test_afd_and_ndis_tools_read_event_store_only_trace(self, tmp_path):
+        writer = NativeEventStoreWriter(
+            tmp_path / ".etw-export-extra-store",
+            run_id="extra-store",
+            timebase=EventStoreTimebase(qpc_origin=0, perf_freq=1_000_000),
+            staging=False,
+            max_rows_per_part=1,
+        )
+        writer.append("afd_connect", {
+            **_store_header(1, 1_000_000),
+            "SocketHandle": 0x100,
+            "LocalAddr": "10.0.0.5",
+            "LocalPort": 5000,
+            "RemoteAddr": "10.0.0.7",
+            "RemotePort": 40000,
+        })
+        for index, qpc in enumerate([1_000_000, 1_000_001, 1_000_002, 2_000_000], start=2):
+            writer.append("afd_recv", {
+                **_store_header(index, qpc, cpu=4 if index < 5 else 5),
+                "SocketHandle": 0x100,
+                "Size": 64,
+                "CompletionStatus": 0,
+            })
+        writer.append("afd_send", {
+            **_store_header(6, 2_100_000),
+            "SocketHandle": 0x100,
+            "Size": 32,
+            "CompletionStatus": 0,
+        })
+        writer.append("afd_close", {
+            **_store_header(7, 3_000_000),
+            "SocketHandle": 0x100,
+        })
+        writer.append("ndis_drops", {
+            **_store_header(8, 4_000_000, pid=0, cpu=1),
+            "MiniportName": "mlx5.sys",
+            "Reason": "MissingBuffer",
+            "Size": 1500,
+        })
+        writer.append("ndis_drops", {
+            **_store_header(9, 4_000_100, pid=0, cpu=1),
+            "MiniportName": "mlx5.sys",
+            "Reason": "MissingBuffer",
+            "Size": 1500,
+        })
+        store = writer.commit()
+        _register_synthetic("extra_store", mode="native", event_store=store)
+
+        drops = get_packet_drops("extra_store")
+        assert "NDIS Packet Drops" in drops
+        assert "MissingBuffer" in drops
+
+        batching = get_afd_batching("extra_store")
+        assert "AFD Batching" in batching
+        assert "0x100" in batching
+
+        lifecycle = get_socket_lifecycle("extra_store")
+        assert "AFD Socket Lifecycle" in lifecycle
+        assert "0x100" in lifecycle
+        assert "288" in lifecycle
+
+        affinity = get_socket_affinity_check("extra_store")
+        assert "Socket Affinity Check" in affinity
+        assert "0x100" in affinity
 
 
 # ---------------------------------------------------------------------------

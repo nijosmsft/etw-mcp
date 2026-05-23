@@ -10,8 +10,8 @@ What this module does:
 1. Walks the trace via :class:`EtwConsumer` once.
 2. For every event, looks up ``(provider_guid, opcode, version)`` in a
    pre-built dispatch table populated by :func:`mof.register_kernel_handlers`.
-3. Decodes via the matching MOF handler, attaches CPU / TimeStamp /
-   ProcessId / ThreadId from the event record header.
+3. Decodes via the matching MOF handler, attaches CPU / raw-QPC
+   TimeStamp / ProcessId / ThreadId from the event record header.
 4. Pairs ``StackWalk`` events with the prior ``SampledProfile`` /
    ``CSwitch`` / etc. event on the same QPC timestamp via a small LRU
    ring buffer (feasibility ``exp4c`` showed the join key works under
@@ -19,6 +19,8 @@ What this module does:
 5. Buckets row dicts into the canonical-class DataFrame map so the
    ``_DUMPER_EVENT_CLASSES`` consumer in ``tools.trace_mgmt`` can use
    them without special-casing the mode.
+6. Normalizes event DataFrame timestamps to xperf-relative microseconds
+   using EventTrace/Header + TRACE_LOGFILE_HEADER PerfFreq.
 
 The dispatch table is keyed on ``(guid, opcode, version)`` with a
 ``(guid, opcode, None)`` wildcard fallback for version-agnostic
@@ -31,17 +33,19 @@ import ctypes
 import logging
 import time
 from collections import Counter, OrderedDict, deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Iterable, Optional
+from typing import Any, Callable, Iterable, Optional
 
 import pandas as pd
 
 from .bindings.types import EVENT_RECORD, guid_string
-from .consumer import EtwConsumer, NativeConsumerError
+from .consumer import EtwConsumer, NativeConsumerError, TraceLogfileMetadata
 from .decoder import TdhDecoder
+from .event_store import EventStoreTimebase, NativeEventStore, NativeEventStoreWriter
 from .manifest import MANIFEST_PROVIDERS, lookup as manifest_lookup
 from .mof import kernel_provider_guids, register_kernel_handlers
+from .schemas import canonical_event_class as canonical_store_event_class
 
 
 logger = logging.getLogger(__name__)
@@ -187,6 +191,14 @@ _STACKABLE_CLASSES: frozenset[str] = frozenset({
 NativeRowDict = dict
 
 
+_QPC_TIMESTAMP_COLUMNS: tuple[str, ...] = (
+    "TimeStamp",
+    "InitialTime",
+    "EventTimeStamp",
+    "StackTimeStamp",
+)
+
+
 @dataclass
 class ExtractStats:
     """Diagnostic counters from a single :func:`extract_events` call."""
@@ -201,6 +213,7 @@ class ExtractStats:
     stacks_orphan: int
     tdh_schemas_cached: int = 0
     tdh_negative_cached: int = 0
+    logfile_metadata: list[TraceLogfileMetadata] = field(default_factory=list)
 
 
 def _header_to_dict(record: EVENT_RECORD) -> dict:
@@ -219,6 +232,86 @@ def _header_to_dict(record: EVENT_RECORD) -> dict:
         "Opcode": int(hdr.EventDescriptor.Opcode),
         "Version": int(hdr.EventDescriptor.Version),
     }
+
+
+def _first_positive_perf_frequency(metadata: list[TraceLogfileMetadata]) -> float | None:
+    for item in metadata:
+        freq = int(getattr(item, "perf_freq", 0) or 0)
+        if freq > 0:
+            return float(freq)
+    return None
+
+
+def _timestamp_origin_qpc(results: dict[str, pd.DataFrame]) -> float | None:
+    """Return the raw QPC timestamp that represents trace-relative zero."""
+
+    header = results.get("EventTrace/Header")
+    if header is not None and not header.empty and "TimeStamp" in header.columns:
+        values = pd.to_numeric(header["TimeStamp"], errors="coerce").dropna()
+        if not values.empty:
+            return float(values.min())
+
+    candidates: list[float] = []
+    for df in results.values():
+        if df is None or df.empty or "TimeStamp" not in df.columns:
+            continue
+        values = pd.to_numeric(df["TimeStamp"], errors="coerce").dropna()
+        if not values.empty:
+            candidates.append(float(values.min()))
+    if candidates:
+        return min(candidates)
+    return None
+
+
+def _normalize_native_timestamps(
+    results: dict[str, pd.DataFrame],
+    logfile_metadata: list[TraceLogfileMetadata],
+) -> None:
+    """Convert raw native QPC timestamps to xperf-relative microseconds.
+
+    Stack pairing happens while rows are still in raw QPC units. Once the
+    row buckets are materialized, every event DataFrame must match xperf's
+    tool-facing convention: timestamps are integer microseconds relative to
+    trace start. The EventTrace/Header row supplies the QPC origin, and the
+    ETL logfile header supplies the QPC frequency.
+    """
+
+    freq = _first_positive_perf_frequency(logfile_metadata)
+    origin = _timestamp_origin_qpc(results)
+    if freq is None or freq <= 0 or origin is None:
+        return
+
+    for df in results.values():
+        if df is None or df.empty:
+            continue
+        for col in _QPC_TIMESTAMP_COLUMNS:
+            if col not in df.columns:
+                continue
+            numeric = pd.to_numeric(df[col], errors="coerce")
+            if numeric.dropna().empty:
+                continue
+            converted = ((numeric - origin) * 1_000_000.0 / freq).round()
+            if converted.notna().all():
+                df[col] = converted.astype("int64")
+            else:
+                df[col] = converted
+
+
+def _enrich_native_sampled_profile(results: dict[str, pd.DataFrame]) -> None:
+    """Backfill SampledProfile PID/process attribution from native thread maps."""
+
+    samples = results.get("SampledProfile")
+    if samples is None or samples.empty:
+        return
+    try:
+        from etw_analyzer.native.aggregators.profile_detail import (
+            enrich_sampled_profile_attribution,
+        )
+    except Exception:
+        return
+    enriched = enrich_sampled_profile_attribution(samples, results)
+    if enriched is not samples:
+        results["SampledProfile"] = enriched
 
 
 def extract_events(
@@ -410,22 +503,6 @@ def extract_events(
         stats = cons.run()
     elapsed = time.perf_counter() - start
 
-    if stats_sink is not None:
-        stats_sink.append(
-            ExtractStats(
-                event_count=stats.event_count,
-                elapsed_seconds=elapsed,
-                bytes_processed=stats.bytes_processed,
-                provider_counts=dict(provider_counts),
-                decoded_counts=dict(decoded_counts),
-                events_lost=stats.events_lost,
-                stacks_paired=stacks_paired,
-                stacks_orphan=stacks_orphan,
-                tdh_schemas_cached=(tdh_decoder.schema_count() if tdh_decoder else 0),
-                tdh_negative_cached=(tdh_decoder.negative_count() if tdh_decoder else 0),
-            )
-        )
-
     # Build the result map. Every requested class is present (empty
     # DataFrame if nothing decoded). Auxiliary classes (StackWalk,
     # Image/Load, etc.) are *also* returned when the caller hasn't pinned
@@ -440,7 +517,321 @@ def extract_events(
                 continue
             result[name] = pd.DataFrame(rows)
 
+    _enrich_native_sampled_profile(result)
+    _normalize_native_timestamps(result, stats.logfile_metadata)
+
+    if stats_sink is not None:
+        stats_sink.append(
+            ExtractStats(
+                event_count=stats.event_count,
+                elapsed_seconds=elapsed,
+                bytes_processed=stats.bytes_processed,
+                provider_counts=dict(provider_counts),
+                decoded_counts=dict(decoded_counts),
+                events_lost=stats.events_lost,
+                stacks_paired=stacks_paired,
+                stacks_orphan=stacks_orphan,
+                tdh_schemas_cached=(tdh_decoder.schema_count() if tdh_decoder else 0),
+                tdh_negative_cached=(tdh_decoder.negative_count() if tdh_decoder else 0),
+                logfile_metadata=stats.logfile_metadata,
+            )
+        )
+
     return result
+
+
+def extract_events_to_store(
+    etl_paths: Path | str | Iterable[Path | str],
+    export_dir: Path | str,
+    *,
+    event_classes: Optional[set[str]] = None,
+    providers: Optional[set[str]] = None,
+    stats_sink: Optional[list[ExtractStats]] = None,
+    run_id: str | None = None,
+    max_rows_per_part: int | None = None,
+    max_bytes_per_part: int | None = None,
+    capture_stacks: bool = True,
+) -> NativeEventStore:
+    """Stream native ProcessTrace rows into a chunked event store.
+
+    Unlike :func:`extract_events`, this path never builds DataFrames or a
+    ``rows_by_class`` map. Stackable rows are held only in the bounded
+    StackWalk pairing buffer; rows are written to the store when paired,
+    evicted, or flushed at the end of extraction.
+    """
+
+    if isinstance(etl_paths, (str, Path)):
+        paths_iter: Iterable[Path | str] = [etl_paths]
+    else:
+        paths_iter = list(etl_paths)
+
+    requested = (
+        set(event_classes)
+        if event_classes is not None
+        else set(CANONICAL_EVENT_CLASSES) | set(KERNEL_AUXILIARY_CLASSES)
+    )
+    requested_store_classes = {
+        store_name
+        for name in requested
+        if (store_name := _store_event_class(name)) is not None
+    }
+
+    writer_kwargs: dict[str, Any] = {
+        "run_id": run_id,
+        "event_classes": sorted(requested_store_classes),
+    }
+    if max_rows_per_part is not None:
+        writer_kwargs["max_rows_per_part"] = max_rows_per_part
+    if max_bytes_per_part is not None:
+        writer_kwargs["max_bytes_per_part"] = max_bytes_per_part
+    store_writer = NativeEventStoreWriter(
+        export_dir,
+        **writer_kwargs,
+    )
+
+    provider_filter: Optional[set[str]] = None
+    if providers is not None:
+        provider_filter = {g.lower() for g in providers}
+
+    provider_counts: Counter[str] = Counter()
+    decoded_counts: Counter[str] = Counter()
+    pending: "OrderedDict[tuple[int, int], tuple[str, NativeRowDict]]" = OrderedDict()
+    stacks_paired = 0
+    stacks_orphan = 0
+    event_sequence = 0
+    min_seen_qpc: int | None = None
+    header_origin_qpc: int | None = None
+
+    tdh_decoder: Optional[TdhDecoder] = None
+
+    def _ensure_tdh() -> TdhDecoder:
+        nonlocal tdh_decoder
+        if tdh_decoder is None:
+            tdh_decoder = TdhDecoder()
+            for kg in _KERNEL_PROVIDER_GUIDS:
+                tdh_decoder.mark_provider_skip(kg)
+        return tdh_decoder
+
+    def _is_store_requested(canonical: str) -> bool:
+        store_name = _store_event_class(canonical)
+        if store_name is None:
+            return False
+        if event_classes is None:
+            return True
+        return canonical in requested or store_name in requested_store_classes
+
+    def _append_store(canonical: str, row: NativeRowDict) -> None:
+        nonlocal min_seen_qpc
+        if not _is_store_requested(canonical):
+            return
+        qpc = _row_qpc(row)
+        if qpc is not None:
+            min_seen_qpc = qpc if min_seen_qpc is None else min(min_seen_qpc, qpc)
+        store_writer.append(canonical, row)
+
+    def _flush_pending_key(key: tuple[int, int]) -> None:
+        item = pending.pop(key, None)
+        if item is None:
+            return
+        canonical, row = item
+        _append_store(canonical, row)
+
+    def _flush_oldest_pending() -> None:
+        if not pending:
+            return
+        canonical, row = pending.popitem(last=False)[1]
+        _append_store(canonical, row)
+
+    def on_event(record: EVENT_RECORD) -> None:
+        nonlocal stacks_paired, stacks_orphan, event_sequence, header_origin_qpc
+
+        event_sequence += 1
+        guid = guid_string(record.EventHeader.ProviderId)
+        provider_counts[guid] += 1
+        if provider_filter is not None and guid not in provider_filter:
+            return
+
+        opcode = int(record.EventHeader.EventDescriptor.Opcode)
+        version = int(record.EventHeader.EventDescriptor.Version)
+        entry = _lookup_handler(guid, opcode, version)
+
+        manifest_entry = None
+        if entry is not None:
+            canonical = entry[0]
+        else:
+            event_id = int(record.EventHeader.EventDescriptor.Id)
+            manifest_entry = manifest_lookup(guid, event_id)
+            if manifest_entry is None:
+                return
+            canonical = manifest_entry[0]
+
+        # Streaming mode can request a small summary event set. Avoid paying
+        # payload-copy and decode costs for high-volume detail classes that
+        # will not be stored or aggregated.
+        if canonical == "StackWalk":
+            if not capture_stacks:
+                return
+        elif not _is_store_requested(canonical):
+            return
+
+        payload_len = int(record.UserDataLength)
+        if payload_len and record.UserData:
+            try:
+                payload = ctypes.string_at(record.UserData, payload_len)
+            except OSError:
+                return
+        else:
+            payload = b""
+
+        hdr = _header_to_dict(record)
+
+        if entry is not None:
+            fn = entry[1]
+            try:
+                row = fn(payload, hdr)
+            except Exception:
+                logger.debug("MOF decoder for %s raised", canonical, exc_info=True)
+                return
+            if row is None:
+                return
+        else:
+            assert manifest_entry is not None
+            mapper = manifest_entry[1]
+            decoder = _ensure_tdh()
+            try:
+                fields = decoder.decode_event(record)
+            except Exception:
+                logger.debug(
+                    "TDH decode for (%s,%d) raised", guid, event_id, exc_info=True
+                )
+                return
+            if fields is None:
+                return
+            try:
+                row = mapper(fields, hdr, payload, decoder)
+            except Exception:
+                logger.debug(
+                    "Manifest mapper for %s raised", canonical, exc_info=True
+                )
+                return
+            if row is None:
+                return
+
+        decoded_counts[canonical] += 1
+        if canonical == "EventTrace/Header":
+            qpc = _row_qpc(row)
+            if qpc is not None:
+                header_origin_qpc = (
+                    qpc if header_origin_qpc is None else min(header_origin_qpc, qpc)
+                )
+
+        if canonical == "StackWalk":
+            target_ts = int(row.get("EventTimeStamp", 0))
+            target_tid = int(row.get("ThreadId", 0))
+            paired = pending.pop((target_ts, target_tid), None)
+            if paired is None:
+                for key in list(pending.keys()):
+                    if key[0] == target_ts:
+                        paired = pending.pop(key)
+                        break
+            if paired is not None:
+                paired_canonical, paired_row = paired
+                paired_row["Stack"] = row["Stack"]
+                _append_store(paired_canonical, paired_row)
+                stacks_paired += 1
+            else:
+                stacks_orphan += 1
+            return
+
+        _prepare_store_row(canonical, row, hdr, event_sequence)
+        if canonical in _STACKABLE_CLASSES and _is_store_requested(canonical):
+            row.setdefault("Stack", None)
+            key = (int(hdr["TimeStamp"]), int(hdr["ThreadId"]))
+            if key in pending:
+                _flush_pending_key(key)
+            pending[key] = (canonical, row)
+            while len(pending) > _PENDING_STACK_CAPACITY:
+                _flush_oldest_pending()
+            return
+
+        _append_store(canonical, row)
+
+    start = time.perf_counter()
+    with EtwConsumer(paths_iter, on_event) as cons:
+        stats = cons.run()
+    elapsed = time.perf_counter() - start
+
+    while pending:
+        _flush_oldest_pending()
+
+    perf_freq = _first_positive_perf_frequency(stats.logfile_metadata)
+    store_writer.timebase = EventStoreTimebase(
+        qpc_origin=header_origin_qpc if header_origin_qpc is not None else min_seen_qpc,
+        perf_freq=perf_freq,
+    )
+    store = store_writer.commit()
+
+    extract_stats = ExtractStats(
+        event_count=stats.event_count,
+        elapsed_seconds=elapsed,
+        bytes_processed=stats.bytes_processed,
+        provider_counts=dict(provider_counts),
+        decoded_counts=dict(decoded_counts),
+        events_lost=stats.events_lost,
+        stacks_paired=stacks_paired,
+        stacks_orphan=stacks_orphan,
+        tdh_schemas_cached=(tdh_decoder.schema_count() if tdh_decoder else 0),
+        tdh_negative_cached=(tdh_decoder.negative_count() if tdh_decoder else 0),
+        logfile_metadata=stats.logfile_metadata,
+    )
+    if stats_sink is not None:
+        stats_sink.append(extract_stats)
+
+    return store
+
+
+def _store_event_class(event_class: str) -> str | None:
+    try:
+        return canonical_store_event_class(event_class)
+    except KeyError:
+        return None
+
+
+def _row_qpc(row: NativeRowDict) -> int | None:
+    for key in ("TimeStampQpc", "TimeStamp", "EventTimeStamp", "StackTimeStamp"):
+        value = row.get(key)
+        if value is not None:
+            return int(value)
+    return None
+
+
+def _prepare_store_row(
+    canonical: str,
+    row: NativeRowDict,
+    hdr: dict,
+    event_sequence: int,
+) -> None:
+    row.setdefault("EventSequence", int(event_sequence))
+    row.setdefault(
+        "TimeStampQpc",
+        int(row.get("TimeStamp", hdr.get("TimeStamp", 0)) or 0),
+    )
+    row.setdefault(
+        "CPU",
+        int(row.get("CPU", hdr.get("ProcessorNumber", -1)) or 0),
+    )
+    row.setdefault(
+        "ProcessId",
+        int(row.get("ProcessId", row.get("PID", hdr.get("ProcessId", 0))) or 0),
+    )
+    row.setdefault(
+        "ThreadId",
+        int(row.get("ThreadId", hdr.get("ThreadId", 0)) or 0),
+    )
+
+    store_name = _store_event_class(canonical)
+    if store_name in {"process", "thread", "image"}:
+        row.setdefault("Type", canonical.split("/", 1)[1] if "/" in canonical else canonical)
 
 
 def count_events_by_provider(
@@ -472,5 +863,6 @@ __all__ = [
     "KERNEL_AUXILIARY_CLASSES",
     "ExtractStats",
     "extract_events",
+    "extract_events_to_store",
     "count_events_by_provider",
 ]
