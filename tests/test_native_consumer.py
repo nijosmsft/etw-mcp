@@ -365,3 +365,60 @@ def test_load_trace_native_large_produces_sampled_profile(isolate_traces):
     # The trace ships ~2.5M PerfInfo events; require at least 100K to
     # tolerate future re-captures.
     assert len(df) >= 100_000
+
+
+@pytest.mark.slow
+@need_large
+def test_native_extract_pairs_stacks_on_large_trace():
+    """Phase N2 acceptance: at least 1000 SampledProfile rows on the large
+    trace must carry a non-empty Stack list after the streaming pairing in
+    ``extract.extract_events``. The buffer is bounded (1024 entries) so
+    most samples evict before their stack arrives, but the pairing rate is
+    high enough on the captured trace for a four-digit lower bound."""
+    from etw_analyzer.native.extract import extract_events
+
+    result = extract_events(
+        LARGE_ETL,
+        event_classes={"SampledProfile"},
+    )
+    sp = result["SampledProfile"]
+    assert len(sp) > 100_000
+    assert "Stack" in sp.columns
+    with_stack = sp["Stack"].apply(lambda s: s is not None).sum()
+    assert with_stack >= 1000, (
+        f"Expected >=1000 SampledProfile rows with a paired Stack; got {with_stack}"
+    )
+
+
+@pytest.mark.slow
+@need_large
+def test_native_extract_decodes_kernel_event_classes():
+    """Phase N2 acceptance: kernel events for which we shipped MOF decoders
+    must produce non-empty DataFrames on the large trace."""
+    from etw_analyzer.native.extract import extract_events
+
+    # Pull every-class extraction to cover CSwitch, StackWalk, ImageLoad,
+    # ReadyThread, Process, DPC/ISR.
+    result = extract_events(LARGE_ETL)
+
+    # SampledProfile dominates the trace.
+    assert len(result["SampledProfile"]) > 100_000
+    # CSwitch fires every context switch — hundreds of thousands.
+    assert len(result["CSwitch"]) > 10_000
+    # StackWalk is paired against samples; the count is high on traces
+    # captured with -stackwalk enabled.
+    assert "StackWalk" in result and len(result["StackWalk"]) > 1_000
+    # ImageLoad covers user-mode DLLs (Image/Load) plus the kernel
+    # driver rundown (Image/DCStart). At least one of each.
+    image_loads = result.get("Image/Load")
+    image_dcstart = result.get("Image/DCStart")
+    assert image_loads is not None and len(image_loads) >= 10
+    assert image_dcstart is not None and len(image_dcstart) >= 10
+    # The kernel rundown contains tcpip.sys + ntoskrnl on every Win10+
+    # box. Match either via DCStart since Image/Load tends to be user-mode.
+    dc_names = image_dcstart["FileName"].str.lower().fillna("")
+    assert (
+        dc_names.str.contains("tcpip").any()
+        or dc_names.str.contains("ntoskrnl").any()
+        or dc_names.str.contains("ntdll").any()
+    )
