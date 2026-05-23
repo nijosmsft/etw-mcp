@@ -1,20 +1,20 @@
 # WPR Trace Analyzer MCP Server
 
-An [MCP](https://modelcontextprotocol.io/) server that lets AI coding assistants analyze Windows WPR/ETW traces (`.etl` files). Load a trace, then ask questions in natural language — the server decodes the ETL in-process via `OpenTraceW` (with a legacy `xperf.exe` fallback) and returns structured results.
+An [MCP](https://modelcontextprotocol.io/) server that lets AI coding assistants analyze Windows WPR/ETW traces (`.etl` files). Load a trace, then ask questions in natural language — the server uses a fast native ETW path by default and can use `xperf.exe` for fallback and full WPA-style coverage.
 
 Works with any Windows performance trace: networking (tcpip.sys, NDIS, NIC drivers, HTTP.sys), kernel (DPCs, ISRs, context switches), and application workloads.
 
 ### Quick Install
 
-Copy-paste this into Claude Code, Copilot, or any AI assistant to install automatically:
+Copy-paste this into Claude Code, Copilot, or any AI assistant to install automatically. Use `.mcp.json` for Claude Code and `.vscode\mcp.json` for VS Code Copilot; the JSON body is shown in the setup examples below.
 
 ```
 Install the WPR trace analyzer MCP server on this Windows machine:
 1. Run: winget install astral-sh.uv (skip if uv is already installed)
-2. Check if xperf.exe exists at "C:\Program Files (x86)\Windows Kits\10\Windows Performance Toolkit\xperf.exe". If not, run: winget install Microsoft.WindowsSDK
-3. Add this MCP server config to .mcp.json:
-   {"mcpServers":{"wpr-trace-analyzer":{"type":"stdio","command":"uv","args":["run","--no-project","--with","https://github.com/nijosmsft/wpr-mcp-server/releases/download/v0.1.0/wpr_mcp_server-0.1.0-py3-none-any.whl","python","-m","etw_analyzer.server"],"env":{"_NT_SYMBOL_PATH":"srv*C:\\symbols*https://msdl.microsoft.com/download/symbols"}}}}
-4. Verify: run "uv run --no-project --with https://github.com/nijosmsft/wpr-mcp-server/releases/download/v0.1.0/wpr_mcp_server-0.1.0-py3-none-any.whl python -m etw_analyzer.server" and confirm it starts
+2. Install Windows Performance Toolkit for complete analysis: check if xperf.exe exists at "C:\Program Files (x86)\Windows Kits\10\Windows Performance Toolkit\xperf.exe". If not, run: winget install Microsoft.WindowsSDK
+3. Add the MCP server config shown below to your assistant's MCP config file.
+   {"mcpServers":{"wpr-trace-analyzer":{"type":"stdio","command":"uv","args":["run","--no-project","--with","https://github.com/nijosmsft/wpr-mcp-server/releases/download/<release-tag>/<wheel-file>.whl","python","-m","etw_analyzer.server"],"env":{"_NT_SYMBOL_PATH":"srv*C:\\symbols*https://msdl.microsoft.com/download/symbols"}}}}
+4. Verify: run "uv run --no-project --with https://github.com/nijosmsft/wpr-mcp-server/releases/download/<release-tag>/<wheel-file>.whl python -m etw_analyzer.server" and confirm it starts
 ```
 
 ## Features
@@ -43,16 +43,16 @@ Install the WPR trace analyzer MCP server on this Windows machine:
 ```powershell
 # 1. Install prerequisites — skip any you already have
 winget install astral-sh.uv              # Python package manager
-winget install Microsoft.WindowsSDK      # Optional — only needed for the xperf fallback
+winget install Microsoft.WindowsSDK      # Recommended — provides xperf for fallback and full analysis coverage
 
 # 2. Verify the latest release wheel starts (Ctrl+C to stop)
-uv run --no-project --with https://github.com/nijosmsft/wpr-mcp-server/releases/download/v0.1.0/wpr_mcp_server-0.1.0-py3-none-any.whl python -m etw_analyzer.server
+uv run --no-project --with https://github.com/nijosmsft/wpr-mcp-server/releases/download/<release-tag>/<wheel-file>.whl python -m etw_analyzer.server
 ```
 
 - **uv** automatically downloads Python, creates a virtual environment, and installs all dependencies on first run. No separate Python install needed.
-- **Release wheel** — use the wheel URL from the latest [GitHub release](https://github.com/nijosmsft/wpr-mcp-server/releases). The examples above use `v0.1.0`; replace the tag and wheel filename when installing a newer release. Maintainers can publish that asset with the manual **Manual release** GitHub Actions workflow.
-- **Native ETW consumer (default)** — the server decodes ETL files in-process via `OpenTraceW`/`tdh.dll`. No external tools needed on a recent Windows build.
-- **xperf.exe (fallback)** — installed as part of the Windows Performance Toolkit (included in the Windows SDK). Only required if you opt out of the native pipeline with `mode="xperf"` or `WPR_MCP_MODE=xperf`, or when running on an older Windows build where the native bindings can't load. Expected location: `C:\Program Files (x86)\Windows Kits\10\Windows Performance Toolkit\xperf.exe`
+- **Release wheel** — use the `.whl` asset URL from the latest [GitHub release](https://github.com/nijosmsft/wpr-mcp-server/releases). The examples use `<release-tag>` and `<wheel-file>` placeholders because the URL is only valid after a release is published. Maintainers can publish that asset with the manual **Manual release** GitHub Actions workflow.
+- **Native ETW consumer (default)** — the server decodes ETL files in-process via `OpenTraceW`/`tdh.dll`. This path is enough to start the MCP server and run the core native analysis tools on recent Windows builds.
+- **xperf.exe / Windows Performance Toolkit** — installed as part of the Windows SDK. Recommended for complete results because it enables fallback extraction, richer WPA-derived stack views, xperf-only tools such as pool analysis, and older Windows builds where the native bindings can't load. Expected location: `C:\Program Files (x86)\Windows Kits\10\Windows Performance Toolkit\xperf.exe`
 
 ## Setup
 
@@ -68,7 +68,7 @@ Add to your `.mcp.json` (project root or `~/.claude/.mcp.json`):
     "wpr-trace-analyzer": {
       "type": "stdio",
       "command": "uv",
-      "args": ["run", "--no-project", "--with", "https://github.com/nijosmsft/wpr-mcp-server/releases/download/v0.1.0/wpr_mcp_server-0.1.0-py3-none-any.whl", "python", "-m", "etw_analyzer.server"],
+      "args": ["run", "--no-project", "--with", "https://github.com/nijosmsft/wpr-mcp-server/releases/download/<release-tag>/<wheel-file>.whl", "python", "-m", "etw_analyzer.server"],
       "env": {
         "_NT_SYMBOL_PATH": "srv*C:\\symbols*https://msdl.microsoft.com/download/symbols"
       }
@@ -87,7 +87,7 @@ Add to `.vscode/mcp.json`:
     "wpr-trace-analyzer": {
       "type": "stdio",
       "command": "uv",
-      "args": ["run", "--no-project", "--with", "https://github.com/nijosmsft/wpr-mcp-server/releases/download/v0.1.0/wpr_mcp_server-0.1.0-py3-none-any.whl", "python", "-m", "etw_analyzer.server"],
+      "args": ["run", "--no-project", "--with", "https://github.com/nijosmsft/wpr-mcp-server/releases/download/<release-tag>/<wheel-file>.whl", "python", "-m", "etw_analyzer.server"],
       "env": {
         "_NT_SYMBOL_PATH": "srv*C:\\symbols*https://msdl.microsoft.com/download/symbols"
       }
@@ -143,7 +143,7 @@ Every analysis tool requires the `trace_id` returned by `load_trace`. This allow
 
 ### Packet Capture and pktmon Examples
 
-Packet-level drill-down tools need an ETL that includes NDIS PacketCapture frame bytes or pktmon packet bytes. For pktmon, collect with `--pkt-size 0`; the analyzer can convert the ETL with `pktmon etl2txt`/`pktmon etl2pcap`, summarize top flows, show timelines, decode packets, estimate Send -> Recv latency, and report pktmon component/edge layer latency:
+Packet-level drill-down tools need an ETL that includes NDIS PacketCapture frame bytes or pktmon packet bytes. For pktmon, collect with `--pkt-size 0`; the analyzer can convert the ETL with `pktmon etl2txt`/`pktmon etl2pcap`, summarize top flows, show timelines, decode packets, estimate Send -> Recv latency, and report pktmon component/edge layer latency. Latency estimates are heuristic and are most reliable on loopback or hosts with synchronized clocks:
 
 ```powershell
 pktmon filter remove
@@ -164,7 +164,7 @@ Then ask questions like:
 "Which 5-tuples account for the most bytes?"
 "Show packet timeline for 10.0.0.1:4444 -> 10.0.0.2:4444/udp"
 "Decode the packet closest to timestamp 123456789"
-"Estimate one-way Send -> Recv latency for captured packets"
+"Estimate one-way Send -> Recv latency for captured packets and explain any clock-sync caveats"
 "Show pktmon layer latency for the top TCP and UDP flows"
 "Show NDIS packet drops by miniport and reason"
 "Check whether UDP recv processing is staying on the same CPUs as NIC DPCs"
@@ -172,7 +172,7 @@ Then ask questions like:
 
 ### Remote Collection with LabLink MCP
 
-This server pairs well with [LabLink MCP](https://github.com/nijosmsft/LabLink) when the AI client has both MCP servers configured. LabLink provides remote hands on Windows lab nodes; wpr-mcp-server analyzes the ETL after LabLink collects or pulls it to the operator machine.
+This server pairs well with [LabLink MCP](https://github.com/nijosmsft/LabLink) when the AI client has both MCP servers configured. LabLink can collect traces from remote Windows machines; wpr-mcp-server analyzes the ETL after LabLink pulls it to the operator machine.
 
 Common combined prompts:
 
@@ -180,7 +180,7 @@ Common combined prompts:
 "On vm-server, collect a 60 second networking trace and tell me which network functions are hottest."
 "Capture UDP port 4444 packets on vm-server for 30 seconds and show the top flows."
 "Get a 30 second performance log from the server role and summarize CPU, DPCs, and TCP/UDP throughput."
-"Trace traffic between 10.0.0.1 and 10.0.0.2 on vm-server, then decode the largest flow and estimate Send -> Recv latency."
+"Trace traffic between 10.0.0.1 and 10.0.0.2 on vm-server, then decode the largest flow and estimate Send -> Recv latency with clock-sync caveats."
 ```
 
 For WPR captures, ask for the outcome instead of naming tools:
@@ -195,7 +195,7 @@ For pktmon captures, describe the traffic pattern and the analysis you want:
 
 ```
 "Collect packet monitor traffic on vm-server for UDP port 4444 for 30 seconds, then show the top flows."
-"Trace packets between 10.0.0.1 and 10.0.0.2 on vm-server, then decode the busiest flow and estimate layer latency."
+"Trace packets between 10.0.0.1 and 10.0.0.2 on vm-server, then decode the busiest flow and estimate layer latency with confidence levels."
 "Capture pktmon data for TCP 443 on vm-server, pull it back, and tell me which component/edge hop adds the most latency."
 "Collect a packet trace for this pattern and analyze it end to end: top flows, timeline, packet decode, and pktmon layer latency."
 ```
@@ -258,6 +258,15 @@ Run the LabLink agent elevated, or under an account with permission to start ETW
 | `get_udp_dispatch_quality` | UDP receive-path CPU distribution and overlap with networking DPC CPUs |
 | `get_per_nic_queue_arrivals` | Per-CPU distribution of NIC-driver DPCs for RSS queue spread |
 | `get_network_wait_chain` | Wait-reason and ReadyThread detail for network-active threads |
+| `get_network_hot_functions` | Convenience view for hot functions in networking modules |
+| `get_network_hot_stacks` | Convenience view for hot stack frames in networking modules |
+| `get_network_dpcs` | Convenience view for DPC/ISR activity in networking modules |
+| `get_network_lock_contention` | Convenience view for lock contention in networking modules |
+| `get_http_requests` | HTTP.sys request lifecycle, URL, status, and latency |
+| `get_http_queue_depth` | HTTP.sys URL-group queue depth and completion latency |
+| `get_quic_connections` | MsQuic connection lifetime, packets, bytes, and loss estimate |
+| `get_quic_cid_distribution` | MsQuic CID hash bucket and CPU distribution |
+| `get_quic_ack_delays` | MsQuic AckDelay percentiles by connection |
 
 #### System & Process Info
 
@@ -289,7 +298,7 @@ Most analysis tools accept:
 
 ### Stack Analysis Notes
 
-`get_hot_stacks` uses xperf's butterfly `Functions by UniInclusive Hits` table, so inclusive and exclusive hit counts are kept separate. `walk_stack` and `butterfly_chain` use the butterfly caller/callee table and require the `trace_id` returned by `load_trace`. `count_stacks` currently works from aggregate butterfly edges, so it estimates matching sample counts rather than counting distinct raw stack instances.
+For full WPA/butterfly stack parity, load with `mode="xperf"` or set `WPR_MCP_MODE=xperf`. In xperf mode, `get_hot_stacks` uses xperf's butterfly `Functions by UniInclusive Hits` table, so inclusive and exclusive hit counts are kept separate. `walk_stack` and `butterfly_chain` use the butterfly caller/callee table and require the `trace_id` returned by `load_trace`. Native mode covers core stack analysis but may not expose every xperf-derived stack view. `count_stacks` currently works from aggregate butterfly edges, so it estimates matching sample counts rather than counting distinct raw stack instances.
 
 ### Trace Loading Modes
 
@@ -297,9 +306,9 @@ Most analysis tools accept:
 
 | Mode | Behavior |
 |------|----------|
-| `"auto"` (default) | Probes the in-process native consumer. Uses it when available; silently falls back to xperf when the bindings can't load (e.g. older Windows builds). |
+| `"auto"` (default) | Probes the in-process native consumer. Uses it when available; falls back to xperf when the bindings can't load (e.g. older Windows builds) or when the native size guardrail rejects a large ETL. |
 | `"native"` | Forces the in-process `OpenTraceW`/`tdh.dll` consumer. Decodes manifest providers (TCPIP, AFD, MsQuic, HTTP.sys) that xperf cannot enumerate. Raises an error if the native bindings aren't available — does not fall back. |
-| `"xperf"` | Forces the legacy `xperf.exe -a dumper` text-based extraction. Requires the Windows Performance Toolkit on PATH. Use this if you hit a native-mode bug or are running on a build the native consumer doesn't support. |
+| `"xperf"` | Forces the legacy Windows Performance Toolkit path. It runs WPA-style xperf actions (`profile`, `dpcisr`, `stack -butterfly`, `cswitch`, `sysconfig`, `process`, `diskio`, `tracestats`) plus `xperf -a dumper` for raw events. Requires the Windows Performance Toolkit in a standard install location or on PATH. Use this if you hit a native-mode bug or need full WPA-style stack coverage. |
 
 The `WPR_MCP_MODE` environment variable overrides the default when `mode=` is left unspecified. Set `WPR_MCP_MODE=xperf` in your MCP config to opt every load_trace call back to the legacy pipeline:
 
@@ -309,7 +318,7 @@ The `WPR_MCP_MODE` environment variable overrides the default when `mode=` is le
     "wpr-trace-analyzer": {
       "type": "stdio",
       "command": "uv",
-      "args": ["run", "--no-project", "--with", "https://github.com/nijosmsft/wpr-mcp-server/releases/download/v0.1.0/wpr_mcp_server-0.1.0-py3-none-any.whl", "python", "-m", "etw_analyzer.server"],
+      "args": ["run", "--no-project", "--with", "https://github.com/nijosmsft/wpr-mcp-server/releases/download/<release-tag>/<wheel-file>.whl", "python", "-m", "etw_analyzer.server"],
       "env": {
         "_NT_SYMBOL_PATH": "srv*C:\\symbols*https://msdl.microsoft.com/download/symbols",
         "WPR_MCP_MODE": "xperf"
@@ -319,7 +328,7 @@ The `WPR_MCP_MODE` environment variable overrides the default when `mode=` is le
 }
 ```
 
-The explicit `mode=` arg always wins over the env var. Both pipelines write the same parquet cache layout, so traces loaded in one mode can be rehydrated from cache in the other without re-extracting.
+The explicit `mode=` arg always wins over the env var. Both pipelines write the same parquet cache layout, so traces loaded in one mode may reuse existing cached data from another mode. Use `force=True` when you need to re-extract with the selected mode.
 
 ### Parallel Analysis
 
@@ -374,7 +383,7 @@ wpr-mcp-server/
 ├── pyproject.toml
 ├── README.md
 ├── LICENSE
-├── tests/                           ← synthetic data, no xperf needed
+├── tests/                           ← synthetic tests by default; gated fixture tests are opt-in
 └── src/etw_analyzer/
     ├── server.py                    ← MCP server entry point
     ├── app.py                       ← FastMCP instance
@@ -387,6 +396,11 @@ wpr-mcp-server/
     │   ├── dpc_isr.py               ← get_dpc_summary, get_dpc_per_cpu
     │   ├── context_switch.py        ← get_lock_contention
     │   ├── memory.py                ← get_memory_pools
+    │   ├── network_events*.py       ← TCP/UDP/socket/throughput tools
+    │   ├── network_lenses.py        ← networking-focused hot functions/stacks/DPCs
+    │   ├── network_wait_chain.py    ← network wait-chain analysis
+    │   ├── packet_capture.py        ← NDIS PacketCapture and pktmon packet tools
+    │   ├── app_layer.py             ← HTTP.sys and MsQuic tools
     │   ├── system_info.py           ← get_sysconfig, get_process_info, get_diskio_summary, get_trace_stats
     │   ├── compare.py               ← compare_traces
     │   └── summary.py               ← analyze, export_analysis
@@ -426,7 +440,19 @@ _NT_SYMBOL_PATH=srv*C:\symbols*https://msdl.microsoft.com/download/symbols;C:\my
 uv run --group dev pytest tests/ -v
 ```
 
-Tests use synthetic data and don't require `xperf.exe` or ETL trace files.
+Default tests use synthetic data and don't require `xperf.exe` or ETL trace files. Gated fixture tests can generate ETLs and independent expected data when explicitly enabled; fixture generation requires Windows Performance Toolkit (`xperf.exe`/`wpr.exe`) and `pktmon.exe`, and may require elevation depending on local policy:
+
+```powershell
+uv run --group dev pytest tests\test_fixture_golden.py --run-fixture --run-golden --generate-fixture-etls -q
+```
+
+### Publishing a Release
+
+Maintainers can publish release wheels from GitHub Actions:
+
+1. Open **Actions** → **Manual release**.
+2. Run the workflow with a tag matching `pyproject.toml`, for example `v0.1.0`.
+3. The workflow validates the version, runs tests, builds wheel/sdist artifacts, and uploads them to the GitHub Release.
 
 ## Contributing
 
