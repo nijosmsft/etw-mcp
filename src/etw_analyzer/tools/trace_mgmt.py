@@ -175,12 +175,17 @@ def load_trace(
         _populate_metadata(trace)
         register_trace(trace)
         _start_background_dumper(trace)
-        # The native dumper produces SampledProfile rows; derive the
-        # aggregated ``cpu_sampling`` DataFrame from them so
-        # ``get_cpu_samples`` (no-cpu-filter path) has data. Blocks until
-        # the background extraction finishes — Phase N1 doesn't have a
-        # streaming variant.
-        _synthesize_native_cpu_sampling(trace)
+        # Phase N4: block until the background extraction (and its
+        # in-thread aggregators) finishes so the loaded-summary
+        # reflects every dataset. The Phase N4 aggregators populate
+        # ``cpu_sampling`` / ``cpu_timeline`` / ``dpc_isr`` /
+        # ``stacks`` etc. inside the background thread. If they
+        # somehow didn't, fall back to the Phase N1 stub for
+        # ``cpu_sampling`` so ``get_cpu_samples`` still has a row set.
+        trace.wait_for_dumper()
+        if "cpu_sampling" not in trace.raw_csv:
+            _synthesize_native_cpu_sampling(trace)
+        _populate_metadata(trace)
 
         return _format_load_summary(trace)
 
@@ -380,21 +385,38 @@ def _start_background_dumper(trace: TraceData) -> None:
                 return
 
             if trace.mode == "native":
-                from etw_analyzer.native import extract_events
+                from etw_analyzer.native import extract_events, ExtractStats
 
                 # Phase N3: include Image/Load + Image/DCStart so the
                 # Symbolizer can register every module the trace touched.
-                # These classes are kernel auxiliaries — they don't get
-                # persisted to parquet (they're not in
-                # ``_DUMPER_EVENT_CLASSES``), but they're cheap to decode
-                # and we need them on the same extraction pass.
-                wanted_with_images = set(wanted)
-                wanted_with_images.update({"Image/Load", "Image/DCStart"})
+                # Phase N4: also pull DPC/ISR/Process/DiskIo/SystemConfig
+                # so the post-extraction aggregators can build the
+                # xperf-equivalent ``cpu_sampling`` / ``dpc_isr`` /
+                # ``process_info`` / ``diskio`` / ``sysconfig`` /
+                # ``tracestats`` outputs. These auxiliaries don't get
+                # persisted to parquet directly — they live in
+                # ``trace.raw_csv`` under their canonical class names
+                # until the aggregators digest them.
+                wanted_with_aux = set(wanted)
+                wanted_with_aux.update({
+                    "Image/Load", "Image/DCStart",
+                    "PerfInfo/DPC", "PerfInfo/ThreadedDPC",
+                    "PerfInfo/TimerDPC", "PerfInfo/ISR",
+                    "Process/Start", "Process/End",
+                    "Process/DCStart", "Process/DCEnd",
+                    "Process/Defunct",
+                    "DiskIo/Read", "DiskIo/Write", "DiskIo/FlushBuffers",
+                    "SystemConfig",
+                })
 
+                stats_sink: list[ExtractStats] = []
                 results = extract_events(
                     trace.etl_path,
-                    event_classes=wanted_with_images,
+                    event_classes=wanted_with_aux,
+                    stats_sink=stats_sink,
                 )
+                if stats_sink:
+                    trace._native_extract_stats = stats_sink[-1]
 
                 # Build the per-trace Symbolizer and feed every
                 # ImageLoad row into it. Phase N3 only wires the
@@ -403,6 +425,26 @@ def _start_background_dumper(trace: TraceData) -> None:
                 # aggregators (butterfly, hot_functions) will call into
                 # ``trace.symbolizer.bulk_resolve`` lazily.
                 _build_symbolizer_from_images(trace, results)
+
+                # Stash auxiliary class DataFrames on raw_csv under
+                # their canonical names so the aggregators can find
+                # them. Aggregators themselves run *after* the with
+                # lock block below.
+                _native_aux = {
+                    name: results.get(name)
+                    for name in (
+                        "PerfInfo/DPC", "PerfInfo/ThreadedDPC",
+                        "PerfInfo/TimerDPC", "PerfInfo/ISR",
+                        "Process/Start", "Process/End",
+                        "Process/DCStart", "Process/DCEnd",
+                        "Process/Defunct",
+                        "DiskIo/Read", "DiskIo/Write", "DiskIo/FlushBuffers",
+                        "SystemConfig",
+                    )
+                }
+                for name, df in _native_aux.items():
+                    if df is not None and not df.empty:
+                        trace.raw_csv[name] = df
             else:
                 from etw_analyzer.parsing.wpa_exporter import parse_dumper_events
 
@@ -429,6 +471,14 @@ def _start_background_dumper(trace: TraceData) -> None:
                             # Non-fatal: keep the in-memory DataFrame even if
                             # we can't persist (e.g. disk full, readonly).
                             pass
+
+            # Phase N4: with the event-level DataFrames in place, run the
+            # native-mode aggregators to populate ``trace.raw_csv`` with
+            # the xperf-equivalent aggregates that the existing analysis
+            # tools consume. Best-effort — a failing aggregator should
+            # not block the trace from loading.
+            if trace.mode == "native":
+                _run_native_aggregators(trace)
         except Exception as e:
             with trace.lock:
                 trace._dumper_error = str(e)
@@ -505,6 +555,125 @@ def _build_symbolizer_from_images(
 
     with trace.lock:
         trace.symbolizer = symbolizer
+
+
+def _run_native_aggregators(trace: TraceData) -> None:
+    """Drive every Phase N4 aggregator and stash results in ``raw_csv``.
+
+    Each aggregator is best-effort: an individual failure logs and is
+    swallowed so the trace can still load. The aggregators read from
+    ``trace.dumper_df`` / ``trace.raw_csv`` (auxiliary classes stashed
+    by the native-mode extractor) and write back to ``trace.raw_csv``
+    under the xperf-equivalent dataset names.
+    """
+
+    try:
+        from etw_analyzer.native.aggregators import (
+            aggregate_cpu_sampling,
+            aggregate_cpu_timeline,
+            aggregate_dpc_isr,
+            build_dpc_isr_raw_text,
+            aggregate_stack_butterfly,
+            build_sysconfig_text,
+            build_process_info_text,
+            build_diskio_text,
+            build_tracestats_text,
+        )
+        from etw_analyzer.native.aggregators.process_info import build_process_table
+        from etw_analyzer.native.aggregators.stack_butterfly import aggregate_stack_callers
+    except Exception:
+        return
+
+    # Build the PID-to-name lookup first so ``cpu_sampling`` can populate
+    # Process Name from Process/DCStart rows.
+    try:
+        ptable = build_process_table(trace)
+        if ptable is not None and not ptable.empty:
+            trace.raw_csv["_native_process_events"] = ptable
+    except Exception:
+        pass
+
+    def _persist_df(name: str, stem: str, df) -> None:
+        if df is None or getattr(df, "empty", True):
+            return
+        with trace.lock:
+            trace.raw_csv[name] = df
+        try:
+            trace.export_dir.mkdir(parents=True, exist_ok=True)
+            df.to_parquet(trace.export_dir / f"{stem}.parquet", index=False)
+        except Exception:
+            pass
+
+    def _persist_text(name: str, filename: str, text) -> None:
+        if not text:
+            return
+        with trace.lock:
+            import pandas as _pd
+            trace.raw_csv[name] = _pd.DataFrame({"raw_text": [text]})
+        try:
+            trace.export_dir.mkdir(parents=True, exist_ok=True)
+            (trace.export_dir / filename).write_text(text, encoding="utf-8")
+        except Exception:
+            pass
+
+    # cpu_sampling — the floor everything else needs.
+    try:
+        _persist_df("cpu_sampling", "cpu_sampling", aggregate_cpu_sampling(trace))
+    except Exception:
+        pass
+
+    # cpu_timeline — per-CPU utilization buckets.
+    try:
+        _persist_df("cpu_timeline", "cpu_timeline", aggregate_cpu_timeline(trace))
+    except Exception:
+        pass
+
+    # dpc_isr — per-module duration histogram.
+    try:
+        _persist_df("dpc_isr", "dpc_isr", aggregate_dpc_isr(trace))
+    except Exception:
+        pass
+
+    # dpc_isr_raw — xperf-format text with per-CPU pair lines.
+    try:
+        _persist_text("dpc_isr_raw", "dpcisr.txt", build_dpc_isr_raw_text(trace))
+    except Exception:
+        pass
+
+    # stacks — butterfly inclusive/exclusive table. Symbolization-heavy,
+    # so this can take a while on big traces. Skipped silently if no
+    # symbolizer is available.
+    try:
+        _persist_df("stacks", "stacks", aggregate_stack_butterfly(trace))
+    except Exception:
+        pass
+
+    # stacks_callers — caller edges (v1 — see module docstring).
+    try:
+        _persist_df("stacks_callers", "stacks_callers", aggregate_stack_callers(trace))
+    except Exception:
+        pass
+
+    # Raw-text aggregates.
+    try:
+        _persist_text("sysconfig", "sysconfig.txt", build_sysconfig_text(trace))
+    except Exception:
+        pass
+
+    try:
+        _persist_text("process_info", "process_info.txt", build_process_info_text(trace))
+    except Exception:
+        pass
+
+    try:
+        _persist_text("diskio", "diskio.txt", build_diskio_text(trace))
+    except Exception:
+        pass
+
+    try:
+        _persist_text("tracestats", "tracestats.txt", build_tracestats_text(trace))
+    except Exception:
+        pass
 
 
 def _synthesize_native_cpu_sampling(trace: TraceData) -> None:

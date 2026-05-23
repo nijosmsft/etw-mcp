@@ -1,0 +1,130 @@
+"""Tests for the cpu_sampling aggregator."""
+
+from __future__ import annotations
+
+import types
+
+import pandas as pd
+import pytest
+
+from etw_analyzer.native.aggregators.profile_detail import (
+    _split_resolved,
+    aggregate_cpu_sampling,
+)
+
+
+class _FakeSymbolizer:
+    """Minimal stand-in for ``Symbolizer.bulk_resolve``."""
+
+    def __init__(self, mapping: dict[int, str]):
+        self._mapping = mapping
+
+    def bulk_resolve(self, addrs):
+        return {int(a): self._mapping.get(int(a), "") for a in addrs}
+
+
+def _make_trace(dumper_df, process_df=None, symbolizer=None):
+    """Return a tiny namespace that quacks like TraceData for these aggregators."""
+    raw_csv = {}
+    if process_df is not None:
+        raw_csv["_native_process_events"] = process_df
+    return types.SimpleNamespace(
+        dumper_df=dumper_df,
+        raw_csv=raw_csv,
+        symbolizer=symbolizer,
+        duration_seconds=10.0,
+    )
+
+
+class TestSplitResolved:
+    def test_module_function_offset(self):
+        assert _split_resolved("ntoskrnl.exe!KeYieldProcessor+0x42") == (
+            "ntoskrnl.exe",
+            "KeYieldProcessor",
+        )
+
+    def test_module_function_no_offset(self):
+        assert _split_resolved("tcpip.sys!TcpipReceive") == ("tcpip.sys", "TcpipReceive")
+
+    def test_no_function(self):
+        assert _split_resolved("foo.sys+0x1234") == ("foo.sys", "")
+
+    def test_unknown(self):
+        assert _split_resolved("unknown+0x0") == ("unknown", "")
+
+    def test_empty(self):
+        assert _split_resolved("") == ("unknown", "")
+
+
+class TestAggregateCpuSampling:
+    def test_empty_dumper(self):
+        trace = _make_trace(pd.DataFrame())
+        assert aggregate_cpu_sampling(trace) is None
+
+    def test_none_dumper(self):
+        trace = _make_trace(None)
+        assert aggregate_cpu_sampling(trace) is None
+
+    def test_happy_path(self):
+        # Three samples, two unique IPs, one PID.
+        dumper = pd.DataFrame([
+            {"TimeStamp": 1, "Process Name": "", "PID": 1000, "CPU": 0,
+             "InstructionPointer": 0xAAA, "Weight": 1, "Module": "", "Function": ""},
+            {"TimeStamp": 2, "Process Name": "", "PID": 1000, "CPU": 0,
+             "InstructionPointer": 0xAAA, "Weight": 1, "Module": "", "Function": ""},
+            {"TimeStamp": 3, "Process Name": "", "PID": 1000, "CPU": 1,
+             "InstructionPointer": 0xBBB, "Weight": 1, "Module": "", "Function": ""},
+        ])
+        sym = _FakeSymbolizer({
+            0xAAA: "ntoskrnl.exe!Func1+0x10",
+            0xBBB: "tcpip.sys!Func2+0x20",
+        })
+        proc = pd.DataFrame([{"ProcessId": 1000, "ImageFileName": "echo_server.exe"}])
+        trace = _make_trace(dumper, process_df=proc, symbolizer=sym)
+
+        result = aggregate_cpu_sampling(trace)
+        assert result is not None
+        assert set(result.columns) == {"Process Name", "PID", "Weight", "% Weight", "Module", "Function"}
+        assert len(result) == 2
+
+        ntos_row = result[result["Module"] == "ntoskrnl.exe"].iloc[0]
+        assert ntos_row["Function"] == "Func1"
+        assert ntos_row["Weight"] == 2
+        assert ntos_row["PID"] == 1000
+        assert ntos_row["Process Name"] == "echo_server.exe"
+
+        tcpip_row = result[result["Module"] == "tcpip.sys"].iloc[0]
+        assert tcpip_row["Weight"] == 1
+
+        # Percentages sum to 100.
+        assert abs(result["% Weight"].sum() - 100.0) < 0.01
+
+    def test_no_symbolizer_keeps_existing_columns(self):
+        dumper = pd.DataFrame([
+            {"TimeStamp": 1, "Process Name": "myproc", "PID": 1000, "CPU": 0,
+             "InstructionPointer": 0xAAA, "Weight": 1, "Module": "tcpip.sys", "Function": "F1"},
+        ])
+        trace = _make_trace(dumper)  # no symbolizer
+        result = aggregate_cpu_sampling(trace)
+        assert result is not None
+        assert len(result) == 1
+        # Without a symbolizer the existing Module/Function columns are
+        # preserved (xperf-style fallback).
+        assert result.iloc[0]["Module"] == "tcpip.sys"
+        assert result.iloc[0]["Function"] == "F1"
+
+    def test_aggregation_collapses_duplicates(self):
+        # 10 samples all hitting the same (PID, Module, Function) → one row.
+        rows = []
+        for _ in range(10):
+            rows.append({
+                "TimeStamp": 1, "Process Name": "p", "PID": 1, "CPU": 0,
+                "InstructionPointer": 0x1, "Weight": 1, "Module": "m.sys", "Function": "f",
+            })
+        sym = _FakeSymbolizer({0x1: "m.sys!f+0x0"})
+        trace = _make_trace(pd.DataFrame(rows), symbolizer=sym)
+        result = aggregate_cpu_sampling(trace)
+        assert result is not None
+        assert len(result) == 1
+        assert result.iloc[0]["Weight"] == 10
+        assert result.iloc[0]["% Weight"] == pytest.approx(100.0)

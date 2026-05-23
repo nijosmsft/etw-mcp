@@ -422,3 +422,90 @@ def test_native_extract_decodes_kernel_event_classes():
         or dc_names.str.contains("ntoskrnl").any()
         or dc_names.str.contains("ntdll").any()
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase N4 acceptance tests — aggregators must populate ``trace.raw_csv``
+# with the xperf-equivalent datasets when the trace is loaded in native
+# mode. These run end-to-end and are marked slow.
+# ---------------------------------------------------------------------------
+@pytest.mark.slow
+@need_large
+def test_native_mode_populates_cpu_sampling(isolate_traces):
+    """Phase N4: native-mode load_trace produces ``cpu_sampling`` matching the
+    xperf-mode schema."""
+    from etw_analyzer.tools.trace_mgmt import load_trace
+    from etw_analyzer.trace_state import get_trace
+
+    _clear_export_dir(LARGE_ETL)
+    result = load_trace(str(LARGE_ETL), mode="native")
+    tid = _extract_trace_id(result)
+    trace = get_trace(tid)
+    trace.wait_for_dumper()
+
+    assert "cpu_sampling" in trace.raw_csv
+    cs = trace.raw_csv["cpu_sampling"]
+    expected = {"Process Name", "PID", "Weight", "% Weight", "Module", "Function"}
+    assert expected.issubset(set(cs.columns))
+    assert len(cs) > 0
+
+
+@pytest.mark.slow
+@need_large
+def test_native_mode_populates_dpc_isr(isolate_traces):
+    """Phase N4: dpc_isr DataFrame has per-module histogram rows."""
+    from etw_analyzer.tools.trace_mgmt import load_trace
+    from etw_analyzer.trace_state import get_trace
+
+    _clear_export_dir(LARGE_ETL)
+    result = load_trace(str(LARGE_ETL), mode="native")
+    tid = _extract_trace_id(result)
+    trace = get_trace(tid)
+    trace.wait_for_dumper()
+
+    assert "dpc_isr" in trace.raw_csv
+    df = trace.raw_csv["dpc_isr"]
+    expected = {"Module", "Bucket_Low_us", "Bucket_High_us", "Count", "Pct"}
+    assert expected.issubset(set(df.columns))
+    assert len(df) > 0
+    # Global rollup row must be present.
+    assert "(all)" in set(df["Module"].unique())
+
+
+@pytest.mark.slow
+@need_large
+def test_native_mode_get_cpu_samples_returns_data(isolate_traces):
+    """Phase N4: ``get_cpu_samples`` returns real data on a native-mode trace."""
+    from etw_analyzer.tools.trace_mgmt import load_trace
+    from etw_analyzer.tools.cpu_sampling import get_cpu_samples
+
+    _clear_export_dir(LARGE_ETL)
+    result = load_trace(str(LARGE_ETL), mode="native")
+    tid = _extract_trace_id(result)
+
+    text = get_cpu_samples(trace_id=tid, group_by="module", max_rows=10)
+    assert "no" not in text.lower().splitlines()[0], text[:200]
+    # Tabular output starts after the header.
+    assert "|" in text or "Module" in text
+
+
+@pytest.mark.slow
+@need_large
+def test_native_mode_emits_tracestats(isolate_traces):
+    """Phase N4: tracestats raw-text DataFrame must be populated on a
+    successful native-mode load so :func:`get_trace_stats`-style tools
+    have something to report."""
+    from etw_analyzer.tools.trace_mgmt import load_trace
+    from etw_analyzer.trace_state import get_trace
+
+    _clear_export_dir(LARGE_ETL)
+    result = load_trace(str(LARGE_ETL), mode="native")
+    tid = _extract_trace_id(result)
+    trace = get_trace(tid)
+    trace.wait_for_dumper()
+
+    assert "tracestats" in trace.raw_csv
+    df = trace.raw_csv["tracestats"]
+    assert not df.empty
+    text = df.iloc[0]["raw_text"]
+    assert "Total events" in text or "Per-dataset" in text
