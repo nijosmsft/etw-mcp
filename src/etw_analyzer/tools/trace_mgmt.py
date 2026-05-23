@@ -323,6 +323,46 @@ _DUMPER_EVENT_CLASSES: dict[str, tuple[str, str]] = {
 }
 
 
+def _persist_dumper_parquet(df: pd.DataFrame, path: Path) -> None:
+    """Write a dumper DataFrame to parquet, sanitizing kernel-address columns.
+
+    The native-mode ``Stack`` column is a tuple of kernel pointers — values
+    routinely exceed signed ``int64`` (e.g. ``0xFFFFF80...`` runs > 2**63).
+    pyarrow's default conversion picks ``int64`` and raises
+    ``OverflowError: int too big to convert``, which used to be silently
+    swallowed in ``_extract`` — leaving the in-memory DataFrame intact for
+    the current session but stranding it from the on-disk cache. The next
+    reload then started from scratch with no ``Stack`` column, which broke
+    every downstream tool that depended on it (most visibly
+    ``get_network_wait_chain`` reporting "No CSwitch events available"
+    after a cache rehydrate).
+
+    The fix is to coerce the ``Stack`` column to a ``numpy uint64`` array
+    column before handing off to ``to_parquet``. pyarrow round-trips that
+    as ``list<uint64>`` and the read path materialises it back as a
+    Python list — close enough to the original tuple shape that the
+    butterfly/wait-chain aggregators don't care.
+    """
+    if "Stack" in df.columns:
+        import numpy as _np
+        def _to_uint64_list(v):
+            if v is None:
+                return None
+            if isinstance(v, (tuple, list)):
+                try:
+                    return _np.asarray(v, dtype=_np.uint64)
+                except (OverflowError, ValueError):
+                    # Last-ditch: drop the addresses we can't fit.
+                    return _np.asarray(
+                        [x for x in v if 0 <= int(x) < (1 << 64)],
+                        dtype=_np.uint64,
+                    )
+            return None
+        df = df.copy()
+        df["Stack"] = df["Stack"].map(_to_uint64_list)
+    df.to_parquet(path, index=False)
+
+
 def _start_background_dumper(trace: TraceData) -> None:
     """Start background extraction of dumper events (single xperf pass).
 
@@ -414,6 +454,13 @@ def _start_background_dumper(trace: TraceData) -> None:
                     "Process/Start", "Process/End",
                     "Process/DCStart", "Process/DCEnd",
                     "Process/Defunct",
+                    # Thread events feed the TID-to-PID map that
+                    # ``_run_native_aggregators`` uses to backfill
+                    # NewProcessName / OldProcessName on the CSwitch
+                    # DataFrame — the cswitch payload itself carries
+                    # only TIDs.
+                    "Thread/Start", "Thread/End",
+                    "Thread/DCStart", "Thread/DCEnd",
                     "DiskIo/Read", "DiskIo/Write", "DiskIo/FlushBuffers",
                     "SystemConfig",
                 })
@@ -447,6 +494,8 @@ def _start_background_dumper(trace: TraceData) -> None:
                         "Process/Start", "Process/End",
                         "Process/DCStart", "Process/DCEnd",
                         "Process/Defunct",
+                        "Thread/Start", "Thread/End",
+                        "Thread/DCStart", "Thread/DCEnd",
                         "DiskIo/Read", "DiskIo/Write", "DiskIo/FlushBuffers",
                         "SystemConfig",
                     )
@@ -475,10 +524,15 @@ def _start_background_dumper(trace: TraceData) -> None:
                     if not df.empty:
                         trace.export_dir.mkdir(parents=True, exist_ok=True)
                         try:
-                            df.to_parquet(_parquet_for(stem), index=False)
+                            _persist_dumper_parquet(df, _parquet_for(stem))
                         except Exception:
                             # Non-fatal: keep the in-memory DataFrame even if
                             # we can't persist (e.g. disk full, readonly).
+                            # NOTE: failing here used to silently strand the
+                            # in-memory frame and lose it on cache rehydrate —
+                            # ``_persist_dumper_parquet`` now sanitizes
+                            # uint64 Stack columns before writing so this is
+                            # only hit on actual filesystem failures.
                             pass
 
             # Phase N4: with the event-level DataFrames in place, run the
@@ -599,6 +653,108 @@ def _run_native_aggregators(trace: TraceData) -> None:
         ptable = build_process_table(trace)
         if ptable is not None and not ptable.empty:
             trace.raw_csv["_native_process_events"] = ptable
+    except Exception:
+        pass
+
+    # Populate NewProcessName / OldProcessName / NewPID / OldPID on the
+    # native CSwitch DataFrame. The native CSwitch decoder gets only the
+    # NewTID/OldTID from the binary payload and the EventHeader PID is
+    # 0xFFFFFFFF for kernel scheduling events, so without this enrichment
+    # ``get_network_wait_chain`` can't match its process-substring
+    # argument against any row even though 393K CSwitch events were
+    # successfully decoded.
+    #
+    # We build a TID→PID map from Thread/DCStart/Start events, then chain
+    # PID → name through the Process-event table. Both maps are built once
+    # and applied vectorized.
+    try:
+        cswitch_df = trace.cswitch_events_df
+        if cswitch_df is not None and not cswitch_df.empty:
+            from etw_analyzer.native.aggregators.profile_detail import (
+                _build_pid_to_name_map,
+            )
+            pid_map = _build_pid_to_name_map(trace)
+            tid_to_pid: dict[int, int] = {}
+            for cls in ("Thread/DCStart", "Thread/Start",
+                        "Thread/DCEnd", "Thread/End"):
+                tdf = trace.raw_csv.get(cls)
+                if tdf is None or tdf.empty:
+                    continue
+                if "ThreadId" not in tdf.columns or "ProcessId" not in tdf.columns:
+                    continue
+                for tid, pid in zip(tdf["ThreadId"].tolist(),
+                                    tdf["ProcessId"].tolist()):
+                    try:
+                        tid_i = int(tid)
+                        pid_i = int(pid)
+                    except (TypeError, ValueError):
+                        continue
+                    # Prefer earlier (DCStart) over later (End) entries
+                    # for stable mapping when TIDs are reused.
+                    tid_to_pid.setdefault(tid_i, pid_i)
+
+            mutated = False
+            if tid_to_pid and "NewTID" in cswitch_df.columns:
+                # Backfill NewPID from the TID map. The native CSwitch
+                # decoder leaves NewPID==0 whenever the EventHeader
+                # ProcessId is the kernel "no process context" sentinel
+                # (which is virtually always), so we treat 0 / negative /
+                # 0xFFFFFFFF as "needs resolution".
+                resolved_new_pid = cswitch_df["NewTID"].map(tid_to_pid)
+                current_new = cswitch_df["NewPID"] if "NewPID" in cswitch_df.columns else None
+                if current_new is not None:
+                    sentinel = (current_new == 0xFFFFFFFF) | (current_new <= 0)
+                    cswitch_df.loc[sentinel, "NewPID"] = (
+                        resolved_new_pid[sentinel].fillna(0).astype("int64")
+                    )
+                else:
+                    cswitch_df["NewPID"] = resolved_new_pid.fillna(0).astype("int64")
+                mutated = True
+
+            if tid_to_pid and "OldTID" in cswitch_df.columns:
+                resolved_old_pid = cswitch_df["OldTID"].map(tid_to_pid)
+                current_old = cswitch_df["OldPID"] if "OldPID" in cswitch_df.columns else None
+                if current_old is not None:
+                    sentinel = (current_old == 0xFFFFFFFF) | (current_old <= 0)
+                    cswitch_df.loc[sentinel, "OldPID"] = (
+                        resolved_old_pid[sentinel].fillna(0).astype("int64")
+                    )
+                else:
+                    cswitch_df["OldPID"] = resolved_old_pid.fillna(0).astype("int64")
+                mutated = True
+
+            if pid_map:
+                if "NewProcessName" in cswitch_df.columns and "NewPID" in cswitch_df.columns:
+                    blank = cswitch_df["NewProcessName"].astype(str).str.len() == 0
+                    if blank.any():
+                        cswitch_df.loc[blank, "NewProcessName"] = (
+                            cswitch_df.loc[blank, "NewPID"]
+                            .map(pid_map)
+                            .fillna("")
+                            .astype(str)
+                        )
+                        mutated = True
+                if "OldProcessName" in cswitch_df.columns and "OldPID" in cswitch_df.columns:
+                    blank = cswitch_df["OldProcessName"].astype(str).str.len() == 0
+                    if blank.any():
+                        cswitch_df.loc[blank, "OldProcessName"] = (
+                            cswitch_df.loc[blank, "OldPID"]
+                            .map(pid_map)
+                            .fillna("")
+                            .astype(str)
+                        )
+                        mutated = True
+
+            if mutated:
+                # Persist the enriched DataFrame so cache rehydration
+                # picks up the names too.
+                try:
+                    _persist_dumper_parquet(
+                        cswitch_df,
+                        trace.export_dir / "cswitch_events.parquet",
+                    )
+                except Exception:
+                    pass
     except Exception:
         pass
 

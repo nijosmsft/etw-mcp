@@ -58,6 +58,28 @@ _PROCESS_HEADER = struct.Struct("<QIIIiQI")
 assert _PROCESS_HEADER.size == 36
 
 
+def _looks_like_sid(payload: bytes, offset: int) -> bool:
+    """Return True when bytes at ``offset`` resemble a valid SID header.
+
+    A real Windows SID always starts with ``Revision == 1`` and
+    ``SubAuthorityCount`` in [0, 15] (the SID_MAX_SUB_AUTHORITIES limit).
+    Anything else is almost certainly noise — most often a leftover
+    kernel-mode pointer from the TOKEN_USER prefix that ETW marshals
+    in front of the SID on Windows 10/11.
+    """
+    if offset + 8 > len(payload):
+        return False
+    rev = payload[offset]
+    sub_count = payload[offset + 1]
+    if rev != 1:
+        return False
+    if sub_count > 15:
+        return False
+    if offset + 8 + 4 * sub_count > len(payload):
+        return False
+    return True
+
+
 def _parse_sid(payload: bytes, offset: int) -> tuple[Optional[str], int]:
     """Parse a Windows SID at ``offset`` and return ``(sid_string, end_offset)``.
 
@@ -72,26 +94,51 @@ def _parse_sid(payload: bytes, offset: int) -> tuple[Optional[str], int]:
     caller should then assume there is no SID and continue at ``offset``.
     A 4-byte all-zero TOKEN_USER prefix is common when the process has
     no user (e.g. system processes); we skip it and re-try.
+
+    Modern Windows kernels (Win10/11) marshal a full ``TOKEN_USER`` struct
+    in front of the SID in Process Start/DCStart payloads:
+
+        PSID Sid          // pointer-sized (8 bytes on x64)
+        DWORD Attributes  // 4 bytes
+        DWORD _padding    // 4 bytes alignment
+
+    The ``Sid`` pointer is a kernel-mode address — *not* zeroed by ETW
+    serialization — so the previous "skip 8 zero bytes" heuristic
+    missed the prefix entirely and the decoder ended up reading the
+    ImageFileName from inside the pointer bytes (visible as
+    ``Image='M�����'``-style garbled output). The fix is to forward-scan
+    up to 16 bytes looking for a plausible SID header (Revision==1,
+    SubAuthorityCount<=15).
     """
     if offset + 2 > len(payload):
         return None, offset
 
-    # Some Process Start payloads prefix a zero TOKEN_USER pointer-sized
-    # field before the SID itself. If the SID's Revision byte is zero,
-    # the SID is the "null SID" (zero-length); just skip the 8 bytes and
-    # move on.
-    rev = payload[offset]
-    if rev == 0:
-        # If we see four zero bytes at offset, it's the TOKEN_USER pad —
-        # skip 8 bytes and retry. If still zero, give up.
-        if offset + 8 <= len(payload) and payload[offset : offset + 8] == b"\x00" * 8:
-            return None, offset + 8
-        return None, offset + 1
+    # Forward-scan up to 16 bytes for a plausible SID header. This
+    # absorbs the TOKEN_USER prefix (8-byte PSID + 4-byte Attributes +
+    # 4-byte padding) used on modern Windows without breaking the
+    # original "SID at offset 0" payload shape that legacy fixtures
+    # use. Bytes that aren't SID-shaped are silently discarded.
+    scan_limit = min(offset + 16, len(payload) - 1)
+    scan = offset
+    while scan <= scan_limit:
+        if _looks_like_sid(payload, scan):
+            offset = scan
+            break
+        scan += 1
+    else:
+        # No SID-shaped header anywhere in the prefix window. Fall back
+        # to the legacy heuristics so the existing fixture-based tests
+        # (which feed in bare zero pads) still parse correctly.
+        rev = payload[offset]
+        if rev == 0:
+            if offset + 8 <= len(payload) and payload[offset : offset + 8] == b"\x00" * 8:
+                return None, offset + 8
+            return None, offset + 1
+        return None, offset
 
+    rev = payload[offset]
     sub_count = payload[offset + 1]
     sid_size = 8 + 4 * sub_count
-    if offset + sid_size > len(payload):
-        return None, offset
 
     auth_bytes = payload[offset + 2 : offset + 8]
     # 48-bit big-endian authority.
@@ -149,9 +196,27 @@ def decode_process_start_end(payload: bytes, hdr: dict) -> Optional[dict]:
     offset = _PROCESS_HEADER.size
     sid, offset = _parse_sid(payload, offset)
     image_name, offset = _read_ascii_z(payload, offset)
-    # Align to 2-byte boundary for the UTF-16 CommandLine that follows.
-    if offset & 1:
-        offset += 1
+    # The kernel does *not* pad between ImageFileName and CommandLine
+    # in real Process Start events — the UTF-16 LE bytes start
+    # immediately after the ASCII null terminator. The previous
+    # "always pad to even" logic shifted CommandLine by one byte on
+    # every real-world event whose offset happened to be odd, turning
+    # ``"C:\…"`` (UTF-16 bytes ``22 00 43 00 3A 00 5C 00``) into
+    # ``䌀㨀…`` (read as ``00 22 00 43 00 3A …``).
+    #
+    # We *do* still tolerate an explicit zero pad byte before the
+    # UTF-16 string — synthetic test fixtures pad to a 2-byte boundary
+    # — and detect it by sniffing the first two bytes: a UTF-16 LE
+    # string starts with the low byte of a character (printable ASCII
+    # for the cmdline cases we care about) followed by a zero high
+    # byte. ``00 XX`` (XX printable) means we're looking at a pad
+    # byte; skip it. ``XX 00`` means we're already aligned.
+    if offset + 2 <= len(payload):
+        b0 = payload[offset]
+        b1 = payload[offset + 1]
+        if b0 == 0 and 0x20 <= b1 < 0x7F:
+            # Padding byte before the real UTF-16 start.
+            offset += 1
     command_line, offset = _read_utf16_z(payload, offset)
 
     cpu = hdr.get("ProcessorNumber")

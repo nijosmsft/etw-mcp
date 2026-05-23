@@ -140,6 +140,35 @@ class TestDecodeCSwitchV5:
         assert row is not None
         assert row["CPU"] == -1
 
+    def test_sentinel_hdr_pid_tid_falls_back_to_payload(self):
+        """Regression: real kernel CSwitch events arrive with EventHeader
+        ProcessId / ThreadId set to ``0xFFFFFFFF`` (kernel scheduling
+        events have no thread context). The decoder must detect that
+        sentinel and fall back to the payload-supplied NewThreadId,
+        leaving NewPID=0 for the downstream TID-to-PID join to fill.
+
+        Before the fix all 393K cswitch rows on the VM-Server trace had
+        NewTID=0xFFFFFFFF, which made
+        ``get_network_wait_chain(trace_id, "nslookup")`` return
+        "No threads matched process substring `nslookup`" — see
+        ``udp-perf/docs/wpr-mcp-native-etw-verification.md`` §"Residual
+        Issues 2".
+        """
+        SENTINEL = 0xFFFFFFFF
+        row = decode_cswitch_v5(
+            _PAYLOAD_1,
+            hdr={
+                "TimeStamp": 1,
+                "ProcessorNumber": 0,
+                "ProcessId": SENTINEL,
+                "ThreadId": SENTINEL,
+            },
+        )
+        assert row is not None
+        # Payload says NewThreadId=3388 — header sentinel must not win.
+        assert row["NewTID"] == 3388
+        assert row["NewPID"] == 0  # left for downstream TID-to-PID fill
+
     def test_emits_canonical_schema_keys(self):
         """The dict shape must match the unified schema documented in
         wpa_exporter._handle_cswitch so downstream code is uniform."""

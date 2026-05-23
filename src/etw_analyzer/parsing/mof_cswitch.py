@@ -215,14 +215,24 @@ def decode_cswitch_v5(payload: bytes, hdr: dict) -> Optional[dict]:
 
     # The new thread/process is the one being switched IN. EVENT_HEADER's
     # ProcessId/ThreadId identify the thread that logged the event (the new
-    # thread); fall back to the payload field if hdr didn't supply them.
+    # thread). On real traces the kernel emits CSwitch events as part of
+    # its scheduling path and the header carries the sentinel
+    # ``0xFFFFFFFF`` (-1) for both fields — meaning "no process context".
+    # In that case we have to fall back to the payload-supplied NewThreadId
+    # and resolve the PID downstream via a TID-to-PID join. The synthetic
+    # test fixtures pass a non-sentinel hdr ThreadId so they're unaffected.
+    _SENTINEL = 0xFFFFFFFF
     hdr_new_tid = hdr.get("ThreadId")
-    if hdr_new_tid is not None:
-        new_tid_final = int(hdr_new_tid)
-    else:
+    if hdr_new_tid is None or int(hdr_new_tid) == _SENTINEL:
         new_tid_final = new_tid
+    else:
+        new_tid_final = int(hdr_new_tid)
 
-    new_pid = hdr.get("ProcessId", 0) or 0
+    hdr_new_pid = hdr.get("ProcessId")
+    if hdr_new_pid is None or int(hdr_new_pid) == _SENTINEL:
+        new_pid = 0  # leave PID unresolved; downstream TID-to-PID fills it
+    else:
+        new_pid = int(hdr_new_pid)
 
     return {
         "TimeStamp": hdr.get("TimeStamp", 0),

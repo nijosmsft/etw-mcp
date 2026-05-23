@@ -133,3 +133,84 @@ class TestDispatchTable:
 
     def test_provider_guid(self):
         assert PROVIDER_GUID == "3d6fa8d0-fe05-11d0-9dda-00c04fd7ba7c"
+
+
+# Regression: Windows 10/11 kernel logger prefixes the SID with a full
+# TOKEN_USER struct (8-byte kernel PSID pointer + 4-byte Attributes +
+# 4-byte alignment padding). The previous decoder only skipped 8 zero
+# bytes, so when the PSID pointer was non-zero the decoder fell out of
+# alignment and read garbled binary as the ImageFileName (visible as
+# ``Image='M�����'``-style output). See
+# ``udp-perf/docs/wpr-mcp-native-etw-verification.md`` §"Residual Issues 1".
+def test_decode_with_token_user_prefix():
+    """Real-world payload shape: 16-byte TOKEN_USER prefix before the SID,
+    and **no padding** between the ASCII ImageFileName null terminator and
+    the UTF-16 LE CommandLine — the kernel writes them back-to-back."""
+    # Kernel-mode PSID pointer — non-zero so the legacy "zero pad" check
+    # would miss it.
+    token_user = b"\xd0\x4b\xb2\xbe\xbd\xf1\xff\xff"
+    token_user += b"\x00" * 8  # Attributes (4) + padding (4)
+
+    # LocalSystem SID, rev=1, count=1, NT, subauth=18.
+    sid_bytes = struct.pack("<BB6sI", 1, 1, b"\x00\x00\x00\x00\x00\x05", 18)
+
+    body = struct.pack(
+        "<QIIIiQI",
+        0xC090_FCE8_8A8B_FFFF,
+        3052,   # PID
+        4,      # ParentId
+        0xFFFFFFFF,
+        0,
+        0,
+        4,
+    )
+    body += token_user + sid_bytes
+    # ASCII name + null, then UTF-16 LE cmdline. NO PADDING — that's the
+    # whole point of this regression test.
+    body += b"smss.exe\x00"
+    body += '"C:\\Windows\\System32\\smss.exe"'.encode("utf-16-le") + b"\x00\x00"
+
+    row = decode_process_start_end(body, hdr={"ProcessorNumber": 0})
+    assert row is not None
+    assert row["ProcessId"] == 3052
+    # Image must be a clean ASCII name — not garbled binary.
+    assert row["ImageFileName"] == "smss.exe"
+    assert row["ImageFileName"].isprintable()
+    assert row["UserSID"] == "S-1-5-18"
+    # CommandLine must decode as ASCII characters, not as CJK kanji
+    # (which is what the byte-shifted UTF-16 decode produces).
+    assert row["CommandLine"] == '"C:\\Windows\\System32\\smss.exe"'
+    assert all(ord(c) < 256 for c in row["CommandLine"]), (
+        f"CmdLine appears byte-shifted (CJK codepoints): {row['CommandLine']!r}"
+    )
+
+
+def test_decode_with_token_user_prefix_zero_low_byte():
+    """The PSID pointer's low byte can be zero — must not be mistaken for
+    a zero-SID pad. Sample observed: ``00 4c b2 be bd f1 ff ff``."""
+    token_user = b"\x00\x4c\xb2\xbe\xbd\xf1\xff\xff"
+    token_user += b"\x00" * 8
+
+    sid_bytes = struct.pack("<BB6sI", 1, 1, b"\x00\x00\x00\x00\x00\x05", 18)
+
+    body = struct.pack(
+        "<QIIIiQI",
+        0xAAAA_BBBB_CCCC_DDDD,
+        1068,  # PID
+        4,
+        0xFFFFFFFF,
+        0,
+        0,
+        4,
+    )
+    body += token_user + sid_bytes
+    body += b"Registry\x00"
+    if len(body) & 1:
+        body += b"\x00"
+    body += b"\x00\x00"  # empty UTF-16 command line
+
+    row = decode_process_start_end(body, hdr={})
+    assert row is not None
+    assert row["ProcessId"] == 1068
+    assert row["ImageFileName"] == "Registry"
+    assert row["ImageFileName"].isprintable()

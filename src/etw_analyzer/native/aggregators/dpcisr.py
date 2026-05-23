@@ -96,6 +96,44 @@ def _bucket_for(duration_us: int) -> tuple[int, int]:
     return _BUCKETS[-1]
 
 
+def _to_uint64_series(col: pd.Series) -> pd.Series:
+    """Coerce a column of kernel addresses to ``uint64`` without overflow.
+
+    Kernel-mode pointers live in the upper half of the 64-bit space
+    (``0xFFFF8000_00000000``+ on x64). ``pd.to_numeric(..., downcast=…)``
+    and the previous ``astype("int64")`` path silently overflowed those
+    to negative values, which then failed every symbolizer lookup —
+    leaving the per-CPU DPC text empty and breaking
+    ``get_per_nic_queue_arrivals`` / ``get_rss_dispatch_quality``.
+
+    This helper takes whatever the upstream extractor produced (numpy
+    ``uint64``, Python ``int``, ``object``) and returns a ``uint64``
+    Series with NaN-safe handling. Values that genuinely don't fit in
+    a uint64 fall through as ``pd.NA``.
+    """
+    import numpy as _np
+    if pd.api.types.is_integer_dtype(col) and col.dtype.kind == "u":
+        return col
+    out = []
+    for v in col.tolist():
+        if v is None or (isinstance(v, float) and _np.isnan(v)):
+            out.append(None)
+            continue
+        try:
+            iv = int(v)
+        except (TypeError, ValueError):
+            out.append(None)
+            continue
+        if iv < 0:
+            # Already-overflowed int64 — recover the unsigned form.
+            iv = iv & 0xFFFFFFFFFFFFFFFF
+        if 0 <= iv < (1 << 64):
+            out.append(_np.uint64(iv))
+        else:
+            out.append(None)
+    return pd.Series(out, index=col.index, dtype="object")
+
+
 def _gather_dpc_events(trace: "TraceData") -> pd.DataFrame:
     """Concatenate every DPC/ISR class DataFrame into one frame.
 
@@ -146,17 +184,22 @@ def aggregate_dpc_isr(trace: "TraceData") -> Optional[pd.DataFrame]:
     )
     durations_us = (durations_qpc * 1_000_000 / qpc_hz).fillna(0).clip(lower=0).astype("int64")
 
-    # Symbolize the Routine to a module label.
+    # Symbolize the Routine to a module label. Kernel addresses live in
+    # the upper half of the 64-bit space (``0xFFFF...``), so we must keep
+    # the column as uint64 — ``astype("int64")`` overflows to negative
+    # and the resulting addresses don't match any registered module,
+    # which is why the verification report saw "(unknown)" for every DPC.
     symbolizer = getattr(trace, "symbolizer", None)
-    routines = pd.to_numeric(dpc_df["Routine"], errors="coerce").dropna().astype("int64").unique().tolist()
+    routine_col = _to_uint64_series(dpc_df["Routine"])
+    unique_routines = routine_col.dropna().unique().tolist()
     label_map: dict[int, str] = {}
-    if symbolizer is not None and routines:
+    if symbolizer is not None and unique_routines:
         try:
-            label_map = symbolizer.bulk_resolve(routines)
+            label_map = symbolizer.bulk_resolve([int(r) for r in unique_routines])
         except Exception:
             label_map = {}
     modules = (
-        pd.to_numeric(dpc_df["Routine"], errors="coerce")
+        routine_col
         .map(label_map)
         .fillna("")
         .map(_module_from_label)
@@ -248,15 +291,16 @@ def build_dpc_isr_raw_text(trace: "TraceData") -> Optional[str]:
     cpus = pd.to_numeric(dpc_df["CPU"], errors="coerce").fillna(-1).astype("int64")
 
     symbolizer = getattr(trace, "symbolizer", None)
-    routines = pd.to_numeric(dpc_df["Routine"], errors="coerce").dropna().astype("int64").unique().tolist()
+    routine_col = _to_uint64_series(dpc_df["Routine"])
+    unique_routines = routine_col.dropna().unique().tolist()
     label_map: dict[int, str] = {}
-    if symbolizer is not None and routines:
+    if symbolizer is not None and unique_routines:
         try:
-            label_map = symbolizer.bulk_resolve(routines)
+            label_map = symbolizer.bulk_resolve([int(r) for r in unique_routines])
         except Exception:
             label_map = {}
     modules = (
-        pd.to_numeric(dpc_df["Routine"], errors="coerce")
+        routine_col
         .map(label_map)
         .fillna("")
         .map(_module_from_label)

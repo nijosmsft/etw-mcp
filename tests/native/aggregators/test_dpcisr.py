@@ -127,3 +127,49 @@ class TestBuildDpcIsrRawText:
         # CPU 0 saw 1us, CPU 3 saw 10us — both > 0.
         assert 0 in cpu_set
         assert 3 in cpu_set
+
+    def test_kernel_uint64_routine_addresses_resolve(self):
+        """Regression: real DPC routine addresses live in the kernel half
+        of the 64-bit space (``0xFFFFF806...``). The previous aggregator
+        forced the Routine column through ``astype("int64")``, which
+        overflowed those addresses to negative values that never matched
+        any symbolized routine — so every CPU row was dropped and
+        ``get_per_nic_queue_arrivals(trace_id, "mlx5.sys")`` returned
+        "No DPC/ISR raw text in trace" on the VM-Server trace even
+        though 23K DPC events had been decoded. See
+        ``udp-perf/docs/wpr-mcp-native-etw-verification.md`` §"Residual
+        Issues 3".
+        """
+        # Two kernel-half addresses — both > 2**63, so int64 overflows.
+        ADDR_A = 0xFFFFF806B06A2E30
+        ADDR_B = 0xFFFFF80643781120
+
+        rows = [
+            {"TimeStamp": 100, "InitialTime": 90, "Routine": ADDR_A, "CPU": 2},
+            {"TimeStamp": 200, "InitialTime": 100, "Routine": ADDR_B, "CPU": 5},
+        ]
+        # Coerce the Routine column to numpy uint64 so the input mirrors
+        # what the native consumer produces.
+        import numpy as _np
+        sym = _FakeSymbolizer({
+            ADDR_A: "ntoskrnl.exe!KiDpcWorker+0x30",
+            ADDR_B: "mlx5.sys+0x1120",
+        })
+        trace = _make_trace(rows, symbolizer=sym)
+        # Force uint64 dtype on Routine.
+        trace.raw_csv["_native_dpc_events"]["Routine"] = (
+            trace.raw_csv["_native_dpc_events"]["Routine"].astype(_np.uint64)
+        )
+
+        text = build_dpc_isr_raw_text(trace)
+        assert text is not None, "raw text must be emitted, not None"
+        # Both modules must appear in the per-CPU pair lines.
+        assert "ntoskrnl.exe" in text.lower()
+        assert "mlx5.sys" in text.lower()
+
+        # And the parser must pick up CPU 2 for ntoskrnl, CPU 5 for mlx5.
+        from etw_analyzer.tools.network_dispatch import _per_cpu_dpc_rows
+        parsed = _per_cpu_dpc_rows(text)
+        mlx5_rows = [r for r in parsed if r["Module"].lower() == "mlx5.sys"]
+        assert mlx5_rows, "mlx5.sys must produce per-CPU rows after uint64 fix"
+        assert 5 in {r["CPU"] for r in mlx5_rows}
