@@ -1,5 +1,7 @@
 """Tests for xperf output parsers."""
 
+import io
+from pathlib import Path
 from unittest.mock import patch
 
 import pandas as pd
@@ -13,6 +15,7 @@ from etw_analyzer.parsing.wpa_exporter import (
     _parse_profile_utilization,
     _parse_dpcisr,
     _parse_stack_butterfly_html,
+    _run_xperf_lines,
     parse_dumper_events,
     parse_sampled_profile_events,
     parse_stack_butterfly_callers,
@@ -300,6 +303,55 @@ CSwitch, TimeStamp, New Process Name ( PID), New TID, NPri, NQnt, TmSinceLast, W
 
 class TestParseDumperEvents:
     """Tests for the multi-event-class dispatch parser."""
+
+    def test_streaming_runner_allows_lost_events(self, tmp_path):
+        captured: dict[str, list[str]] = {}
+
+        class FakeProc:
+            def __init__(self, cmd, **_kwargs):
+                captured["cmd"] = cmd
+                self.stdout = io.StringIO("SampledProfile, header\n")
+                self.returncode = 0
+
+            def wait(self, timeout=None):
+                self.returncode = 0
+                return 0
+
+            def poll(self):
+                return self.returncode
+
+            def terminate(self):
+                self.returncode = -15
+
+            def kill(self):
+                self.returncode = -9
+
+        with (
+            patch(
+                "etw_analyzer.parsing.wpa_exporter.find_xperf",
+                return_value=Path(r"C:\fake\xperf.exe"),
+            ),
+            patch("etw_analyzer.parsing.wpa_exporter.subprocess.Popen", side_effect=FakeProc),
+        ):
+            lines = list(
+                _run_xperf_lines(
+                    tmp_path / "fake.etl",
+                    "dumper",
+                    action_args=["-foo"],
+                    symbols=False,
+                )
+            )
+
+        assert lines == ["SampledProfile, header"]
+        assert captured["cmd"] == [
+            r"C:\fake\xperf.exe",
+            "-i",
+            str(tmp_path / "fake.etl"),
+            "-tle",
+            "-a",
+            "dumper",
+            "-foo",
+        ]
 
     def _patch_xperf_lines(self, text: str):
         """Patch ``_run_xperf_lines`` to yield ``text`` line-by-line."""
