@@ -36,6 +36,11 @@ from .extract import (
     count_events_by_provider,
     extract_events,
 )
+from .symbolizer import (
+    Symbolizer,
+    SymbolizerError,
+    is_available as is_symbolizer_available,
+)
 
 
 __all__ = [
@@ -47,4 +52,7 @@ __all__ = [
     "count_events_by_provider",
     "CANONICAL_EVENT_CLASSES",
     "ExtractStats",
+    "Symbolizer",
+    "SymbolizerError",
+    "is_symbolizer_available",
 ]

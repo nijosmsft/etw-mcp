@@ -103,6 +103,15 @@ class TraceData:
     _dumper_ready: threading.Event = field(default_factory=threading.Event, repr=False)
     _dumper_error: str | None = field(default=None, repr=False)
 
+    # Phase N3: dbghelp-backed symbolizer. Populated in native mode by
+    # ``tools.trace_mgmt._start_background_dumper`` once ImageLoad
+    # events have been decoded. ``None`` for xperf-mode traces — the
+    # xperf path uses ``xperf -a symcache -build`` instead, which
+    # produces symbolized strings inline. Phase N4 aggregators
+    # (butterfly, hot_functions) call into ``symbolizer.bulk_resolve``
+    # when resolving SampledProfile stacks.
+    symbolizer: Any = field(default=None, repr=False)
+
     # Metadata
     duration_seconds: float | None = None
     cpu_count: int | None = None

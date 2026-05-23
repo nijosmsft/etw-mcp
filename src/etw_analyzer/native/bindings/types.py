@@ -449,6 +449,38 @@ class PROPERTY_DATA_DESCRIPTOR(ctypes.Structure):
     ]
 
 
+# ---------------------------------------------------------------------------
+# dbghelp support structs.
+#
+# ``SYMBOL_INFOW`` is a variable-length struct: ``Name`` is declared as a
+# 1-WCHAR tail in the SDK and the caller is expected to over-allocate the
+# struct so the tail covers up to ``MaxNameLen`` characters. Consumers in
+# :mod:`native.symbolizer` follow that pattern via ``ctypes.create_string_buffer``
+# plus a pointer cast.
+#
+# Layout matches ``DbgHelp.h`` SDK 10.0.22621 — fixed prefix is 88 bytes
+# on x64; the trailing ``Name`` array adds ``MaxNameLen * sizeof(WCHAR)``.
+# ---------------------------------------------------------------------------
+class SYMBOL_INFOW(ctypes.Structure):
+    _fields_ = [
+        ("SizeOfStruct", wintypes.ULONG),
+        ("TypeIndex", wintypes.ULONG),
+        ("Reserved", ctypes.c_ulonglong * 2),
+        ("Index", wintypes.ULONG),
+        ("Size", wintypes.ULONG),
+        ("ModBase", ctypes.c_ulonglong),
+        ("Flags", wintypes.ULONG),
+        ("Value", ctypes.c_ulonglong),
+        ("Address", ctypes.c_ulonglong),
+        ("Register", wintypes.ULONG),
+        ("Scope", wintypes.ULONG),
+        ("Tag", wintypes.ULONG),
+        ("NameLen", wintypes.ULONG),
+        ("MaxNameLen", wintypes.ULONG),
+        ("Name", wintypes.WCHAR * 1),  # variable-length tail
+    ]
+
+
 __all__ = [
     "GUID",
     "guid_string",
@@ -470,4 +502,5 @@ __all__ = [
     "EVENT_PROPERTY_INFO",
     "TRACE_EVENT_INFO",
     "PROPERTY_DATA_DESCRIPTOR",
+    "SYMBOL_INFOW",
 ]

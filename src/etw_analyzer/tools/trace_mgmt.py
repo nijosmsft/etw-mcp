@@ -382,10 +382,27 @@ def _start_background_dumper(trace: TraceData) -> None:
             if trace.mode == "native":
                 from etw_analyzer.native import extract_events
 
+                # Phase N3: include Image/Load + Image/DCStart so the
+                # Symbolizer can register every module the trace touched.
+                # These classes are kernel auxiliaries — they don't get
+                # persisted to parquet (they're not in
+                # ``_DUMPER_EVENT_CLASSES``), but they're cheap to decode
+                # and we need them on the same extraction pass.
+                wanted_with_images = set(wanted)
+                wanted_with_images.update({"Image/Load", "Image/DCStart"})
+
                 results = extract_events(
                     trace.etl_path,
-                    event_classes=wanted,
+                    event_classes=wanted_with_images,
                 )
+
+                # Build the per-trace Symbolizer and feed every
+                # ImageLoad row into it. Phase N3 only wires the
+                # plumbing — no symbol resolution happens during load,
+                # so failures here shouldn't block. Phase N4
+                # aggregators (butterfly, hot_functions) will call into
+                # ``trace.symbolizer.bulk_resolve`` lazily.
+                _build_symbolizer_from_images(trace, results)
             else:
                 from etw_analyzer.parsing.wpa_exporter import parse_dumper_events
 
@@ -429,6 +446,65 @@ def _start_background_dumper(trace: TraceData) -> None:
             return
         trace._dumper_future = thread
         thread.start()
+
+
+def _build_symbolizer_from_images(
+    trace: TraceData,
+    results: dict[str, pd.DataFrame],
+) -> None:
+    """Instantiate the per-trace Symbolizer and register every loaded module.
+
+    Phase N3 plumbing — Phase N4 will read ``trace.symbolizer`` from the
+    aggregators (butterfly / hot_functions). Today the symbolizer just
+    needs to know the modules so the lazy ``resolve()`` calls later have
+    enough metadata to ask dbghelp.
+
+    Failures here are non-fatal: the trace still loads, just without
+    symbolized stacks. The xperf-mode path is unaffected.
+    """
+
+    try:
+        from etw_analyzer.native import Symbolizer
+    except (ImportError, OSError):
+        return
+
+    try:
+        symbolizer = Symbolizer(symbol_path=trace.symbol_path)
+    except Exception:
+        return
+
+    # Combine Image/Load and Image/DCStart rows. DCStart events are
+    # emitted at trace start for already-loaded modules; Load events
+    # fire as new modules come online during capture. Together they
+    # cover every module a SampledProfile stack could reference.
+    rows: list[dict] = []
+    for class_name in ("Image/Load", "Image/DCStart"):
+        df = results.get(class_name)
+        if df is None or df.empty:
+            continue
+        for row in df.to_dict(orient="records"):
+            rows.append(row)
+
+    # Deduplicate by ImageBase. ETW frequently repeats the same module
+    # across DCStart + a follow-up Load with the same base; one
+    # registration is enough.
+    seen_bases: set[int] = set()
+    for row in rows:
+        base = int(row.get("ImageBase", 0) or 0)
+        if not base or base in seen_bases:
+            continue
+        seen_bases.add(base)
+        size = int(row.get("ImageSize", 0) or 0)
+        file_name = str(row.get("FileName", "") or "")
+        try:
+            symbolizer.add_module(base, size, file_name)
+        except Exception:
+            # Per-module failure is non-fatal; the address will still
+            # resolve to ``unknown+0x…`` if dbghelp can't find a PDB.
+            continue
+
+    with trace.lock:
+        trace.symbolizer = symbolizer
 
 
 def _synthesize_native_cpu_sampling(trace: TraceData) -> None:
@@ -741,6 +817,15 @@ def unload_trace(trace_id: str) -> str:
     """
     trace = require_trace(trace_id)
     if unregister_trace(trace_id):
+        # Release dbghelp state if we had a symbolizer attached
+        # (native-mode traces only). Errors here are silent — the
+        # registry removal already succeeded.
+        sym = getattr(trace, "symbolizer", None)
+        if sym is not None:
+            try:
+                sym.close()
+            except Exception:
+                pass
         return f"Unloaded trace `{trace.trace_id}` (`{trace.etl_path.name}`)"
     return f"Trace `{trace_id}` was not loaded."
 
