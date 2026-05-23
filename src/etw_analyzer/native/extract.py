@@ -39,7 +39,9 @@ import pandas as pd
 
 from .bindings.types import EVENT_RECORD, guid_string
 from .consumer import EtwConsumer, NativeConsumerError
-from .mof import register_kernel_handlers
+from .decoder import TdhDecoder
+from .manifest import MANIFEST_PROVIDERS, lookup as manifest_lookup
+from .mof import kernel_provider_guids, register_kernel_handlers
 
 
 logger = logging.getLogger(__name__)
@@ -129,6 +131,13 @@ _DISPATCH: dict[tuple[str, int, Optional[int]], tuple[str, Callable]] = {}
 register_kernel_handlers(_DISPATCH)
 
 
+# Kernel-MOF provider GUIDs — we pre-mark these on every TdhDecoder
+# instance so TdhGetEventInformation isn't called per kernel event
+# (which is the bulk of every trace). The first event from a non-kernel
+# provider still pays the GUID-formatting cost once.
+_KERNEL_PROVIDER_GUIDS: frozenset[str] = frozenset(kernel_provider_guids())
+
+
 def _lookup_handler(
     guid: str, opcode: int, version: Optional[int]
 ) -> Optional[tuple[str, Callable]]:
@@ -190,6 +199,8 @@ class ExtractStats:
     events_lost: int
     stacks_paired: int
     stacks_orphan: int
+    tdh_schemas_cached: int = 0
+    tdh_negative_cached: int = 0
 
 
 def _header_to_dict(record: EVENT_RECORD) -> dict:
@@ -263,6 +274,20 @@ def extract_events(
     stacks_paired = 0
     stacks_orphan = 0
 
+    # TDH-based manifest decoder. We instantiate lazily — many traces
+    # will never need it (pure kernel-logger captures) and creating it
+    # is cheap but pre-marking the kernel providers takes a couple of
+    # microseconds we'd rather skip.
+    tdh_decoder: Optional[TdhDecoder] = None
+
+    def _ensure_tdh() -> TdhDecoder:
+        nonlocal tdh_decoder
+        if tdh_decoder is None:
+            tdh_decoder = TdhDecoder()
+            for kg in _KERNEL_PROVIDER_GUIDS:
+                tdh_decoder.mark_provider_skip(kg)
+        return tdh_decoder
+
     def _record_class(canonical: str, row: NativeRowDict) -> None:
         bucket = rows_by_class.get(canonical)
         if bucket is None:
@@ -282,10 +307,6 @@ def extract_events(
         opcode = int(record.EventHeader.EventDescriptor.Opcode)
         version = int(record.EventHeader.EventDescriptor.Version)
         entry = _lookup_handler(guid, opcode, version)
-        if entry is None:
-            return
-
-        canonical, fn = entry
 
         # Pull payload bytes. ``ctypes.string_at`` is cheap (memcpy into a
         # bytes object), and the buffer is reused by ETW after the
@@ -301,14 +322,45 @@ def extract_events(
 
         hdr = _header_to_dict(record)
 
-        try:
-            row = fn(payload, hdr)
-        except Exception:
-            logger.debug("MOF decoder for %s raised", canonical, exc_info=True)
-            return
-
-        if row is None:
-            return
+        if entry is not None:
+            canonical, fn = entry
+            try:
+                row = fn(payload, hdr)
+            except Exception:
+                logger.debug("MOF decoder for %s raised", canonical, exc_info=True)
+                return
+            if row is None:
+                return
+        else:
+            # No kernel-MOF handler — try the TDH path. The manifest
+            # registry is keyed on (guid, event_id) so the dispatch is
+            # version-agnostic; the mapper itself tolerates field-name
+            # drift across manifest versions.
+            event_id = int(record.EventHeader.EventDescriptor.Id)
+            manifest_entry = manifest_lookup(guid, event_id)
+            if manifest_entry is None:
+                return
+            canonical, mapper = manifest_entry
+            decoder = _ensure_tdh()
+            try:
+                fields = decoder.decode_event(record)
+            except Exception:
+                logger.debug(
+                    "TDH decode for (%s,%d) raised", guid, event_id, exc_info=True
+                )
+                return
+            if fields is None:
+                # TDH had no manifest — probably a misregistered ID.
+                return
+            try:
+                row = mapper(fields, hdr, payload, decoder)
+            except Exception:
+                logger.debug(
+                    "Manifest mapper for %s raised", canonical, exc_info=True
+                )
+                return
+            if row is None:
+                return
 
         # StackWalk: pair against the pending buffer instead of buffering
         # by itself. The decoded row has ``EventTimeStamp`` (the QPC of
@@ -369,6 +421,8 @@ def extract_events(
                 events_lost=stats.events_lost,
                 stacks_paired=stacks_paired,
                 stacks_orphan=stacks_orphan,
+                tdh_schemas_cached=(tdh_decoder.schema_count() if tdh_decoder else 0),
+                tdh_negative_cached=(tdh_decoder.negative_count() if tdh_decoder else 0),
             )
         )
 
