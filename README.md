@@ -32,6 +32,8 @@ Install the WPR trace analyzer MCP server on this Windows machine:
 - **System info** — CPU model, NIC details, memory, disk config from trace metadata
 - **Process info** — running processes, command lines, loaded driver versions
 - **Disk I/O** — per-file I/O summary to rule out storage bottlenecks
+- **Network flows and sockets** — TCP/UDP throughput, per-flow summaries, retransmits, socket lifecycle, and AFD batching
+- **Packet capture analysis** — decode NDIS PacketCapture frame bytes from WPR/pktmon-style ETLs, including 5-tuples, timelines, and Send→Recv latency estimates
 - **Export** — save analysis to markdown for sharing via email
 - **Caching** — parquet-based disk cache for instant reload, parallel xperf extraction
 
@@ -117,6 +119,13 @@ You don't need to know tool names. Just describe what you want:
 "What are the DPC durations for the NIC driver?"
 "Which CPUs are active and which are idle?"
 "Is there lock contention in the networking stack?"
+"Show TCP and UDP throughput by process"
+"Summarize UDP flows in this trace"
+"Show packet drops by miniport and reason"
+"Summarize packet-capture 5-tuples from this pktmon trace"
+"Show the packet timeline for 10.0.0.1:5000 -> 10.0.0.2:6000/udp"
+"Decode the packet closest to timestamp 123456789"
+"Estimate Send -> Recv latency from packet capture data"
 "Compare this trace with the baseline"
 "Export the analysis to a markdown file"
 "What hardware is this trace from?"
@@ -126,13 +135,77 @@ You don't need to know tool names. Just describe what you want:
 ### Workflow
 
 ```
-load_trace(path)          → Parse ETL via xperf, cache as parquet, return trace_id
+load_trace(path)          → Parse ETL via native ETW or xperf, cache as parquet, return trace_id
 analyze(trace_id)         → One-call comprehensive report
 detailed tools(trace_id)  → Drill into specific areas
 export_analysis(trace_id) → Save to .md for sharing
 ```
 
 Every analysis tool requires the `trace_id` returned by `load_trace`. This allows multiple traces to be analyzed concurrently in the same MCP server process without cross-trace contamination.
+
+### Packet Capture and pktmon Examples
+
+Packet-level tools need an ETL that includes NDIS PacketCapture frame bytes. For pktmon, capture raw packet bytes so the analyzer can decode Ethernet/IP/TCP/UDP headers:
+
+```powershell
+pktmon filter remove
+pktmon filter add UdpEcho -t UDP -p 4444
+pktmon start --capture --pkt-size 0 --file-name C:\traces\pktmon-udp.etl
+# Run the workload you want to inspect.
+pktmon stop
+```
+
+WPR profiles work too as long as they enable the `Microsoft-Windows-NDIS-PacketCapture` provider.
+
+Then ask questions like:
+
+```
+"Load C:\traces\pktmon-udp.etl and show the packet capture summary"
+"Which 5-tuples account for the most bytes?"
+"Show packet timeline for 10.0.0.1:4444 -> 10.0.0.2:4444/udp"
+"Decode the packet closest to timestamp 123456789"
+"Estimate one-way Send -> Recv latency for captured packets"
+"Show NDIS packet drops by miniport and reason"
+"Check whether UDP recv processing is staying on the same CPUs as NIC DPCs"
+```
+
+### Remote Collection with LabLink MCP
+
+This server pairs well with [LabLink MCP](https://github.com/nijosmsft/LabLink) when the AI client has both MCP servers configured. LabLink provides remote hands on Windows lab nodes; wpr-mcp-server analyzes the ETL after LabLink collects or pulls it to the operator machine.
+
+Common combined prompts:
+
+```
+"Use LabLink to collect a 60 second networking WPR trace from vm-server, save it as C:\traces\vm-server-network.etl, then load it and analyze network hot functions."
+"Collect a packet monitor trace on vm-server for UDP port 4444, pull it to C:\traces\vm-server-pktmon.etl, then show packet-capture 5-tuples and UDP flows."
+"Get a perf log from the server role for 30 seconds, analyze CPU usage, DPCs, and TCP/UDP throughput."
+"Run pktmon on vm-server for traffic between 10.0.0.1 and 10.0.0.2, then decode the largest flow and estimate Send -> Recv latency."
+```
+
+For WPR captures, the assistant can use LabLink's `collect_etw_trace` tool directly:
+
+```text
+LabLink collect_etw_trace(node="vm-server", profile="C:\profiles\networking.wprp", duration=60, local_output="C:\traces\vm-server-network.etl")
+wpr-mcp-server load_trace("C:\traces\vm-server-network.etl")
+wpr-mcp-server analyze(trace_id)
+```
+
+For pktmon captures, the assistant can use LabLink to run the remote commands and pull the ETL back:
+
+```text
+LabLink execute_script(node="vm-server", script_body="
+pktmon filter remove
+pktmon filter add UdpEcho -t UDP -p 4444
+pktmon start --capture --pkt-size 0 --file-name C:\Temp\vm-server-pktmon.etl
+Start-Sleep -Seconds 30
+pktmon stop
+")
+LabLink pull_file(node="vm-server", remote_path="C:\Temp\vm-server-pktmon.etl", local_path="C:\traces\vm-server-pktmon.etl")
+wpr-mcp-server load_trace("C:\traces\vm-server-pktmon.etl")
+wpr-mcp-server get_packet_capture_summary(trace_id)
+```
+
+The LabLink agent needs permission to run WPR or pktmon on the target node and write the remote ETL path. The analyzer still runs locally and only requires access to the pulled `.etl` file.
 
 ### Available Tools
 
@@ -166,6 +239,29 @@ Every analysis tool requires the `trace_id` returned by `load_trace`. This allow
 | `get_dpc_per_cpu` | Per-CPU DPC breakdown |
 | `get_lock_contention` | Spinlock contention from ReadyThread stacks |
 | `get_memory_pools` | Kernel pool allocations by module and tag |
+
+#### Networking & Packet Capture
+
+| Tool | Purpose |
+|------|---------|
+| `get_connection_summary` | Per-TCP-connection bytes, packets, retransmits, and duration |
+| `get_udp_flow_summary` | Per-UDP-flow packet counts, bytes, duration, and packet rate |
+| `get_per_process_socket_throughput` | Per-process TCP/UDP PPS and MB/s, split by send and receive |
+| `get_tcp_retransmits` | Per-connection TCP retransmit counts and rates |
+| `get_connect_latency` | Per-process TCP connect cadence/latency percentiles |
+| `get_accept_latency` | Per-process TCP accept cadence/latency percentiles |
+| `get_packet_drops` | NDIS dropped-packet counts by miniport and reason |
+| `get_afd_batching` | Approximate packets per AFD/IOCP receive completion |
+| `get_socket_lifecycle` | Socket create/close timing, duration, recv/send counts, and bytes |
+| `get_socket_affinity_check` | Whether AFD recv completions cluster on one CPU per socket |
+| `get_packet_capture_summary` | Decode packet-capture frame bytes and group traffic by 5-tuple |
+| `get_packet_timeline` | Show chronological packets for a selected 5-tuple |
+| `decode_packet` | Decode the Ethernet, IP, and L4 headers for the packet nearest a timestamp |
+| `get_send_recv_latency` | Heuristic Send→Recv latency from matched packet-capture events |
+| `get_rss_dispatch_quality` | Compare NIC DPC CPUs with process CPU samples to spot cross-CPU dispatch |
+| `get_udp_dispatch_quality` | UDP receive-path CPU distribution and overlap with networking DPC CPUs |
+| `get_per_nic_queue_arrivals` | Per-CPU distribution of NIC-driver DPCs for RSS queue spread |
+| `get_network_wait_chain` | Wait-reason and ReadyThread detail for network-active threads |
 
 #### System & Process Info
 
