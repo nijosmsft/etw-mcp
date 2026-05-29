@@ -10,7 +10,10 @@ from etw_analyzer.native import cache as native_cache
 from etw_analyzer.native.aggregators.dpcisr import aggregate_dpc_isr
 from etw_analyzer.native.aggregators.profile_detail import aggregate_cpu_sampling
 from etw_analyzer.native.aggregators.profile_util import aggregate_cpu_timeline
-from etw_analyzer.native.aggregators.streaming import build_streaming_aggregates
+from etw_analyzer.native.aggregators.streaming import (
+    _normalize_cpu_sampling_capacity,
+    build_streaming_aggregates,
+)
 from etw_analyzer.native.event_store import EventStoreTimebase, NativeEventStoreWriter
 from etw_analyzer.native.worker import NativeWorkerRequest, build_streaming_event_store_cache
 import etw_analyzer.native as native
@@ -220,6 +223,63 @@ def test_streaming_aggregates_match_dataframe_aggregators(tmp_path: Path):
     assert "process_info" in result.texts
     assert "server.exe" in result.texts["process_info"]
     assert result.warnings == []
+
+
+def test_streaming_idle_top_up_does_not_treat_real_idle_sample_as_synthetic(tmp_path: Path):
+    trace = TraceData(
+        trace_id="trace_idle",
+        etl_path=tmp_path / "sample.etl",
+        export_dir=tmp_path / ".etw-export-sample",
+        mode="native",
+        duration_seconds=1.0,
+        cpu_count=1,
+    )
+    cpu_sampling = pd.DataFrame([{
+        "Process Name": "Idle",
+        "PID": 0,
+        "Weight": 250_000,
+        "% Weight": 100.0,
+        "Module": "ntoskrnl.exe",
+        "Function": "KiIdleLoop",
+    }])
+    cpu_sampling.attrs["profile_weight_time_scaled"] = True
+
+    result = _normalize_cpu_sampling_capacity(cpu_sampling, None, trace)
+
+    assert len(result) == 2
+    assert int(result["Weight"].sum()) == 1_000_000
+    synthetic = result[
+        (result["Module"] == "<Heuristic Low Power State>")
+        & (result["Function"] == "<C3>")
+    ].iloc[0]
+    assert synthetic["Process Name"] == "Idle"
+    assert synthetic["Weight"] == 750_000
+
+
+def test_streaming_sample_count_weights_do_not_synthesize_idle(tmp_path: Path):
+    trace = TraceData(
+        trace_id="trace_sample_count",
+        etl_path=tmp_path / "sample.etl",
+        export_dir=tmp_path / ".etw-export-sample",
+        mode="native",
+        duration_seconds=1.0,
+        cpu_count=1,
+    )
+    cpu_sampling = pd.DataFrame([{
+        "Process Name": "server.exe",
+        "PID": 1234,
+        "Weight": 1_000,
+        "% Weight": 100.0,
+        "Module": "mod.sys",
+        "Function": "HotRoutine",
+    }])
+    cpu_sampling.attrs["profile_weight_time_scaled"] = False
+
+    result = _normalize_cpu_sampling_capacity(cpu_sampling, None, trace)
+
+    assert len(result) == 1
+    assert "Idle" not in result["Process Name"].tolist()
+    assert int(result["Weight"].sum()) == 1_000
 
 
 def test_worker_streaming_finalization_writes_aggregate_outputs(

@@ -5,9 +5,9 @@ of named TDH fields, this module maps it onto the canonical row schema
 the Phase 3-5 tools expect (the same shape ``parsing.wpa_exporter`` builds
 from xperf text). The mapping is one closed-form function per
 (provider_guid, event_id) entry — manifests change occasionally between
-Windows builds but the relevant TCPIP/AFD/Quic/HttpService event IDs and
-their core fields are stable enough that a hand-written table beats any
-runtime introspection.
+Windows builds but the currently verified TCPIP/AFD/Quic/HttpService and
+NDIS PacketCapture event IDs and their core fields are stable enough that a
+hand-written table beats any runtime introspection.
 
 For every supported manifest event we record:
 
@@ -21,13 +21,18 @@ For every supported manifest event we record:
   sockaddrs can be re-parsed), and ``decoder`` is the schema (in case
   the mapper needs to look at the property descriptor list).
 
-Providers covered fully:
+Providers covered by the fast-path registry:
 
 * **TCPIP** (``2f07e2ee-15db-40f1-90ef-9d7ba282188a``)
 * **AFD/Winsock** (``e53c6823-7bb8-44bb-90dc-3f86090d48a6``)
 * **MsQuic** (``ff15e657-4f26-570e-88ab-0796b258d11c``)
 * **HttpService** (``dd5ef90a-6398-47a4-ad34-4dcecdef795f``)
 * **NDIS-PacketCapture** (``2ed6006e-4729-4609-b423-3ee7bcd678ef``)
+
+NDIS drop rows have a mapper helper below, but no registry entry: this repo
+does not yet contain a verified provider GUID/event ID for those manifest
+rows, and guessing would silently misclassify unrelated NDIS events. Use the
+xperf path for drop parity until that ID is verified.
 
 Event-ID source: the ``multi-provider.etl`` reference trace at
 ``C:\\temp\\etw-feasibility\\`` and the field-name discovery probe whose
@@ -543,6 +548,33 @@ def _map_ndis_packet_capture(fields, hdr, payload, decoder):
         "MiniportName": f"IfIndex={_to_int(fields.get('MiniportIfIndex'))}",
         "PacketBytes": blob.hex(),
         "Size": size,
+    })
+    return row
+
+
+def _map_ndis_drop(fields, hdr, payload, decoder):
+    row = _make_header(hdr)
+    miniport = (
+        fields.get("MiniportName")
+        or fields.get("Miniport")
+        or fields.get("AdapterName")
+        or fields.get("IfIndex")
+        or fields.get("MiniportIfIndex")
+    )
+    row.update({
+        "MiniportName": "" if miniport is None else str(miniport),
+        "Reason": str(
+            fields.get("Reason")
+            or fields.get("DropReason")
+            or fields.get("Status")
+            or ""
+        ),
+        "Size": _to_int(
+            fields.get("Size")
+            or fields.get("PacketSize")
+            or fields.get("FragmentSize")
+            or fields.get("PayloadLength")
+        ),
     })
     return row
 

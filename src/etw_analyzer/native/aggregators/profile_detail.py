@@ -19,7 +19,9 @@ Algorithm:
        rundown/start rows when the event-header PID is the kernel sentinel,
        then look up the process name from Process/DCStart/Start rows.
     5. Group by (Process Name, PID, Module, Function), sum
-       ``ProfileWeight`` when present (else ``Weight``), compute % Weight.
+       ``ProfileWeight`` when present (else ``Weight``), synthesize xperf's
+       Idle bucket only when trace duration and CPU count give a reliable
+       capacity, then compute % Weight.
 
 Symbolization is the expensive step here. We deduplicate IPs first so
 ``bulk_resolve`` only pays the dbghelp cost once per unique address —
@@ -158,11 +160,106 @@ def aggregate_cpu_sampling(trace: "TraceData") -> Optional[pd.DataFrame]:
         .sum()
         .reset_index()
     )
+    agg = _synthesize_idle_row_when_reliable(
+        trace,
+        agg,
+        profile_weight_time_scaled=(
+            weight_col == "ProfileWeight"
+            and _profile_weights_are_time_scaled(df)
+        ),
+    )
     total = float(agg["Weight"].sum()) or 1.0
     agg["% Weight"] = (agg["Weight"] / total) * 100.0
     agg = agg[["Process Name", "PID", "Weight", "% Weight", "Module", "Function"]]
     agg = agg.sort_values("Weight", ascending=False).reset_index(drop=True)
     return agg
+
+
+def _synthesize_idle_row_when_reliable(
+    trace: "TraceData",
+    agg: pd.DataFrame,
+    *,
+    profile_weight_time_scaled: bool,
+) -> pd.DataFrame:
+    """Add xperf's Idle bucket when native metadata gives a safe capacity."""
+
+    if agg.empty or "Weight" not in agg.columns or not profile_weight_time_scaled:
+        return agg
+
+    capacity = _trace_cpu_capacity_us(trace)
+    if capacity is None or capacity <= 0:
+        return agg
+
+    weights = pd.to_numeric(agg["Weight"], errors="coerce").fillna(0.0)
+    observed = float(weights.sum())
+    if observed <= 0 or observed >= capacity:
+        return agg
+
+    idle_weight = int(round(capacity - observed))
+    if idle_weight <= 0:
+        return agg
+
+    idle_row = {
+        "Process Name": "Idle",
+        "PID": 0,
+        "Weight": idle_weight,
+        "Module": "<Heuristic Low Power State>",
+        "Function": "<C3>",
+    }
+    return pd.concat([agg, pd.DataFrame([idle_row])], ignore_index=True)
+
+
+def _profile_weights_are_time_scaled(df: pd.DataFrame) -> bool:
+    if "ProfileWeight" not in df.columns or "Weight" not in df.columns:
+        return False
+    profile_weights = pd.to_numeric(df["ProfileWeight"], errors="coerce").fillna(0.0)
+    sample_weights = pd.to_numeric(df["Weight"], errors="coerce").fillna(0.0)
+    return bool((profile_weights > sample_weights).any())
+
+
+def _trace_cpu_capacity_us(trace: "TraceData") -> float | None:
+    duration = _positive_trace_float(getattr(trace, "duration_seconds", None))
+    cpu_count = _positive_trace_int(getattr(trace, "cpu_count", None))
+
+    raw_csv = getattr(trace, "raw_csv", {}) or {}
+    metadata = raw_csv.get("trace_metadata")
+    if metadata is not None and not getattr(metadata, "empty", True):
+        if duration is None and "DurationSeconds" in metadata.columns:
+            duration = _positive_series_float(metadata["DurationSeconds"])
+        if cpu_count is None and "NumberOfProcessors" in metadata.columns:
+            cpu_count = _positive_series_int(metadata["NumberOfProcessors"])
+
+    if duration is None or cpu_count is None:
+        return None
+    return float(duration) * float(cpu_count) * 1_000_000.0
+
+
+def _positive_trace_float(value) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 else None
+
+
+def _positive_trace_int(value) -> int | None:
+    try:
+        number = int(float(value))
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 else None
+
+
+def _positive_series_float(series: pd.Series) -> float | None:
+    values = pd.to_numeric(series, errors="coerce").dropna()
+    values = values[values > 0]
+    return float(values.max()) if not values.empty else None
+
+
+def _positive_series_int(series: pd.Series) -> int | None:
+    values = pd.to_numeric(series, errors="coerce").dropna()
+    values = values[values > 0]
+    return int(values.max()) if not values.empty else None
 
 
 def _build_pid_to_name_map(trace: "TraceData") -> dict[int, str]:

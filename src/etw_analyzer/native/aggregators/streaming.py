@@ -273,8 +273,26 @@ def _normalize_cpu_sampling_capacity(
     # If the decoded ProfileWeight already looks like xperf's total CPU
     # capacity, preserve it. This is the common path and keeps small-trace
     # parity exact.
+    profile_weight_time_scaled = bool(cpu_sampling.attrs.get("profile_weight_time_scaled", False))
+
     if current_total <= expected_capacity * 1.5:
-        return _recompute_cpu_sampling_percent(cpu_sampling)
+        normalized = cpu_sampling.copy()
+        if (
+            profile_weight_time_scaled
+            and current_total < expected_capacity
+            and not _has_synthetic_idle_row(normalized)
+        ):
+            idle_weight = int(round(expected_capacity - current_total))
+            if idle_weight > 0:
+                idle_row = {
+                    "Process Name": "Idle",
+                    "PID": 0,
+                    "Weight": idle_weight,
+                    "Module": "<Heuristic Low Power State>",
+                    "Function": "<C3>",
+                }
+                normalized = pd.concat([normalized, pd.DataFrame([idle_row])], ignore_index=True)
+        return _recompute_cpu_sampling_percent(normalized)
 
     active_target = _timeline_busy_us(cpu_timeline)
     if active_target is None or active_target <= 0:
@@ -304,6 +322,17 @@ def _normalize_cpu_sampling_capacity(
         normalized = pd.concat([normalized, pd.DataFrame([idle_row])], ignore_index=True)
 
     return _recompute_cpu_sampling_percent(normalized)
+
+
+def _has_synthetic_idle_row(cpu_sampling: pd.DataFrame) -> bool:
+    required = {"Process Name", "Module", "Function"}
+    if not required.issubset(cpu_sampling.columns):
+        return False
+    return (
+        cpu_sampling["Process Name"].astype(str).eq("Idle")
+        & cpu_sampling["Module"].astype(str).eq("<Heuristic Low Power State>")
+        & cpu_sampling["Function"].astype(str).eq("<C3>")
+    ).any()
 
 
 def _recompute_cpu_sampling_percent(cpu_sampling: pd.DataFrame) -> pd.DataFrame:
@@ -524,6 +553,7 @@ def _build_cpu_sampling(
     batch_size: int,
 ) -> pd.DataFrame | None:
     weights: dict[tuple[str, int, str, str], int] = defaultdict(int)
+    profile_weight_time_scaled = False
 
     columns = [
         "ProcessId", "ThreadId", "PayloadThreadId", "InstructionPointer",
@@ -554,8 +584,11 @@ def _build_cpu_sampling(
             )
             process_name = dimensions.pid_to_name.get(pid, "Unknown")
             weight = _positive_int(_value_at(profile_weights, idx))
+            base_weight = _positive_int(_value_at(base_weights, idx))
+            if weight is not None and base_weight is not None and weight > base_weight:
+                profile_weight_time_scaled = True
             if weight is None:
-                weight = _positive_int(_value_at(base_weights, idx)) or 1
+                weight = base_weight or 1
             module, function = resolver.pair_for(ip)
             weights[(process_name, pid, module, function)] += int(weight)
 
@@ -575,7 +608,9 @@ def _build_cpu_sampling(
     total = float(df["Weight"].sum()) or 1.0
     df["% Weight"] = df["Weight"].astype(float) / total * 100.0
     df = df[["Process Name", "PID", "Weight", "% Weight", "Module", "Function"]]
-    return df.sort_values("Weight", ascending=False).reset_index(drop=True)
+    df = df.sort_values("Weight", ascending=False).reset_index(drop=True)
+    df.attrs["profile_weight_time_scaled"] = profile_weight_time_scaled
+    return df
 
 
 def _build_dpc_aggregates(

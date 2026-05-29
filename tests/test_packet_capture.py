@@ -7,8 +7,10 @@ fixture rows or fixture dumper text.
 
 from __future__ import annotations
 
+import os
 import socket
 import struct
+import subprocess
 from pathlib import Path
 from unittest.mock import patch
 
@@ -22,9 +24,12 @@ from etw_analyzer.parsing.wpa_exporter import (
     parse_dumper_events,
 )
 from etw_analyzer.tools.packet_capture import (
+    _ensure_pktmon_text,
+    _write_cache_metadata,
     decode_packet,
     get_packet_capture_summary,
     get_packet_timeline,
+    get_pktmon_layer_latency,
     get_send_recv_latency,
 )
 from etw_analyzer.trace_state import (
@@ -268,6 +273,118 @@ def _register_event_store_trace(
     return trace
 
 
+def _pcapng_block(block_type: int, body: bytes) -> bytes:
+    total_len = 12 + len(body)
+    return struct.pack("<II", block_type, total_len) + body + struct.pack("<I", total_len)
+
+
+def _write_pcapng(path: Path, packets: list[bytes]) -> None:
+    section_body = (
+        b"\x4d\x3c\x2b\x1a"
+        + struct.pack("<HHq", 1, 0, -1)
+    )
+    interface_body = struct.pack("<HHI", 1, 0, 65535)
+    blocks = [
+        _pcapng_block(0x0A0D0D0A, section_body),
+        _pcapng_block(0x00000001, interface_body),
+    ]
+    for index, packet in enumerate(packets):
+        timestamp = 1_000_000 + index
+        packet_body = struct.pack(
+            "<IIIII",
+            0,
+            timestamp >> 32,
+            timestamp & 0xFFFFFFFF,
+            len(packet),
+            len(packet),
+        )
+        packet_body += packet
+        packet_body += b"\x00" * ((4 - (len(packet) % 4)) % 4)
+        blocks.append(_pcapng_block(0x00000006, packet_body))
+    path.write_bytes(b"".join(blocks))
+
+
+def _register_pktmon_text_trace(
+    trace_id: str,
+    tmp_path: Path,
+    text: str,
+    packets: list[bytes] | None = None,
+) -> TraceData:
+    etl_path = tmp_path / f"{trace_id}.etl"
+    export_dir = tmp_path / f".etw-export-{trace_id}"
+    etl_path.write_bytes(b"synthetic pktmon etl")
+    export_dir.mkdir()
+    text_path = export_dir / "pktmon.etl2txt.txt"
+    text_path.write_bytes(text.encode("utf-16"))
+    _write_cache_metadata(text_path, etl_path)
+    (export_dir / "pktmon.components.txt").write_text(_PKTMON_COMPONENTS_FIXTURE, encoding="utf-8")
+    if packets is not None:
+        pcapng_path = export_dir / "pktmon.etl2pcap.pcapng"
+        _write_pcapng(pcapng_path, packets)
+        _write_cache_metadata(pcapng_path, etl_path)
+    trace = TraceData(
+        trace_id=trace_id,
+        etl_path=etl_path,
+        export_dir=export_dir,
+        packet_capture_df=None,
+    )
+    trace._dumper_ready.set()
+    register_trace(trace)
+    return trace
+
+
+_PKTMON_TEXT_FIXTURE = f"""
+12:05:31.000000000 PktGroupId 1, PktNumber 1, Appearance 0, Direction Tx , Type Ethernet , Component 12, Edge 1, Filter 2, OriginalSize {len(_PACKET_A_HEX) // 2}, LoggedSize {len(_PACKET_A_HEX) // 2}
+\t00-00-00-00-00-01 > 00-00-00-00-00-02, IPv4, length 28: 10.0.0.1.5000 > 10.0.0.2.6000: UDP, length 8
+12:05:31.000001000 PktGroupId 2, PktNumber 1, Appearance 0, Direction Tx , Type Ethernet , Component 4, Edge 1, Filter 2, OriginalSize {len(_PACKET_A_HEX) // 2}, LoggedSize {len(_PACKET_A_HEX) // 2}
+\t00-00-00-00-00-01 > 00-00-00-00-00-02, IPv4, length 28: 10.0.0.1.5000 > 10.0.0.2.6000: UDP, length 8
+12:05:31.000002000 PktGroupId 3, PktNumber 1, Appearance 0, Direction Rx , Type Ethernet , Component 1, Edge 1, Filter 2, OriginalSize {len(_PACKET_B_HEX) // 2}, LoggedSize {len(_PACKET_B_HEX) // 2}
+\t00-00-00-00-00-02 > 00-00-00-00-00-01, IPv4, length 28: 10.0.0.2.6000 > 10.0.0.1.5000: UDP, length 8
+12:05:31.000003000 PktGroupId 4, PktNumber 1, Appearance 0, Direction Rx , Type Ethernet , Component 4, Edge 1, Filter 2, OriginalSize {len(_PACKET_B_HEX) // 2}, LoggedSize {len(_PACKET_B_HEX) // 2}
+\t00-00-00-00-00-02 > 00-00-00-00-00-01, IPv4, length 28: 10.0.0.2.6000 > 10.0.0.1.5000: UDP, length 8
+"""
+
+
+_PKTMON_COMPONENTS_FIXTURE = """
+NIC: Synthetic NIC
+    Id: 1
+    Driver: syntheticnic.sys
+
+    Filter Drivers:
+        Id Driver           Name
+        -- ------           ----
+        6 wfplwfs.sys       WFP Native Filter
+        4 samplelwf.sys     Sample LWF
+
+    Protocols:
+        Id Driver     Name   EtherType
+        -- ------     ----   ---------
+        12 tcpip.sys  TCPIP  IPv4, ARP
+        9             NETVSCVFPP * (All)
+"""
+
+
+def _pktmon_path_text(
+    *,
+    direction: str,
+    packet_len: int,
+    detail: str,
+    stages: list[tuple[int, int]],
+    start_group: int = 100,
+) -> str:
+    lines = []
+    for index, (component, edge) in enumerate(stages):
+        lines.append(
+            "12:05:31."
+            f"{index:09d} PktGroupId {start_group + index}, PktNumber 1, "
+            f"Appearance 0, Direction {direction} , Type Ethernet , "
+            f"Component {component}, Edge {edge}, Filter 1, "
+            f"OriginalSize {packet_len}, LoggedSize {packet_len}"
+        )
+        lines.append(f"\t{detail}")
+    return "\n".join(lines) + "\n"
+
+
 # ---------------------------------------------------------------------------
 # Tool tests: get_packet_capture_summary
 # ---------------------------------------------------------------------------
@@ -316,6 +433,272 @@ class TestPacketCaptureSummary:
         out = get_packet_capture_summary("pcs4", process_filter="wanted")
         assert "10.0.0.1:5000 -> 10.0.0.2:6000/udp" in out
         assert "10.0.0.2:6000 -> 10.0.0.1:5000/udp" not in out
+
+    def test_pktmon_text_fallback_dedupes_boundary_packets(self, tmp_path):
+        _register_pktmon_text_trace("pcs_pktmon", tmp_path, _PKTMON_TEXT_FIXTURE)
+
+        out = get_packet_capture_summary("pcs_pktmon")
+
+        assert "Source: pktmon ETL text fallback" in out
+        assert "Total packets: 2" in out
+        assert "10.0.0.1:5000 -> 10.0.0.2:6000/udp" in out
+        assert "10.0.0.2:6000 -> 10.0.0.1:5000/udp" in out
+
+    def test_pktmon_text_fallback_rejects_process_filter(self, tmp_path):
+        _register_pktmon_text_trace("pcs_pktmon_filter", tmp_path, _PKTMON_TEXT_FIXTURE)
+
+        out = get_packet_capture_summary("pcs_pktmon_filter", process_filter="echo")
+
+        assert "Process filtering is not available for pktmon text fallback" in out
+
+
+class TestPktmonDerivedPacketTools:
+    def test_pktmon_component_sidecar_next_to_etl_is_used(self, tmp_path):
+        trace_id = "pktmon_sidecar"
+        etl_path = tmp_path / f"{trace_id}.etl"
+        export_dir = tmp_path / f".etw-export-{trace_id}"
+        etl_path.write_bytes(b"synthetic pktmon etl")
+        export_dir.mkdir()
+        (etl_path.with_name(f"{etl_path.stem}.components.txt")).write_text(
+            _PKTMON_COMPONENTS_FIXTURE,
+            encoding="utf-8",
+        )
+        text = _pktmon_path_text(
+            direction="Tx",
+            packet_len=len(_PACKET_A_HEX) // 2,
+            detail=(
+                "00-00-00-00-00-01 > 00-00-00-00-00-02, IPv4, length 28: "
+                "10.0.0.1.5000 > 10.0.0.2.6000: UDP, length 8"
+            ),
+            stages=[(4, 1), (4, 2)],
+        )
+        text_path = export_dir / "pktmon.etl2txt.txt"
+        pcapng_path = export_dir / "pktmon.etl2pcap.pcapng"
+        text_path.write_bytes(text.encode("utf-16"))
+        _write_cache_metadata(text_path, etl_path)
+        _write_pcapng(pcapng_path, [bytes.fromhex(_PACKET_A_HEX), bytes.fromhex(_PACKET_A_HEX)])
+        _write_cache_metadata(pcapng_path, etl_path)
+        trace = TraceData(trace_id=trace_id, etl_path=etl_path, export_dir=export_dir)
+        trace._dumper_ready.set()
+        register_trace(trace)
+
+        out = get_pktmon_layer_latency(trace_id)
+
+        assert "Component names:" in out
+        assert "Sample LWF (samplelwf.sys): edge 1 -> edge 2" in out
+
+    def test_stale_pktmon_text_cache_is_regenerated(self, tmp_path):
+        etl_path = tmp_path / "stale.etl"
+        export_dir = tmp_path / ".etw-export-stale"
+        text_path = export_dir / "pktmon.etl2txt.txt"
+        export_dir.mkdir()
+        etl_path.write_bytes(b"old")
+        text_path.write_text("stale", encoding="utf-16")
+        _write_cache_metadata(text_path, etl_path)
+        etl_path.write_bytes(b"new etl with different identity")
+        os.utime(etl_path, (2, 2))
+        os.utime(text_path, (3, 3))
+        trace = TraceData(trace_id="stale", etl_path=etl_path, export_dir=export_dir)
+
+        def fake_run(cmd, **_kwargs):
+            out_path = Path(cmd[cmd.index("--out") + 1])
+            out_path.write_text("fresh", encoding="utf-16")
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        with patch("etw_analyzer.tools.packet_capture.subprocess.run", side_effect=fake_run):
+            path, error = _ensure_pktmon_text(trace)
+
+        assert error is None
+        assert path == text_path
+        assert text_path.read_text(encoding="utf-16") == "fresh"
+
+    def test_pktmon_pcapng_fallback_powers_timeline_and_decode(self, tmp_path):
+        _register_pktmon_text_trace(
+            "pktmon_deep",
+            tmp_path,
+            _PKTMON_TEXT_FIXTURE,
+            [
+                bytes.fromhex(_PACKET_A_HEX),
+                bytes.fromhex(_PACKET_A_HEX),
+                bytes.fromhex(_PACKET_B_HEX),
+                bytes.fromhex(_PACKET_B_HEX),
+            ],
+        )
+
+        timeline = get_packet_timeline(
+            "pktmon_deep",
+            "10.0.0.1:5000 -> 10.0.0.2:6000/udp",
+        )
+        decoded = decode_packet("pktmon_deep", 0)
+
+        assert "Matched packets: 2" in timeline
+        assert "10.0.0.1:5000" in timeline
+        assert "10.0.0.2:6000" in timeline
+        assert "**UDP:**" in decoded
+        assert "src: `10.0.0.1`" in decoded
+
+    def test_empty_native_packet_dataset_falls_back_to_pktmon(self, tmp_path):
+        trace_id = "pktmon_empty_native"
+        etl_path = tmp_path / f"{trace_id}.etl"
+        export_dir = tmp_path / f".etw-export-{trace_id}"
+        etl_path.write_bytes(b"synthetic pktmon etl")
+        writer = NativeEventStoreWriter(
+            export_dir,
+            run_id=f"{trace_id}-store",
+            event_classes=["packet_capture"],
+            staging=False,
+        )
+        text_path = export_dir / "pktmon.etl2txt.txt"
+        pcapng_path = export_dir / "pktmon.etl2pcap.pcapng"
+        text_path.write_bytes(_PKTMON_TEXT_FIXTURE.encode("utf-16"))
+        _write_cache_metadata(text_path, etl_path)
+        _write_pcapng(
+            pcapng_path,
+            [
+                bytes.fromhex(_PACKET_A_HEX),
+                bytes.fromhex(_PACKET_A_HEX),
+                bytes.fromhex(_PACKET_B_HEX),
+                bytes.fromhex(_PACKET_B_HEX),
+            ],
+        )
+        _write_cache_metadata(pcapng_path, etl_path)
+        trace = TraceData(
+            trace_id=trace_id,
+            etl_path=etl_path,
+            export_dir=export_dir,
+            mode="native",
+            event_store=writer.commit(),
+        )
+        trace._dumper_ready.set()
+        register_trace(trace)
+
+        out = get_packet_timeline(trace_id, "10.0.0.1:5000 -> 10.0.0.2:6000/udp")
+
+        assert "Matched packets: 2" in out
+
+    def test_pktmon_pcapng_fallback_supports_send_recv_latency(self, tmp_path):
+        detail = (
+            "00-00-00-00-00-01 > 00-00-00-00-00-02, IPv4, length 28: "
+            "10.0.0.1.5000 > 10.0.0.2.6000: UDP, length 8"
+        )
+        text = (
+            _pktmon_path_text(
+                direction="Tx",
+                packet_len=len(_PACKET_A_HEX) // 2,
+                detail=detail,
+                stages=[(12, 1)],
+            )
+            + _pktmon_path_text(
+                direction="Rx",
+                packet_len=len(_PACKET_A_HEX) // 2,
+                detail=detail,
+                stages=[(1, 1)],
+                start_group=200,
+            )
+        )
+        _register_pktmon_text_trace(
+            "pktmon_latency",
+            tmp_path,
+            text,
+            [bytes.fromhex(_PACKET_A_HEX), bytes.fromhex(_PACKET_A_HEX)],
+        )
+
+        out = get_send_recv_latency("pktmon_latency")
+
+        assert "Send → Recv Latency" in out
+        assert "10.0.0.1:5000 -> 10.0.0.2:6000/udp" in out
+
+    def test_pktmon_layer_latency_groups_udp_and_tcp_paths(self, tmp_path):
+        udp_detail = (
+            "00-00-00-00-00-01 > 00-00-00-00-00-02, IPv4, length 28: "
+            "10.0.0.1.5000 > 10.0.0.2.6000: UDP, length 8"
+        )
+        tcp_packet = _build_ipv4_tcp(
+            src_ip="10.0.0.3",
+            dst_ip="10.0.0.4",
+            src_port=7000,
+            dst_port=443,
+            seq=123,
+            ack=456,
+            flags=0x10,
+        )
+        tcp_detail = (
+            "00-00-00-00-00-03 > 00-00-00-00-00-04, IPv4, length 40: "
+            "10.0.0.3.7000 > 10.0.0.4.443: tcp 0"
+        )
+        text = (
+            _pktmon_path_text(
+                direction="Tx",
+                packet_len=len(_PACKET_A_HEX) // 2,
+                detail=udp_detail,
+                stages=[(12, 1), (4, 1)],
+            )
+            + _pktmon_path_text(
+                direction="Tx",
+                packet_len=len(tcp_packet),
+                detail=tcp_detail,
+                stages=[(12, 1), (4, 1), (4, 2), (6, 1), (6, 2), (2, 1), (9, 1), (1, 1)],
+                start_group=300,
+            )
+        )
+        _register_pktmon_text_trace(
+            "pktmon_layers",
+            tmp_path,
+            text,
+            [bytes.fromhex(_PACKET_A_HEX), bytes.fromhex(_PACKET_A_HEX)] + [tcp_packet] * 8,
+        )
+
+        out = get_pktmon_layer_latency("pktmon_layers")
+
+        assert "Pktmon Layer Latency" in out
+        assert "udp" in out
+        assert "tcp" in out
+        assert "12/1 -> 4/1" in out
+        assert "Sample LWF (samplelwf.sys): edge 1 -> edge 2" in out
+        assert "high" in out
+
+    def test_pktmon_layer_latency_direction_filter_limits_journeys(self, tmp_path):
+        tx_detail = (
+            "00-00-00-00-00-01 > 00-00-00-00-00-02, IPv4, length 28: "
+            "10.0.0.1.5000 > 10.0.0.2.6000: UDP, length 8"
+        )
+        rx_detail = (
+            "00-00-00-00-00-02 > 00-00-00-00-00-01, IPv4, length 28: "
+            "10.0.0.2.6000 > 10.0.0.1.5000: UDP, length 8"
+        )
+        text = (
+            _pktmon_path_text(
+                direction="Tx",
+                packet_len=len(_PACKET_A_HEX) // 2,
+                detail=tx_detail,
+                stages=[(12, 1), (4, 1)],
+            )
+            + _pktmon_path_text(
+                direction="Rx",
+                packet_len=len(_PACKET_B_HEX) // 2,
+                detail=rx_detail,
+                stages=[(1, 1), (9, 1)],
+                start_group=200,
+            )
+        )
+        _register_pktmon_text_trace(
+            "pktmon_tx_only",
+            tmp_path,
+            text,
+            [
+                bytes.fromhex(_PACKET_A_HEX),
+                bytes.fromhex(_PACKET_A_HEX),
+                bytes.fromhex(_PACKET_B_HEX),
+                bytes.fromhex(_PACKET_B_HEX),
+            ],
+        )
+
+        out = get_pktmon_layer_latency("pktmon_tx_only", direction="tx")
+
+        assert "Direction filter: `tx`" in out
+        assert "Journeys grouped: 1" in out
+        assert "| Send |" in out
+        assert "| Recv |" not in out
 
 
 # ---------------------------------------------------------------------------
@@ -452,6 +835,24 @@ class TestSendRecvLatency:
         _register_synthetic("srl4", _packet_capture_df(rows))
         out = get_send_recv_latency("srl4")
         assert "No matched Send/Recv pairs" in out
+
+    def test_pairs_more_than_ten_ms_apart_are_not_matched(self):
+        packet = _build_ipv4_udp(
+            src_ip="10.0.0.1", dst_ip="10.0.0.2",
+            src_port=5000, dst_port=6000, ip_id=1,
+        )
+        rows = [
+            {"TimeStamp": 1_000, "Direction": "Send",
+             "PacketBytes": packet.hex(), "Size": len(packet)},
+            {"TimeStamp": 11_001, "Direction": "Recv",
+             "PacketBytes": packet.hex(), "Size": len(packet)},
+        ]
+        _register_synthetic("srl_far", _packet_capture_df(rows))
+
+        out = get_send_recv_latency("srl_far")
+
+        assert "No Send" in out
+        assert "within the matching window" in out
 
     def test_exact_window_match_survives_older_candidate_eviction(self):
         old_send = _build_ipv4_udp(

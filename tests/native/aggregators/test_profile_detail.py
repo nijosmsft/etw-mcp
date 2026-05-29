@@ -23,7 +23,14 @@ class _FakeSymbolizer:
         return {int(a): self._mapping.get(int(a), "") for a in addrs}
 
 
-def _make_trace(dumper_df, process_df=None, symbolizer=None, raw_csv=None):
+def _make_trace(
+    dumper_df,
+    process_df=None,
+    symbolizer=None,
+    raw_csv=None,
+    duration_seconds=10.0,
+    cpu_count=None,
+):
     """Return a tiny namespace that quacks like TraceData for these aggregators."""
     raw_csv = dict(raw_csv or {})
     if process_df is not None:
@@ -32,7 +39,8 @@ def _make_trace(dumper_df, process_df=None, symbolizer=None, raw_csv=None):
         dumper_df=dumper_df,
         raw_csv=raw_csv,
         symbolizer=symbolizer,
-        duration_seconds=10.0,
+        duration_seconds=duration_seconds,
+        cpu_count=cpu_count,
     )
 
 
@@ -174,3 +182,68 @@ class TestAggregateCpuSampling:
         assert result is not None
         assert len(result) == 1
         assert result.iloc[0]["Weight"] == 0x50000
+
+    def test_profile_weight_synthesizes_idle_when_capacity_is_reliable(self):
+        dumper = pd.DataFrame([
+            {"TimeStamp": 1, "Process Name": "p", "PID": 1, "CPU": 0,
+             "InstructionPointer": 0x1, "Weight": 1, "ProfileWeight": 250_000,
+             "Module": "m.sys", "Function": "f"},
+        ])
+        sym = _FakeSymbolizer({0x1: "m.sys!f+0x0"})
+        trace = _make_trace(dumper, symbolizer=sym, duration_seconds=1.0, cpu_count=1)
+
+        result = aggregate_cpu_sampling(trace)
+
+        assert result is not None
+        idle = result[result["Process Name"] == "Idle"].iloc[0]
+        assert idle["PID"] == 0
+        assert idle["Module"] == "<Heuristic Low Power State>"
+        assert idle["Function"] == "<C3>"
+        assert idle["Weight"] == 750_000
+        assert result["Weight"].sum() == 1_000_000
+        assert result["% Weight"].sum() == pytest.approx(100.0)
+
+    def test_sample_count_profile_weight_does_not_synthesize_idle(self):
+        dumper = pd.DataFrame([
+            {"TimeStamp": 1, "Process Name": "p", "PID": 1, "CPU": 0,
+             "InstructionPointer": 0x1, "Weight": 1, "ProfileWeight": 1,
+             "Module": "m.sys", "Function": "f"},
+        ])
+        sym = _FakeSymbolizer({0x1: "m.sys!f+0x0"})
+        trace = _make_trace(dumper, symbolizer=sym, duration_seconds=1.0, cpu_count=1)
+
+        result = aggregate_cpu_sampling(trace)
+
+        assert result is not None
+        assert "Idle" not in result["Process Name"].tolist()
+        assert len(result) == 1
+
+    def test_profile_weight_does_not_synthesize_idle_without_cpu_count(self):
+        dumper = pd.DataFrame([
+            {"TimeStamp": 1, "Process Name": "p", "PID": 1, "CPU": 0,
+             "InstructionPointer": 0x1, "Weight": 1, "ProfileWeight": 250_000,
+             "Module": "m.sys", "Function": "f"},
+        ])
+        sym = _FakeSymbolizer({0x1: "m.sys!f+0x0"})
+        trace = _make_trace(dumper, symbolizer=sym, duration_seconds=1.0)
+
+        result = aggregate_cpu_sampling(trace)
+
+        assert result is not None
+        assert "Idle" not in result["Process Name"].tolist()
+        assert len(result) == 1
+
+    def test_profile_weight_does_not_synthesize_idle_when_observed_exceeds_capacity(self):
+        dumper = pd.DataFrame([
+            {"TimeStamp": 1, "Process Name": "p", "PID": 1, "CPU": 0,
+             "InstructionPointer": 0x1, "Weight": 1, "ProfileWeight": 1_250_000,
+             "Module": "m.sys", "Function": "f"},
+        ])
+        sym = _FakeSymbolizer({0x1: "m.sys!f+0x0"})
+        trace = _make_trace(dumper, symbolizer=sym, duration_seconds=1.0, cpu_count=1)
+
+        result = aggregate_cpu_sampling(trace)
+
+        assert result is not None
+        assert "Idle" not in result["Process Name"].tolist()
+        assert len(result) == 1

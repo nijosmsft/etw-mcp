@@ -152,8 +152,9 @@ def get_sysconfig(trace_id: str) -> str:
     """Show system configuration embedded in the trace.
 
     Extracts CPU model, core count, memory size, NIC details, and disk
-    configuration from the trace metadata. Essential context for any
-    performance analysis.
+    configuration from the trace metadata. Native mode currently emits a
+    compact metadata subset, not full xperf SystemConfig TDH decode.
+    Essential context for any performance analysis.
 
     Args:
         trace_id: ID returned by load_trace.
@@ -263,7 +264,9 @@ def get_diskio_summary(trace_id: str) -> str:
     """Show disk I/O summary from the trace.
 
     Shows per-file I/O counts, bytes, and latency. Use to rule out
-    storage as a performance bottleneck.
+    storage as a performance bottleneck. Native mode currently exposes a
+    compact DiskIo subset; use ``mode="xperf"`` for richer xperf DiskIo
+    parity.
 
     Args:
         trace_id: ID returned by load_trace.

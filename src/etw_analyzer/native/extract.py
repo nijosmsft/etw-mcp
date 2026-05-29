@@ -71,6 +71,8 @@ CANONICAL_EVENT_CLASSES: tuple[str, ...] = (
     "AFD/Connect",
     "AFD/Accept",
     "AFD/Close",
+    # Reserved for xperf/cache parity. Native manifest dispatch intentionally
+    # leaves this empty until a provider GUID/event ID is verified.
     "NdisDrop",
     "NdisPacketCapture",
     "HttpService/Recv",

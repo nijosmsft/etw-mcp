@@ -35,12 +35,15 @@ from etw_analyzer.native.manifest import (
     QUIC_GUID,
     TCPIP_GUID,
     _hex_to_bytes,
+    _map_ndis_drop,
     _parse_ip_port_string,
+    _REGISTRY,
     _sockaddr_to_ip_port,
     _to_int,
     lookup,
     manifest_event_count,
 )
+from etw_analyzer.native.schemas import rows_to_table, schema_for_event_class
 
 
 # ---------------------------------------------------------------------------
@@ -219,6 +222,58 @@ def test_tcpip_connect_mapper_extracts_ip_port():
     assert row["CPU"] == 4
 
 
+def test_tcpip_connect_mapper_accepts_ipv6_sockaddr_hex():
+    canonical, mapper = lookup(TCPIP_GUID, 1033)
+    local = (
+        bytes([0x17, 0x00, 0x30, 0x39])
+        + b"\x00" * 4
+        + bytes.fromhex("20010db8000000000000000000000001")
+        + b"\x00" * 4
+    )
+    remote = (
+        bytes([0x17, 0x00, 0x01, 0xBB])
+        + b"\x00" * 4
+        + bytes.fromhex("20010db8000000000000000000000002")
+        + b"\x00" * 4
+    )
+
+    row = mapper(
+        {
+            "LocalAddress": "0x" + local.hex(),
+            "RemoteAddress": "0x" + remote.hex(),
+            "Tcb": "0x1234",
+        },
+        _hdr(),
+        b"",
+        None,
+    )
+
+    assert canonical == "TcpIp/Connect"
+    assert row["LocalAddr"] == "2001:db8::1"
+    assert row["LocalPort"] == 12345
+    assert row["RemoteAddr"] == "2001:db8::2"
+    assert row["RemotePort"] == 443
+
+
+def test_tcpip_connect_mapper_tolerates_empty_local_address():
+    _canonical, mapper = lookup(TCPIP_GUID, 1033)
+    row = mapper(
+        {
+            "LocalAddress": "",
+            "RemoteAddress": "10.0.0.7:443",
+            "Tcb": "0x1234",
+        },
+        _hdr(),
+        b"",
+        None,
+    )
+
+    assert row["LocalAddr"] == ""
+    assert row["LocalPort"] == 0
+    assert row["RemoteAddr"] == "10.0.0.7"
+    assert row["RemotePort"] == 443
+
+
 def test_tcpip_send_mapper_extracts_size():
     canonical, mapper = lookup(TCPIP_GUID, 1332)
     fields = {"Tcb": "0xFFFF", "BytesSent": 1460, "SeqNo": 12345}
@@ -246,6 +301,99 @@ def test_afd_close_mapper_emits_just_handle():
     assert row["SocketHandle"] == 0xFEFE
 
 
+def test_all_registered_afd_mappers_produce_schema_compatible_rows():
+    fields = {
+        "Endpoint": "0x100",
+        "BufferLength": 256,
+        "Status": 0,
+        "Address": "10.0.0.7:443",
+    }
+
+    afd_items = [
+        (event_id, canonical, mapper)
+        for (guid, event_id), (canonical, mapper) in _REGISTRY.items()
+        if guid == AFD_GUID
+    ]
+    assert afd_items
+    for event_id, canonical, mapper in afd_items:
+        row = mapper(fields, _hdr(), b"", None)
+        assert row is not None, event_id
+        table = rows_to_table(canonical, [row])
+        assert table.schema == schema_for_event_class(canonical).schema
+        assert table.num_rows == 1
+
+
+def test_quic_connection_created_falls_back_to_connection_id_field():
+    canonical, mapper = lookup(QUIC_GUID, 5)
+    row = mapper({"Connection": "0x2000", "CID": "abcd"}, _hdr(), b"", None)
+
+    assert canonical == "Quic/ConnectionCreated"
+    assert row["ConnectionId"] == 0x2000
+    assert row["CID"] == "abcd"
+
+
+def test_http_recv_missing_url_maps_to_empty_string():
+    canonical, mapper = lookup(HTTP_GUID, 1)
+    row = mapper(
+        {"RequestId": "0x10", "ConnectionId": "0x20", "Verb": "GET"},
+        _hdr(),
+        b"",
+        None,
+    )
+
+    assert canonical == "HttpService/Recv"
+    assert row["RequestId"] == 0x10
+    assert row["ConnectionId"] == 0x20
+    assert row["Url"] == ""
+
+
+def test_registered_manifest_mappers_emit_event_store_schema_compatible_rows():
+    fields = {
+        "LocalAddress": "10.0.0.5:5000",
+        "RemoteAddress": "10.0.0.7:443",
+        "LocalSockAddr": "10.0.0.5:5000",
+        "RemoteSockAddr": "10.0.0.7:443",
+        "Tcb": "0x1234",
+        "BytesSent": 128,
+        "BytesRecv": 256,
+        "NumBytes": 512,
+        "SeqNo": 7,
+        "MSS": 1460,
+        "RcvWnd": 65535,
+        "ISN": 3,
+        "RexmitCount": 2,
+        "Endpoint": "0x100",
+        "BufferLength": 64,
+        "Status": 0,
+        "Address": "10.0.0.7:443",
+        "CorrelationId": "0x2000",
+        "Connection": "0x2000",
+        "CID": "abcd",
+        "PacketNumber": 9,
+        "Size": 1200,
+        "Length": 1200,
+        "AckDelay": 50,
+        "LargestAcknowledged": 8,
+        "RequestId": "0x3000",
+        "ConnectionId": "0x4000",
+        "Verb": "GET",
+        "Url": "/health",
+        "UrlGroupId": "0x5000",
+        "StatusCode": 200,
+        "ContentLength": 123,
+        "MiniportIfIndex": 7,
+        "Fragment": "0xAABBCCDDEEFF",
+        "FragmentSize": 6,
+    }
+
+    for (guid, event_id), (canonical, mapper) in sorted(_REGISTRY.items()):
+        row = mapper(fields, _hdr(), b"", None)
+        assert row is not None, (guid, event_id, canonical)
+        table = rows_to_table(canonical, [row])
+        assert table.schema == schema_for_event_class(canonical).schema
+        assert table.num_rows == 1
+
+
 def test_ndis_packet_capture_returns_none_on_empty_fragment():
     canonical, mapper = lookup(NDIS_PC_GUID, 1001)
     assert canonical == "NdisPacketCapture"
@@ -266,6 +414,26 @@ def test_ndis_packet_capture_extracts_packet_bytes():
     assert row["Size"] == 6
     assert "IfIndex=7" in row["MiniportName"]
     assert row["Direction"] == "Recv"
+
+
+def test_ndis_drop_mapper_shape_without_registry_entry():
+    fields = {
+        "MiniportIfIndex": 9,
+        "DropReason": "MissingBuffer",
+        "PacketSize": 1514,
+    }
+    row = _map_ndis_drop(fields, _hdr(), b"", None)
+
+    assert row["MiniportName"] == "9"
+    assert row["Reason"] == "MissingBuffer"
+    assert row["Size"] == 1514
+    assert row["CPU"] == 4
+
+
+def test_ndis_drop_is_not_registered_without_verified_event_id():
+    from etw_analyzer.native.manifest import _REGISTRY
+
+    assert all(canonical != "NdisDrop" for canonical, _mapper in _REGISTRY.values())
 
 
 # ---------------------------------------------------------------------------

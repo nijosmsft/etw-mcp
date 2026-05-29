@@ -1,0 +1,78 @@
+name: Manual release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag. Must match pyproject version, for example v0.1.0."
+        required: true
+        type: string
+      prerelease:
+        description: "Mark this GitHub release as a prerelease"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install Python
+        run: uv python install 3.11
+
+      - name: Validate release tag
+        shell: pwsh
+        run: |
+          $version = uv run --python 3.11 python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])"
+          $expectedTag = "v$version"
+          $actualTag = "${{ inputs.tag }}"
+          if ($actualTag -ne $expectedTag) {
+            throw "Release tag '$actualTag' must match pyproject version '$version' ($expectedTag)."
+          }
+
+      - name: Run tests
+        run: uv run --python 3.11 --group dev pytest tests/ -q
+
+      - name: Build package
+        run: uv build
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/*
+          if-no-files-found: error
+
+      - name: Create GitHub release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "${{ inputs.tag }}"
+          $ghArgs = @(
+            "release", "create", $tag,
+            "--target", "$env:GITHUB_SHA",
+            "--title", $tag,
+            "--generate-notes"
+          )
+          if ("${{ inputs.prerelease }}" -eq "true") {
+            $ghArgs += "--prerelease"
+          }
+          Get-ChildItem -Path dist -File | ForEach-Object {
+            $ghArgs += $_.FullName
+          }
+          & gh @ghArgs

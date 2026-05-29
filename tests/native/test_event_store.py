@@ -152,6 +152,60 @@ def test_scan_time_filter_uses_seconds_as_qpc_pushdown(tmp_path: Path):
     assert rows["TimeStamp"].tolist() == [500_000, 1_000_000]
 
 
+def test_scan_projected_columns_still_honor_cpu_and_time_filters(tmp_path: Path):
+    export_dir = tmp_path / ".etw-export-sample"
+    writer = NativeEventStoreWriter(
+        export_dir,
+        run_id="run-projected-filter",
+        timebase=EventStoreTimebase(qpc_origin=1_000, perf_freq=1_000),
+        staging=False,
+        max_rows_per_part=1,
+    )
+    for index, (qpc, cpu) in enumerate([(1_000, 0), (1_500, 1), (2_000, 1), (2_500, 0)]):
+        writer.append("sampled_profile", _sample(index, qpc, cpu=cpu))
+    store = writer.commit()
+
+    rows = store.scan(
+        "sampled_profile",
+        filters=EventFilters(cpu_filter="1", start_time=0.25, end_time=1.0),
+        columns=["InstructionPointer"],
+    )
+
+    assert rows.columns.tolist() == ["InstructionPointer", "TimeStamp"]
+    assert rows["InstructionPointer"].tolist() == [HIGH_ADDRESS, HIGH_ADDRESS]
+    assert rows["TimeStamp"].tolist() == [500_000, 1_000_000]
+
+
+def test_iter_batches_projected_columns_still_honor_cpu_and_time_filters(tmp_path: Path):
+    export_dir = tmp_path / ".etw-export-sample"
+    writer = NativeEventStoreWriter(
+        export_dir,
+        run_id="run-projected-filter-batches",
+        timebase=EventStoreTimebase(qpc_origin=10_000, perf_freq=1_000),
+        staging=False,
+        max_rows_per_part=1,
+    )
+    for index, (qpc, cpu) in enumerate([(10_000, 0), (10_500, 1), (11_000, 1), (11_500, 0)]):
+        writer.append("sampled_profile", _sample(index, qpc, cpu=cpu))
+    store = writer.commit()
+
+    batches = list(
+        store.iter_batches(
+            "sampled_profile",
+            filters=EventFilters(cpu_filter="1", start_time=0.25, end_time=1.0),
+            columns=["InstructionPointer"],
+            batch_size=1,
+        )
+    )
+
+    assert len(batches) == 2
+    assert [batch.columns.tolist() for batch in batches] == [
+        ["InstructionPointer", "TimeStamp"],
+        ["InstructionPointer", "TimeStamp"],
+    ]
+    assert [int(batch.iloc[0]["TimeStamp"]) for batch in batches] == [500_000, 1_000_000]
+
+
 def test_missing_part_file_rejected(tmp_path: Path):
     export_dir = tmp_path / ".etw-export-sample"
     writer = NativeEventStoreWriter(export_dir, run_id="run-missing", staging=False)

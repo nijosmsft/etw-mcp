@@ -161,4 +161,6 @@ class TestTracestats:
         assert "Number of Processors : 80" in text
         assert "Trace duration (s)   : 16.4502142" in text
         assert "Total events:    12345" in text
+        assert "EventCount:      12345" in text
+        assert "abc-guid EventCount=1000" in text
         assert "SampledProfile: 800" in text

@@ -93,10 +93,10 @@ def load_trace(
               raises if it's unavailable. ``"xperf"`` forces the legacy
               text-based ``xperf -a dumper`` extraction. The
               ``WPR_MCP_MODE`` environment variable overrides this arg
-              when the arg is left at its default. The native pipeline
-              extracts events xperf cannot enumerate (manifest providers
-              like TCPIP/AFD/MsQuic/HTTP.sys) — see
-              ``udp-perf/docs/wpr-mcp-native-etw-design.md``.
+              when the arg is left at its default. The native pipeline is
+              a fast path for a curated event/aggregation subset, not full
+              ``xperf`` parity; use ``mode="xperf"`` for broadest
+              coverage.
     """
     path = Path(etl_path)
     if not path.exists():
@@ -1941,6 +1941,11 @@ def _format_load_summary(trace: TraceData) -> str:
     if trace.event_store is not None:
         lines.append("")
         lines.append("**Native event store:**")
+        lines.append(
+            "Native mode is a fast-path coverage subset, not full `xperf` "
+            "parity; reload with `mode=\"xperf\"` if an analysis needs "
+            "broader WPA/xperf-derived data."
+        )
         for name, dataset in sorted(trace.event_store.manifest.datasets.items()):
             lines.append(
                 f"- `{name}`: {dataset.row_count:,} rows across "

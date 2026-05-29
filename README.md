@@ -12,10 +12,9 @@ Copy-paste this into Claude Code, Copilot, or any AI assistant to install automa
 Install the WPR trace analyzer MCP server on this Windows machine:
 1. Run: winget install astral-sh.uv (skip if uv is already installed)
 2. Check if xperf.exe exists at "C:\Program Files (x86)\Windows Kits\10\Windows Performance Toolkit\xperf.exe". If not, run: winget install Microsoft.WindowsSDK
-3. Run: git clone https://github.com/nijosmsft/wpr-mcp-server.git C:\tools\wpr-mcp-server
-4. Add this MCP server config to .mcp.json:
-   {"mcpServers":{"wpr-trace-analyzer":{"type":"stdio","command":"uv","args":["run","--directory","C:\\tools\\wpr-mcp-server","python","-m","etw_analyzer.server"],"env":{"_NT_SYMBOL_PATH":"srv*C:\\symbols*https://msdl.microsoft.com/download/symbols"}}}}
-5. Verify: run "uv run --directory C:\tools\wpr-mcp-server python -m etw_analyzer.server" and confirm it starts
+3. Add this MCP server config to .mcp.json:
+   {"mcpServers":{"wpr-trace-analyzer":{"type":"stdio","command":"uv","args":["run","--no-project","--with","https://github.com/nijosmsft/wpr-mcp-server/releases/download/v0.1.0/wpr_mcp_server-0.1.0-py3-none-any.whl","python","-m","etw_analyzer.server"],"env":{"_NT_SYMBOL_PATH":"srv*C:\\symbols*https://msdl.microsoft.com/download/symbols"}}}}
+4. Verify: run "uv run --no-project --with https://github.com/nijosmsft/wpr-mcp-server/releases/download/v0.1.0/wpr_mcp_server-0.1.0-py3-none-any.whl python -m etw_analyzer.server" and confirm it starts
 ```
 
 ## Features
@@ -46,13 +45,12 @@ Install the WPR trace analyzer MCP server on this Windows machine:
 winget install astral-sh.uv              # Python package manager
 winget install Microsoft.WindowsSDK      # Optional — only needed for the xperf fallback
 
-# 2. Clone and verify
-git clone https://github.com/nijosmsft/wpr-mcp-server.git
-cd wpr-mcp-server
-uv run python -m etw_analyzer.server     # verify it starts (Ctrl+C to stop)
+# 2. Verify the latest release wheel starts (Ctrl+C to stop)
+uv run --no-project --with https://github.com/nijosmsft/wpr-mcp-server/releases/download/v0.1.0/wpr_mcp_server-0.1.0-py3-none-any.whl python -m etw_analyzer.server
 ```
 
 - **uv** automatically downloads Python, creates a virtual environment, and installs all dependencies on first run. No separate Python install needed.
+- **Release wheel** — use the wheel URL from the latest [GitHub release](https://github.com/nijosmsft/wpr-mcp-server/releases). The examples above use `v0.1.0`; replace the tag and wheel filename when installing a newer release. Maintainers can publish that asset with the manual **Manual release** GitHub Actions workflow.
 - **Native ETW consumer (default)** — the server decodes ETL files in-process via `OpenTraceW`/`tdh.dll`. No external tools needed on a recent Windows build.
 - **xperf.exe (fallback)** — installed as part of the Windows Performance Toolkit (included in the Windows SDK). Only required if you opt out of the native pipeline with `mode="xperf"` or `WPR_MCP_MODE=xperf`, or when running on an older Windows build where the native bindings can't load. Expected location: `C:\Program Files (x86)\Windows Kits\10\Windows Performance Toolkit\xperf.exe`
 
@@ -70,7 +68,7 @@ Add to your `.mcp.json` (project root or `~/.claude/.mcp.json`):
     "wpr-trace-analyzer": {
       "type": "stdio",
       "command": "uv",
-      "args": ["run", "--directory", "C:\\path\\to\\wpr-mcp-server", "python", "-m", "etw_analyzer.server"],
+      "args": ["run", "--no-project", "--with", "https://github.com/nijosmsft/wpr-mcp-server/releases/download/v0.1.0/wpr_mcp_server-0.1.0-py3-none-any.whl", "python", "-m", "etw_analyzer.server"],
       "env": {
         "_NT_SYMBOL_PATH": "srv*C:\\symbols*https://msdl.microsoft.com/download/symbols"
       }
@@ -89,7 +87,7 @@ Add to `.vscode/mcp.json`:
     "wpr-trace-analyzer": {
       "type": "stdio",
       "command": "uv",
-      "args": ["run", "--directory", "C:\\path\\to\\wpr-mcp-server", "python", "-m", "etw_analyzer.server"],
+      "args": ["run", "--no-project", "--with", "https://github.com/nijosmsft/wpr-mcp-server/releases/download/v0.1.0/wpr_mcp_server-0.1.0-py3-none-any.whl", "python", "-m", "etw_analyzer.server"],
       "env": {
         "_NT_SYMBOL_PATH": "srv*C:\\symbols*https://msdl.microsoft.com/download/symbols"
       }
@@ -98,7 +96,7 @@ Add to `.vscode/mcp.json`:
 }
 ```
 
-Replace `C:\\path\\to\\wpr-mcp-server` with the actual path to this repo.
+Replace the release URL with the wheel asset from the release you want to run.
 
 ## Usage
 
@@ -145,7 +143,7 @@ Every analysis tool requires the `trace_id` returned by `load_trace`. This allow
 
 ### Packet Capture and pktmon Examples
 
-Packet-level tools need an ETL that includes NDIS PacketCapture frame bytes. For pktmon, capture raw packet bytes so the analyzer can decode Ethernet/IP/TCP/UDP headers:
+Packet-level drill-down tools need an ETL that includes NDIS PacketCapture frame bytes or pktmon packet bytes. For pktmon, collect with `--pkt-size 0`; the analyzer can convert the ETL with `pktmon etl2txt`/`pktmon etl2pcap`, summarize top flows, show timelines, decode packets, estimate Send -> Recv latency, and report pktmon component/edge layer latency:
 
 ```powershell
 pktmon filter remove
@@ -157,6 +155,8 @@ pktmon stop
 
 WPR profiles work too as long as they enable the `Microsoft-Windows-NDIS-PacketCapture` provider.
 
+Pktmon ETLs expose numeric component/edge IDs in packet events. For friendly component names, the analyzer uses `pktmon comp list --all` on the analysis host or a sidecar file named `<trace>.components.txt` / `pktmon.components.txt` captured from the target machine.
+
 Then ask questions like:
 
 ```
@@ -165,6 +165,7 @@ Then ask questions like:
 "Show packet timeline for 10.0.0.1:4444 -> 10.0.0.2:4444/udp"
 "Decode the packet closest to timestamp 123456789"
 "Estimate one-way Send -> Recv latency for captured packets"
+"Show pktmon layer latency for the top TCP and UDP flows"
 "Show NDIS packet drops by miniport and reason"
 "Check whether UDP recv processing is staying on the same CPUs as NIC DPCs"
 ```
@@ -176,36 +177,30 @@ This server pairs well with [LabLink MCP](https://github.com/nijosmsft/LabLink) 
 Common combined prompts:
 
 ```
-"Use LabLink to collect a 60 second networking WPR trace from vm-server, save it as C:\traces\vm-server-network.etl, then load it and analyze network hot functions."
-"Collect a packet monitor trace on vm-server for UDP port 4444, pull it to C:\traces\vm-server-pktmon.etl, then show packet-capture 5-tuples and UDP flows."
-"Get a perf log from the server role for 30 seconds, analyze CPU usage, DPCs, and TCP/UDP throughput."
-"Run pktmon on vm-server for traffic between 10.0.0.1 and 10.0.0.2, then decode the largest flow and estimate Send -> Recv latency."
+"On vm-server, collect a 60 second networking trace and tell me which network functions are hottest."
+"Capture UDP port 4444 packets on vm-server for 30 seconds and show the top flows."
+"Get a 30 second performance log from the server role and summarize CPU, DPCs, and TCP/UDP throughput."
+"Trace traffic between 10.0.0.1 and 10.0.0.2 on vm-server, then decode the largest flow and estimate Send -> Recv latency."
 ```
 
-For WPR captures, the assistant can use LabLink's `collect_etw_trace` tool directly:
+For WPR captures, ask for the outcome instead of naming tools:
 
-```text
-LabLink collect_etw_trace(node="vm-server", profile="C:\profiles\networking.wprp", duration=60, local_output="C:\traces\vm-server-network.etl")
-wpr-mcp-server load_trace("C:\traces\vm-server-network.etl")
-wpr-mcp-server analyze(trace_id)
+```
+"Collect a 60 second networking trace from vm-server and tell me which modules and functions used the most CPU."
+"Capture a performance trace from the server role, then summarize CPU usage, DPC time, TCP/UDP throughput, and any packet drops."
+"Get a WPR trace from vm-server while I reproduce the issue, then analyze network hot functions and lock contention."
 ```
 
-For pktmon captures, the assistant can use LabLink to run the remote commands and pull the ETL back:
+For pktmon captures, describe the traffic pattern and the analysis you want:
 
-```text
-LabLink execute_script(node="vm-server", script_body="
-pktmon filter remove
-pktmon filter add UdpEcho -t UDP -p 4444
-pktmon start --capture --pkt-size 0 --file-name C:\Temp\vm-server-pktmon.etl
-Start-Sleep -Seconds 30
-pktmon stop
-")
-LabLink pull_file(node="vm-server", remote_path="C:\Temp\vm-server-pktmon.etl", local_path="C:\traces\vm-server-pktmon.etl")
-wpr-mcp-server load_trace("C:\traces\vm-server-pktmon.etl")
-wpr-mcp-server get_packet_capture_summary(trace_id)
+```
+"Collect packet monitor traffic on vm-server for UDP port 4444 for 30 seconds, then show the top flows."
+"Trace packets between 10.0.0.1 and 10.0.0.2 on vm-server, then decode the busiest flow and estimate layer latency."
+"Capture pktmon data for TCP 443 on vm-server, pull it back, and tell me which component/edge hop adds the most latency."
+"Collect a packet trace for this pattern and analyze it end to end: top flows, timeline, packet decode, and pktmon layer latency."
 ```
 
-The LabLink agent needs permission to run WPR or pktmon on the target node and write the remote ETL path. The analyzer still runs locally and only requires access to the pulled `.etl` file.
+Run the LabLink agent elevated, or under an account with permission to start ETW sessions and write the chosen remote ETL path. The analyzer runs locally after the `.etl` is pulled back, so it only needs read access to the local trace file.
 
 ### Available Tools
 
@@ -258,6 +253,7 @@ The LabLink agent needs permission to run WPR or pktmon on the target node and w
 | `get_packet_timeline` | Show chronological packets for a selected 5-tuple |
 | `decode_packet` | Decode the Ethernet, IP, and L4 headers for the packet nearest a timestamp |
 | `get_send_recv_latency` | Heuristic Send→Recv latency from matched packet-capture events |
+| `get_pktmon_layer_latency` | Estimate pktmon component/edge traversal latency for TCP, UDP, and IP packets |
 | `get_rss_dispatch_quality` | Compare NIC DPC CPUs with process CPU samples to spot cross-CPU dispatch |
 | `get_udp_dispatch_quality` | UDP receive-path CPU distribution and overlap with networking DPC CPUs |
 | `get_per_nic_queue_arrivals` | Per-CPU distribution of NIC-driver DPCs for RSS queue spread |
@@ -313,7 +309,7 @@ The `WPR_MCP_MODE` environment variable overrides the default when `mode=` is le
     "wpr-trace-analyzer": {
       "type": "stdio",
       "command": "uv",
-      "args": ["run", "--directory", "C:\\path\\to\\wpr-mcp-server", "python", "-m", "etw_analyzer.server"],
+      "args": ["run", "--no-project", "--with", "https://github.com/nijosmsft/wpr-mcp-server/releases/download/v0.1.0/wpr_mcp_server-0.1.0-py3-none-any.whl", "python", "-m", "etw_analyzer.server"],
       "env": {
         "_NT_SYMBOL_PATH": "srv*C:\\symbols*https://msdl.microsoft.com/download/symbols",
         "WPR_MCP_MODE": "xperf"

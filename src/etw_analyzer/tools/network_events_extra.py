@@ -43,8 +43,11 @@ _NO_NDIS_DROP_DATA_MSG = (
     "*No NDIS dropped-packet event data in this trace.*\n\n"
     "Either no packets were dropped during the trace, or the trace was "
     "collected without the `Microsoft-Windows-NDIS` provider's drop "
-    "keyword enabled. To capture drops, re-collect using "
-    "`udp-perf/scripts/networking.wprp`."
+    "keyword enabled. Native mode also does not register NDIS drop "
+    "manifest event IDs until they are verified, to avoid silently "
+    "misclassifying unrelated NDIS events. For best drop coverage, "
+    "re-collect using `udp-perf/scripts/networking.wprp` and load with "
+    "`mode=\"xperf\"`."
 )
 
 
@@ -351,10 +354,12 @@ def get_accept_latency(
 def get_packet_drops(trace_id: str, top_n: int = 30) -> str:
     """Per-(miniport, reason) NDIS dropped-packet counts.
 
-    Reads ``ndis_drops_df`` and groups by (MiniportName, Reason). Each row
+    Reads NDIS drop rows and groups by (MiniportName, Reason). Each row
     shows the drop count, total bytes dropped, and percentage of total
-    drops. Sorted by count descending. Common reasons include
-    ``MissingBuffer``, ``IpsecRcvPolicyError``, ``WrongAdapter``.
+    drops. Native mode currently omits NDIS drop manifest IDs unless they
+    are verified; use ``mode="xperf"`` for the broadest drop coverage.
+    Common reasons include ``MissingBuffer``, ``IpsecRcvPolicyError``,
+    ``WrongAdapter``.
 
     Args:
         trace_id: ID returned by load_trace.

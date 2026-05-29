@@ -21,23 +21,61 @@ from __future__ import annotations
 from collections import deque
 from collections.abc import Iterator
 import heapq
+import json
+from pathlib import Path
+import re
+import struct
+import subprocess
 from typing import Any
 
 import pandas as pd
 
 from etw_analyzer.app import mcp
 from etw_analyzer.formatting.markdown import format_table
-from etw_analyzer.native.accessors import has_trace_event_dataset, iter_event_batches
+from etw_analyzer.native.accessors import iter_event_batches
 from etw_analyzer.parsing.packet_decode import decode_packet_headers
 from etw_analyzer.trace_state import TraceData, require_trace
 
 
 _NO_PACKET_CAPTURE_MSG = (
     "*No packet-capture data in this trace.*\n\n"
-    "Re-collect with `udp-perf/scripts/networking.wprp` — the "
-    "`Microsoft-Windows-NDIS-PacketCapture` provider must be enabled to "
-    "record frame bytes. Standard `xdptrace.wprp` traces do not include "
-    "packet captures."
+    "For WPR traces, re-collect with `udp-perf/scripts/networking.wprp` — "
+    "the `Microsoft-Windows-NDIS-PacketCapture` provider must be enabled "
+    "to record frame bytes. For pktmon traces, collect with "
+    "`pktmon start --capture --pkt-size 0` so pktmon can emit packet "
+    "headers for summary analysis."
+)
+_PKTMON_TEXT_FILENAME = "pktmon.etl2txt.txt"
+_PKTMON_PCAPNG_FILENAME = "pktmon.etl2pcap.pcapng"
+_PKTMON_BOUNDARY_PARQUET_FILENAME = "pktmon.boundary.parquet"
+_PKTMON_LAYER_PARQUET_FILENAME = "pktmon.layer.parquet"
+_PKTMON_COMPONENTS_FILENAME = "pktmon.components.txt"
+_PKTMON_CONVERT_TIMEOUT_SECONDS = 120
+_PKTMON_COMPONENT_TIMEOUT_SECONDS = 30
+_PKTMON_LAYER_WINDOW_US = 50_000
+_PKTMON_TX_PATH = ((12, 1), (4, 1), (4, 2), (6, 1), (6, 2), (2, 1), (9, 1), (1, 1))
+_PKTMON_RX_PATH = ((1, 1), (9, 1), (2, 1), (6, 2), (6, 1), (4, 2), (4, 1), (12, 1))
+_PKTMON_PATH_INDEX = {
+    "Send": {stage: index for index, stage in enumerate(_PKTMON_TX_PATH)},
+    "Recv": {stage: index for index, stage in enumerate(_PKTMON_RX_PATH)},
+}
+_PKTMON_HEADER_RE = re.compile(
+    r"^(?P<ts>\d\d:\d\d:\d\d\.\d+) "
+    r"(?P<drop>Drop: )?PktGroupId (?P<group>\d+), "
+    r"PktNumber (?P<number>\d+), "
+    r"Appearance (?P<appearance>\d+), "
+    r"Direction\s+(?P<direction>Tx|Rx)\s*, "
+    r"Type\s+(?P<type>\w+)\s*, "
+    r"Component\s+(?P<component>\d+)"
+    r"(?:,\s*Edge\s+(?P<edge>\d+))?.*?"
+    r"OriginalSize\s+(?P<size>\d+),\s*LoggedSize\s+(?P<logged>\d+)",
+)
+_PKTMON_FLOW_RE = re.compile(
+    r"(?P<family>IPv4|IPv6), length (?P<iplen>\d+): "
+    r"(?P<src>.+)\.(?P<srcport>\d+) > "
+    r"(?P<dst>.+)\.(?P<dstport>\d+): "
+    r"(?P<proto>tcp|udp)\b",
+    re.IGNORECASE,
 )
 
 _PACKET_BATCH_SIZE = 65_536
@@ -97,6 +135,17 @@ def _project_packet_columns(
     return df[keep].reset_index(drop=True)
 
 
+def _event_store_packet_capture_row_count(trace: TraceData) -> int:
+    store = getattr(trace, "event_store", None)
+    datasets = getattr(getattr(store, "manifest", None), "datasets", None)
+    if not isinstance(datasets, dict):
+        return 0
+    dataset = datasets.get("packet_capture")
+    if dataset is None:
+        return 0
+    return int(getattr(dataset, "row_count", 0) or 0)
+
+
 def _packet_capture_batches(
     trace: TraceData,
     *,
@@ -107,7 +156,7 @@ def _packet_capture_batches(
     """Yield packet-capture rows without forcing event-store materialization."""
 
     materialized = trace.packet_capture_df
-    if isinstance(materialized, pd.DataFrame):
+    if _packet_capture_ready(materialized):
         df = _project_packet_columns(materialized, columns)
         if sort_by_time and "TimeStamp" in df.columns and not df.empty:
             ts = pd.to_numeric(df["TimeStamp"], errors="coerce")
@@ -117,23 +166,630 @@ def _packet_capture_batches(
             yield df.iloc[start:start + safe_batch_size].reset_index(drop=True)
         return
 
-    for batch in iter_event_batches(
-        trace,
-        "packet_capture",
-        columns=columns,
-        batch_size=batch_size,
-    ):
-        if sort_by_time and "TimeStamp" in batch.columns and not batch.empty:
-            ts = pd.to_numeric(batch["TimeStamp"], errors="coerce")
-            batch = batch.assign(_sort_ts=ts).sort_values("_sort_ts").drop(columns=["_sort_ts"])
-        yield batch.reset_index(drop=True)
+    if _event_store_packet_capture_row_count(trace) > 0:
+        yielded = False
+        for batch in iter_event_batches(
+            trace,
+            "packet_capture",
+            columns=columns,
+            batch_size=batch_size,
+        ):
+            yielded = yielded or not batch.empty
+            if sort_by_time and "TimeStamp" in batch.columns and not batch.empty:
+                ts = pd.to_numeric(batch["TimeStamp"], errors="coerce")
+                batch = batch.assign(_sort_ts=ts).sort_values("_sort_ts").drop(columns=["_sort_ts"])
+            yield batch.reset_index(drop=True)
+        if yielded:
+            return
+
+    pktmon_df, _error = _pktmon_packet_capture_df(trace, boundary_only=True)
+    if pktmon_df is None or pktmon_df.empty:
+        return
+    df = _project_packet_columns(pktmon_df, columns)
+    if sort_by_time and "TimeStamp" in df.columns and not df.empty:
+        ts = pd.to_numeric(df["TimeStamp"], errors="coerce")
+        df = df.assign(_sort_ts=ts).sort_values("_sort_ts").drop(columns=["_sort_ts"])
+    safe_batch_size = max(1, int(batch_size or _PACKET_BATCH_SIZE))
+    for start in range(0, len(df), safe_batch_size):
+        yield df.iloc[start:start + safe_batch_size].reset_index(drop=True)
 
 
-def _packet_capture_available(trace: TraceData) -> bool:
+def _ndis_packet_capture_available(trace: TraceData) -> bool:
     materialized = trace.packet_capture_df
     if isinstance(materialized, pd.DataFrame):
         return _packet_capture_ready(materialized)
-    return has_trace_event_dataset(trace, "packet_capture")
+    return _event_store_packet_capture_row_count(trace) > 0
+
+
+def _packet_capture_available(trace: TraceData) -> bool:
+    if _ndis_packet_capture_available(trace):
+        return True
+    pktmon_df, _error = _pktmon_packet_capture_df(trace, boundary_only=True)
+    return pktmon_df is not None and not pktmon_df.empty
+
+
+def _pktmon_text_path(trace: TraceData) -> Path:
+    return trace.export_dir / _PKTMON_TEXT_FILENAME
+
+
+def _cache_file_current(cache_path: Path, source_path: Path) -> bool:
+    if not cache_path.exists() or not source_path.exists():
+        return False
+    meta_path = _cache_metadata_path(cache_path)
+    if not meta_path.exists():
+        return False
+    try:
+        metadata = json.loads(meta_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    return metadata == _source_identity(source_path)
+
+
+def _source_identity(source_path: Path) -> dict[str, int]:
+    stat = source_path.stat()
+    return {"size": int(stat.st_size), "mtime_ns": int(stat.st_mtime_ns)}
+
+
+def _cache_metadata_path(cache_path: Path) -> Path:
+    return cache_path.with_name(cache_path.name + ".meta.json")
+
+
+def _write_cache_metadata(cache_path: Path, source_path: Path) -> None:
+    _cache_metadata_path(cache_path).write_text(
+        json.dumps(_source_identity(source_path), sort_keys=True),
+        encoding="utf-8",
+    )
+
+
+def _remove_stale_cache(cache_path: Path) -> tuple[bool, str | None]:
+    try:
+        if cache_path.exists():
+            cache_path.unlink()
+        meta_path = _cache_metadata_path(cache_path)
+        if meta_path.exists():
+            meta_path.unlink()
+    except OSError as exc:
+        return False, f"could not remove stale pktmon cache file {cache_path}: {exc}"
+    return True, None
+
+
+def _read_pktmon_text(path: Path) -> str:
+    raw = path.read_bytes()
+    if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
+        encodings = ("utf-16", "utf-8-sig", "utf-8")
+    elif raw.startswith(b"\xef\xbb\xbf"):
+        encodings = ("utf-8-sig", "utf-8", "utf-16")
+    else:
+        encodings = ("utf-8", "utf-8-sig", "utf-16")
+    for encoding in encodings:
+        try:
+            return raw.decode(encoding)
+        except UnicodeError:
+            continue
+    return raw.decode("utf-8", errors="replace")
+
+
+def _ensure_pktmon_text(trace: TraceData) -> tuple[Path | None, str | None]:
+    text_path = _pktmon_text_path(trace)
+    if _cache_file_current(text_path, trace.etl_path):
+        return text_path, None
+
+    try:
+        trace.export_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        return None, f"could not create pktmon export directory: {exc}"
+    removed, remove_error = _remove_stale_cache(text_path)
+    if not removed:
+        return None, remove_error
+
+    cmd = [
+        "pktmon", "etl2txt", str(trace.etl_path),
+        "--out", str(text_path),
+        "--brief", "--timestamp",
+    ]
+    try:
+        completed = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=_PKTMON_CONVERT_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except FileNotFoundError:
+        return None, "`pktmon.exe` was not found on PATH"
+    except subprocess.TimeoutExpired:
+        return None, "pktmon ETL-to-text conversion timed out"
+    except OSError as exc:
+        return None, f"pktmon ETL-to-text conversion failed to start: {exc}"
+
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout or "").strip()
+        if detail:
+            detail = detail.splitlines()[-1]
+            return None, f"pktmon ETL-to-text conversion failed: {detail}"
+        return None, "pktmon ETL-to-text conversion failed"
+    if not text_path.exists():
+        return None, "pktmon ETL-to-text conversion did not produce an output file"
+    _write_cache_metadata(text_path, trace.etl_path)
+    return text_path, None
+
+
+def _pktmon_pcapng_path(trace: TraceData) -> Path:
+    return trace.export_dir / _PKTMON_PCAPNG_FILENAME
+
+
+def _ensure_pktmon_pcapng(trace: TraceData) -> tuple[Path | None, str | None]:
+    pcapng_path = _pktmon_pcapng_path(trace)
+    if _cache_file_current(pcapng_path, trace.etl_path):
+        return pcapng_path, None
+
+    try:
+        trace.export_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        return None, f"could not create pktmon export directory: {exc}"
+    removed, remove_error = _remove_stale_cache(pcapng_path)
+    if not removed:
+        return None, remove_error
+
+    cmd = ["pktmon", "etl2pcap", str(trace.etl_path), "--out", str(pcapng_path)]
+    try:
+        completed = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=_PKTMON_CONVERT_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except FileNotFoundError:
+        return None, "`pktmon.exe` was not found on PATH"
+    except subprocess.TimeoutExpired:
+        return None, "pktmon ETL-to-PCAPNG conversion timed out"
+    except OSError as exc:
+        return None, f"pktmon ETL-to-PCAPNG conversion failed to start: {exc}"
+
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout or "").strip()
+        if detail:
+            detail = detail.splitlines()[-1]
+            return None, f"pktmon ETL-to-PCAPNG conversion failed: {detail}"
+        return None, "pktmon ETL-to-PCAPNG conversion failed"
+    if not pcapng_path.exists():
+        return None, "pktmon ETL-to-PCAPNG conversion did not produce an output file"
+    _write_cache_metadata(pcapng_path, trace.etl_path)
+    return pcapng_path, None
+
+
+def _pktmon_component_sidecar_paths(trace: TraceData) -> list[Path]:
+    return [
+        trace.export_dir / _PKTMON_COMPONENTS_FILENAME,
+        trace.etl_path.with_name(f"{trace.etl_path.stem}.components.txt"),
+    ]
+
+
+def _parse_pktmon_component_list(text: str) -> dict[int, str]:
+    components: dict[int, str] = {}
+    current_table = ""
+    pending_name = ""
+    pending_id: int | None = None
+
+    def _label(name: str, driver: str = "") -> str:
+        name = name.strip()
+        driver = driver.strip()
+        if name and driver:
+            return f"{name} ({driver})"
+        return name or driver
+
+    for raw_line in text.splitlines():
+        stripped = raw_line.strip()
+        if not stripped:
+            current_table = ""
+            continue
+
+        if stripped.startswith("NIC: "):
+            pending_name = stripped.removeprefix("NIC: ").strip()
+            pending_id = None
+            current_table = ""
+            continue
+        if stripped.startswith("vSwitch: "):
+            pending_name = stripped.removeprefix("vSwitch: ").strip()
+            pending_id = None
+            current_table = ""
+            continue
+        if stripped in {"HTTP Message", "IPSEC", "Unregistered Miniport"}:
+            pending_name = stripped
+            pending_id = None
+            current_table = ""
+            continue
+        if stripped.startswith("Id: ") and pending_name:
+            try:
+                pending_id = int(stripped.split(":", 1)[1].strip())
+                components[pending_id] = pending_name
+            except ValueError:
+                pending_id = None
+            continue
+        if stripped.startswith("Driver: ") and pending_id is not None:
+            driver = stripped.split(":", 1)[1].strip()
+            components[pending_id] = _label(pending_name, driver)
+            continue
+        if stripped in {"Filter Drivers:", "Protocols:", "Application Protocols:"}:
+            current_table = stripped.rstrip(":")
+            continue
+        if stripped.startswith("Id ") or stripped.startswith("-- "):
+            continue
+
+        if current_table:
+            parts = [part.strip() for part in re.split(r"\s{2,}", stripped) if part.strip()]
+            row_match = (
+                re.match(r"^(\d+)\s+(\S+\.sys)\s+(.+)$", stripped, re.IGNORECASE)
+                or re.match(r"^(\d+)\s+(\S+)\s{2,}(.+)$", stripped)
+            )
+            if len(parts) < 2 and row_match:
+                parts = [row_match.group(1), row_match.group(2), row_match.group(3).strip()]
+            if len(parts) < 2:
+                continue
+            try:
+                component_id = int(parts[0])
+            except ValueError:
+                if row_match:
+                    parts = [row_match.group(1), row_match.group(2), row_match.group(3).strip()]
+                    component_id = int(parts[0])
+                else:
+                    continue
+            if current_table == "Filter Drivers" and len(parts) >= 3:
+                components[component_id] = _label(parts[2], parts[1])
+            elif current_table == "Protocols":
+                if len(parts) >= 4:
+                    components[component_id] = _label(parts[2], parts[1])
+                elif len(parts) >= 2:
+                    components[component_id] = _label(parts[1])
+            elif current_table == "Application Protocols" and len(parts) >= 3:
+                components[component_id] = _label(parts[2], parts[1])
+
+    return components
+
+
+def _pktmon_component_map(trace: TraceData) -> tuple[dict[int, str], str | None]:
+    for path in _pktmon_component_sidecar_paths(trace):
+        if path.exists():
+            return _parse_pktmon_component_list(_read_pktmon_text(path)), str(path)
+
+    cache_path = trace.export_dir / _PKTMON_COMPONENTS_FILENAME
+    try:
+        trace.export_dir.mkdir(parents=True, exist_ok=True)
+        completed = subprocess.run(
+            ["pktmon", "comp", "list", "--all"],
+            capture_output=True,
+            text=True,
+            timeout=_PKTMON_COMPONENT_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return {}, None
+
+    if completed.returncode != 0 or not completed.stdout.strip():
+        return {}, None
+    try:
+        cache_path.write_text(completed.stdout, encoding="utf-8")
+    except OSError:
+        pass
+    return _parse_pktmon_component_list(completed.stdout), "`pktmon comp list --all` on analysis host"
+
+
+def _pcapng_padded_length(length: int) -> int:
+    return (length + 3) & ~3
+
+
+def _parse_pcapng_tsresol(value: bytes) -> float:
+    if not value:
+        return 1e-6
+    raw = value[0]
+    base = 2 if raw & 0x80 else 10
+    exponent = raw & 0x7F
+    return base ** -exponent
+
+
+def _iter_pcapng_options(data: bytes, endian: str, offset: int, end: int) -> Iterator[tuple[int, bytes]]:
+    cursor = offset
+    while cursor + 4 <= end:
+        code, length = struct.unpack_from(endian + "HH", data, cursor)
+        cursor += 4
+        if code == 0:
+            break
+        value = data[cursor:cursor + length]
+        cursor += _pcapng_padded_length(length)
+        yield code, value
+
+
+def _read_pcapng_packets(path: Path) -> tuple[list[dict[str, Any]] | None, str | None]:
+    data = path.read_bytes()
+    packets: list[dict[str, Any]] = []
+    interfaces: list[dict[str, Any]] = []
+    endian = "<"
+    offset = 0
+
+    while offset + 12 <= len(data):
+        block_type, block_length = struct.unpack_from(endian + "II", data, offset)
+        if block_length < 12 or offset + block_length > len(data):
+            return None, f"invalid PCAPNG block at offset {offset}"
+
+        body_offset = offset + 8
+        body_end = offset + block_length - 4
+
+        if block_type == 0x0A0D0D0A:
+            magic = data[body_offset:body_offset + 4]
+            if magic == b"\x4d\x3c\x2b\x1a":
+                endian = "<"
+            elif magic == b"\x1a\x2b\x3c\x4d":
+                endian = ">"
+            else:
+                return None, "invalid PCAPNG byte-order magic"
+            interfaces = []
+        elif block_type == 0x00000001:
+            if body_offset + 8 > body_end:
+                return None, "truncated PCAPNG interface block"
+            link_type, _reserved, snaplen = struct.unpack_from(endian + "HHI", data, body_offset)
+            tsresol = 1e-6
+            for code, value in _iter_pcapng_options(data, endian, body_offset + 8, body_end):
+                if code == 9:
+                    tsresol = _parse_pcapng_tsresol(value)
+            interfaces.append({"link_type": link_type, "snaplen": snaplen, "tsresol": tsresol})
+        elif block_type == 0x00000006:
+            if body_offset + 20 > body_end:
+                return None, "truncated PCAPNG enhanced packet block"
+            interface_id, ts_high, ts_low, captured_len, original_len = struct.unpack_from(
+                endian + "IIIII",
+                data,
+                body_offset,
+            )
+            packet_offset = body_offset + 20
+            packet_end = packet_offset + captured_len
+            if packet_end > body_end:
+                return None, "truncated PCAPNG packet data"
+            if interface_id >= len(interfaces):
+                return None, f"PCAPNG packet references unknown interface {interface_id}"
+            raw_timestamp = (ts_high << 32) | ts_low
+            tsresol = float(interfaces[interface_id].get("tsresol", 1e-6))
+            packets.append({
+                "timestamp_us": int(round(raw_timestamp * tsresol * 1_000_000)),
+                "captured_len": int(captured_len),
+                "original_len": int(original_len),
+                "packet_bytes": data[packet_offset:packet_end],
+            })
+
+        trailing_length = struct.unpack_from(endian + "I", data, offset + block_length - 4)[0]
+        if trailing_length != block_length:
+            return None, f"invalid PCAPNG trailing block length at offset {offset}"
+        offset += block_length
+
+    if offset != len(data):
+        return None, "trailing bytes after final PCAPNG block"
+    return packets, None
+
+
+def _is_pktmon_boundary_packet(
+    direction: str,
+    packet_type: str,
+    component: int,
+    edge: int,
+) -> bool:
+    if packet_type != "Ethernet":
+        return False
+    return (
+        (direction == "Tx" and component == 12 and edge == 1)
+        or (direction == "Rx" and component == 1 and edge == 1)
+    )
+
+
+def _pktmon_text_rows(text: str) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    pending: dict[str, str] | None = None
+
+    for line in text.splitlines():
+        header = _PKTMON_HEADER_RE.match(line)
+        if header:
+            direction = header.group("direction")
+            packet_type = header.group("type")
+            component = int(header.group("component"))
+            edge = int(header.group("edge") or -1)
+            is_drop = bool(header.group("drop"))
+            pending = (
+                header.groupdict()
+                if not is_drop and _is_pktmon_boundary_packet(direction, packet_type, component, edge)
+                else None
+            )
+            continue
+
+        if pending is None:
+            continue
+        if not line.startswith("\t"):
+            pending = None
+            continue
+
+        flow = _PKTMON_FLOW_RE.search(line)
+        if flow is None:
+            pending = None
+            continue
+
+        proto = flow.group("proto").lower()
+        rows.append({
+            "Direction": "Send" if pending["direction"] == "Tx" else "Recv",
+            "5-Tuple": (
+                f"{flow.group('src')}:{flow.group('srcport')} -> "
+                f"{flow.group('dst')}:{flow.group('dstport')}/{proto}"
+            ),
+            "Size": int(pending["size"]),
+        })
+        pending = None
+
+    return rows
+
+
+def _pktmon_text_appearances(text: str) -> list[dict[str, Any]]:
+    appearances: list[dict[str, Any]] = []
+    pending: dict[str, str] | None = None
+
+    for line in text.splitlines():
+        header = _PKTMON_HEADER_RE.match(line)
+        if header:
+            is_drop = bool(header.group("drop"))
+            pending = (
+                header.groupdict()
+                if not is_drop and header.group("type") == "Ethernet"
+                else None
+            )
+            continue
+
+        if pending is None:
+            continue
+        if not line.startswith("\t"):
+            pending = None
+            continue
+
+        direction = "Send" if pending["direction"] == "Tx" else "Recv"
+        component = int(pending["component"])
+        edge = int(pending["edge"] or -1)
+        appearances.append({
+            "PktmonTime": pending["ts"],
+            "Direction": direction,
+            "PktmonDirection": pending["direction"],
+            "Component": component,
+            "Edge": edge,
+            "PktGroupId": int(pending["group"]),
+            "PktNumber": int(pending["number"]),
+            "Appearance": int(pending["appearance"]),
+            "OriginalSize": int(pending["size"]),
+            "LoggedSize": int(pending["logged"]),
+            "PktmonDetail": line.strip(),
+            "Boundary": _is_pktmon_boundary_packet(pending["direction"], pending["type"], component, edge),
+            "PathIndex": _PKTMON_PATH_INDEX.get(direction, {}).get((component, edge), -1),
+        })
+        pending = None
+
+    return appearances
+
+
+def _pktmon_cache_path(trace: TraceData, *, boundary_only: bool) -> Path:
+    name = _PKTMON_BOUNDARY_PARQUET_FILENAME if boundary_only else _PKTMON_LAYER_PARQUET_FILENAME
+    return trace.export_dir / name
+
+
+def _pktmon_packet_capture_df(
+    trace: TraceData,
+    *,
+    boundary_only: bool,
+) -> tuple[pd.DataFrame | None, str | None]:
+    if not trace.etl_path.exists():
+        return None, f"trace ETL file does not exist: {trace.etl_path}"
+
+    cache_path = _pktmon_cache_path(trace, boundary_only=boundary_only)
+    if _cache_file_current(cache_path, trace.etl_path):
+        return pd.read_parquet(cache_path), None
+
+    text_path, text_error = _ensure_pktmon_text(trace)
+    if text_error is not None:
+        return None, text_error
+    pcapng_path, pcapng_error = _ensure_pktmon_pcapng(trace)
+    if pcapng_error is not None:
+        return None, pcapng_error
+    if text_path is None or pcapng_path is None:
+        return None, "pktmon conversion did not return text and PCAPNG output paths"
+
+    appearances = _pktmon_text_appearances(_read_pktmon_text(text_path))
+    packets, packet_error = _read_pcapng_packets(pcapng_path)
+    if packet_error is not None:
+        return None, packet_error
+    if packets is None:
+        return None, "pktmon PCAPNG parsing did not return packets"
+    if len(appearances) != len(packets):
+        return (
+            None,
+            "pktmon text/PCAPNG packet count mismatch: "
+            f"{len(appearances):,} text appearances vs {len(packets):,} PCAPNG packets",
+        )
+
+    rows: list[dict[str, Any]] = []
+    first_timestamp = packets[0]["timestamp_us"] if packets else 0
+    size_mismatches: list[str] = []
+    for index, (appearance, packet) in enumerate(zip(appearances, packets, strict=True)):
+        captured_len = int(packet["captured_len"])
+        if captured_len != int(appearance["LoggedSize"]) and len(size_mismatches) < 5:
+            size_mismatches.append(
+                f"#{index}: text logged={appearance['LoggedSize']} pcap captured={captured_len}"
+            )
+        if boundary_only and not bool(appearance["Boundary"]):
+            continue
+        rows.append({
+            "TimeStamp": int(packet["timestamp_us"]) - int(first_timestamp),
+            "Direction": appearance["Direction"],
+            "MiniportName": "pktmon",
+            "PacketBytes": packet["packet_bytes"].hex(),
+            "Size": int(appearance["OriginalSize"]),
+            "CapturedSize": captured_len,
+            "Process Name": "",
+            "PID": 0,
+            "ThreadID": 0,
+            "CPU": 0,
+            "Source": "pktmon",
+            "PktmonTime": appearance["PktmonTime"],
+            "PktGroupId": appearance["PktGroupId"],
+            "PktNumber": appearance["PktNumber"],
+            "Appearance": appearance["Appearance"],
+            "Component": appearance["Component"],
+            "Edge": appearance["Edge"],
+            "Boundary": bool(appearance["Boundary"]),
+            "PathIndex": appearance["PathIndex"],
+            "PktmonDetail": appearance["PktmonDetail"],
+        })
+
+    if size_mismatches:
+        return None, "pktmon text/PCAPNG size mismatch: " + "; ".join(size_mismatches)
+
+    df = pd.DataFrame(rows)
+    trace.export_dir.mkdir(parents=True, exist_ok=True)
+    df.to_parquet(cache_path, index=False)
+    _write_cache_metadata(cache_path, trace.etl_path)
+    return df, None
+
+
+def _pktmon_capture_summary_df(trace: TraceData) -> tuple[pd.DataFrame | None, str | None]:
+    text_path, error = _ensure_pktmon_text(trace)
+    if error is not None:
+        return None, error
+    if text_path is None:
+        return None, "pktmon ETL-to-text conversion did not return an output path"
+
+    text = _read_pktmon_text(text_path)
+    rows = _pktmon_text_rows(text)
+    if not rows:
+        return None, None
+
+    aggregates: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        five_tuple = row["5-Tuple"]
+        entry = aggregates.setdefault(
+            five_tuple,
+            {
+                "5-Tuple": five_tuple,
+                "Recv Pkts": 0,
+                "Send Pkts": 0,
+                "Total Pkts": 0,
+                "Total Bytes": 0,
+            },
+        )
+        direction = row["Direction"]
+        if direction == "Recv":
+            entry["Recv Pkts"] += 1
+        elif direction == "Send":
+            entry["Send Pkts"] += 1
+        entry["Total Pkts"] += 1
+        entry["Total Bytes"] += int(row["Size"])
+
+    return (
+        pd.DataFrame(list(aggregates.values()))
+        .sort_values("Total Bytes", ascending=False)
+        .reset_index(drop=True),
+        None,
+    )
 
 
 def _apply_process_filter(df: pd.DataFrame, process_filter: str | None) -> pd.DataFrame:
@@ -337,6 +993,294 @@ def _five_tuples_match(row, query: dict[str, Any]) -> bool:
     return forward or backward
 
 
+def _ip_payload_length(decoded: dict[str, Any]) -> int:
+    version = int(decoded.get("ip.version", 0) or 0)
+    if version == 4:
+        return max(0, int(decoded.get("ip.total_length", 0) or 0) - int(decoded.get("ip.header_len", 0) or 0))
+    if version == 6:
+        return max(0, int(decoded.get("ip.payload_length", 0) or 0))
+    return 0
+
+
+def _tcp_payload_length(decoded: dict[str, Any]) -> int:
+    return max(0, _ip_payload_length(decoded) - int(decoded.get("tcp.header_len", 0) or 0))
+
+
+def _packet_fingerprint(decoded: dict[str, Any], size: int) -> tuple[tuple[Any, ...] | None, str]:
+    src = decoded.get("ip.src")
+    dst = decoded.get("ip.dst")
+    proto_num = decoded.get("ip.proto")
+    if not src or not dst or proto_num is None:
+        return None, "other"
+
+    ip_id = decoded.get("ip.id", -1)
+    if proto_num == 6 and "tcp.src_port" in decoded and "tcp.dst_port" in decoded:
+        return (
+            (
+                "tcp", src, dst,
+                int(decoded.get("tcp.src_port", 0) or 0),
+                int(decoded.get("tcp.dst_port", 0) or 0),
+                int(decoded.get("tcp.seq", 0) or 0),
+                int(decoded.get("tcp.ack", 0) or 0),
+                int(decoded.get("tcp.flags_raw", 0) or 0),
+                _tcp_payload_length(decoded),
+                int(ip_id or -1),
+                int(size),
+            ),
+            "tcp",
+        )
+    if proto_num == 17 and "udp.src_port" in decoded and "udp.dst_port" in decoded:
+        return (
+            (
+                "udp", src, dst,
+                int(decoded.get("udp.src_port", 0) or 0),
+                int(decoded.get("udp.dst_port", 0) or 0),
+                int(decoded.get("udp.length", 0) or 0),
+                int(ip_id or -1),
+                int(size),
+            ),
+            "udp",
+        )
+
+    return (
+        (
+            "ip", src, dst, int(proto_num),
+            int(ip_id or -1),
+            _ip_payload_length(decoded),
+            int(size),
+        ),
+        f"proto-{int(proto_num)}",
+    )
+
+
+def _journey_confidence(proto: str, complete: bool) -> str:
+    if proto == "tcp":
+        return "high" if complete else "medium"
+    if proto == "udp":
+        return "medium" if complete else "low"
+    return "low"
+
+
+def _percentile(values: list[float], pct: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    index = min(len(ordered) - 1, max(0, int(round((pct / 100.0) * (len(ordered) - 1)))))
+    return float(ordered[index])
+
+
+def _stage_name(component: int, edge: int) -> str:
+    return f"{component}/{edge}"
+
+
+def _component_label(component: int, component_map: dict[int, str]) -> str:
+    return component_map.get(int(component), f"Component {int(component)}")
+
+
+def _friendly_stage_name(component: int, edge: int, component_map: dict[int, str]) -> str:
+    return f"{_component_label(component, component_map)} edge {int(edge)}"
+
+
+def _friendly_hop(
+    before: dict[str, Any],
+    after: dict[str, Any],
+    component_map: dict[int, str],
+) -> str:
+    before_component = int(before["Component"])
+    after_component = int(after["Component"])
+    before_edge = int(before["Edge"])
+    after_edge = int(after["Edge"])
+    if before_component == after_component:
+        return (
+            f"{_component_label(before_component, component_map)}: "
+            f"edge {before_edge} -> edge {after_edge}"
+        )
+    return (
+        f"{_friendly_stage_name(before_component, before_edge, component_map)} -> "
+        f"{_friendly_stage_name(after_component, after_edge, component_map)}"
+    )
+
+
+def _safe_int(value: Any, default: int = -1) -> int:
+    try:
+        if pd.isna(value):
+            return default
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _group_pktmon_journeys(
+    df: pd.DataFrame,
+    *,
+    five_tuple: str | None,
+    direction_filter: str | None,
+) -> list[dict[str, Any]]:
+    query = _parse_five_tuple_query(five_tuple) if five_tuple else None
+    direction_filter_normalized = None
+    if direction_filter:
+        value = direction_filter.strip().lower()
+        if value in ("tx", "send"):
+            direction_filter_normalized = "Send"
+        elif value in ("rx", "recv", "receive"):
+            direction_filter_normalized = "Recv"
+
+    journeys: list[dict[str, Any]] = []
+    active: dict[tuple[str, tuple[Any, ...]], list[dict[str, Any]]] = {}
+    next_id = 1
+
+    if df.empty:
+        return journeys
+    ordered = df.copy()
+    ts = pd.to_numeric(ordered["TimeStamp"], errors="coerce")
+    ordered = ordered.assign(_sort_ts=ts).dropna(subset=["_sort_ts"]).sort_values("_sort_ts")
+
+    for _, row in ordered.iterrows():
+        direction = str(row.get("Direction", ""))
+        if direction_filter_normalized and direction != direction_filter_normalized:
+            continue
+        path_index = _safe_int(row.get("PathIndex", -1))
+        if path_index < 0:
+            continue
+        decoded = _decode_row(row.get("PacketBytes", ""))
+        src, dst, sport, dport, proto, five = _decoded_tuple_fields(decoded)
+        match_row = {
+            "_src": src,
+            "_dst": dst,
+            "_src_port": sport,
+            "_dst_port": dport,
+            "_proto": proto,
+        }
+        if query is not None and not _five_tuples_match(match_row, query):
+            continue
+        fingerprint, fingerprint_proto = _packet_fingerprint(decoded, int(row.get("Size", 0) or 0))
+        if fingerprint is None:
+            continue
+
+        row_ts = float(row.get("TimeStamp", 0) or 0)
+        key = (direction, fingerprint)
+        candidates = [
+            journey for journey in active.get(key, [])
+            if path_index > int(journey["stages"][-1]["PathIndex"])
+            and row_ts - float(journey["stages"][-1]["TimeStamp"]) <= _PKTMON_LAYER_WINDOW_US
+        ]
+        if candidates:
+            journey = max(
+                candidates,
+                key=lambda item: (
+                    int(item["stages"][-1]["PathIndex"]),
+                    float(item["stages"][-1]["TimeStamp"]),
+                ),
+            )
+        else:
+            journey = {
+                "Journey": next_id,
+                "Direction": direction,
+                "Protocol": fingerprint_proto,
+                "5-Tuple": five,
+                "stages": [],
+            }
+            next_id += 1
+            active.setdefault(key, []).append(journey)
+            journeys.append(journey)
+
+        journey["stages"].append({
+            "TimeStamp": row_ts,
+            "Component": _safe_int(row.get("Component", -1)),
+            "Edge": _safe_int(row.get("Edge", -1)),
+            "PathIndex": path_index,
+            "PktmonTime": row.get("PktmonTime", ""),
+        })
+
+        expected_path_len = len(_PKTMON_TX_PATH if direction == "Send" else _PKTMON_RX_PATH)
+        if path_index == expected_path_len - 1:
+            active[key] = [item for item in active.get(key, []) if item is not journey]
+
+    for journey in journeys:
+        stages = journey["stages"]
+        direction = journey["Direction"]
+        expected_path_len = len(_PKTMON_TX_PATH if direction == "Send" else _PKTMON_RX_PATH)
+        path_indices = {int(stage["PathIndex"]) for stage in stages}
+        complete = 0 in path_indices and expected_path_len - 1 in path_indices
+        journey["Complete"] = complete
+        journey["Confidence"] = _journey_confidence(str(journey["Protocol"]), complete)
+        journey["TotalLatencyUs"] = (
+            max(float(stage["TimeStamp"]) for stage in stages)
+            - min(float(stage["TimeStamp"]) for stage in stages)
+            if len(stages) > 1 else 0.0
+        )
+
+    return journeys
+
+
+def _layer_latency_tables(
+    journeys: list[dict[str, Any]],
+    component_map: dict[int, str],
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    hop_values: dict[tuple[str, str, str, str, str], list[float]] = {}
+    for journey in journeys:
+        stages = journey["stages"]
+        if len(stages) < 2:
+            continue
+        for before, after in zip(stages, stages[1:]):
+            if int(after["PathIndex"]) <= int(before["PathIndex"]):
+                continue
+            hop = (
+                f"{_stage_name(before['Component'], before['Edge'])} -> "
+                f"{_stage_name(after['Component'], after['Edge'])}"
+            )
+            friendly_hop = _friendly_hop(before, after, component_map)
+            key = (
+                str(journey["Direction"]),
+                str(journey["Protocol"]),
+                hop,
+                friendly_hop,
+                str(journey["Confidence"]),
+            )
+            hop_values.setdefault(key, []).append(float(after["TimeStamp"]) - float(before["TimeStamp"]))
+
+    hop_rows = []
+    for (direction, proto, hop, friendly_hop, confidence), values in hop_values.items():
+        hop_rows.append({
+            "Direction": direction,
+            "Protocol": proto,
+            "Hop": hop,
+            "Component Hop": friendly_hop,
+            "Confidence": confidence,
+            "Samples": len(values),
+            "p50 us": round(_percentile(values, 50), 1),
+            "p95 us": round(_percentile(values, 95), 1),
+            "p99 us": round(_percentile(values, 99), 1),
+            "Max us": round(max(values), 1),
+        })
+
+    slow_rows = []
+    for journey in sorted(journeys, key=lambda item: float(item.get("TotalLatencyUs", 0)), reverse=True)[:10]:
+        stages = journey["stages"]
+        if len(stages) < 2:
+            continue
+        slow_rows.append({
+            "Journey": journey["Journey"],
+            "Direction": journey["Direction"],
+            "Protocol": journey["Protocol"],
+            "Confidence": journey["Confidence"],
+            "Stages": len(stages),
+            "Total us": round(float(journey["TotalLatencyUs"]), 1),
+            "5-Tuple": journey["5-Tuple"],
+            "Path": " -> ".join(_stage_name(stage["Component"], stage["Edge"]) for stage in stages),
+            "Friendly Path": " -> ".join(
+                _friendly_stage_name(stage["Component"], stage["Edge"], component_map)
+                for stage in stages
+            ),
+        })
+
+    hop_df = pd.DataFrame(hop_rows)
+    if not hop_df.empty:
+        hop_df = hop_df.sort_values(["Max us", "Samples"], ascending=[False, False]).reset_index(drop=True)
+    slow_df = pd.DataFrame(slow_rows)
+    return hop_df, slow_df
+
+
 # ---------------------------------------------------------------------------
 # Tool: get_packet_capture_summary
 # ---------------------------------------------------------------------------
@@ -351,9 +1295,11 @@ def get_packet_capture_summary(
     """Per-5-tuple packet/byte counts derived from decoded packet headers.
 
     Decodes the captured frame bytes for every row in ``packet_capture_df``
-    on the fly (Ethernet → IP → L4) and groups by 5-tuple. One row per
-    5-tuple with packet count split by Direction (Recv / Send) and total
-    bytes. Sorted by total bytes descending.
+    on the fly (Ethernet → IP → L4) and groups by 5-tuple. If the trace has
+    no NDIS PacketCapture rows, pktmon ETLs are summarized by converting
+    them with ``pktmon etl2txt`` and reading boundary packet observations.
+    One row per 5-tuple with packet count split by Direction (Recv / Send)
+    and total bytes. Sorted by total bytes descending.
 
     Args:
         trace_id: ID returned by load_trace.
@@ -363,7 +1309,29 @@ def get_packet_capture_summary(
     trace = require_trace(trace_id)
     _ensure_dumper_ready(trace)
 
-    if not _packet_capture_available(trace):
+    if not _ndis_packet_capture_available(trace):
+        if process_filter:
+            return (
+                "*Process filtering is not available for pktmon text fallback.*\n\n"
+                "This trace has no `Microsoft-Windows-NDIS-PacketCapture` "
+                "frame-byte dataset, and pktmon ETL text does not include "
+                "process names. Re-collect with NDIS PacketCapture enabled "
+                "to filter packets by process."
+            )
+        pktmon_df, pktmon_error = _pktmon_capture_summary_df(trace)
+        if pktmon_df is not None and not pktmon_df.empty:
+            lines = [
+                "**Packet Capture Summary**",
+                "",
+                "Source: pktmon ETL text fallback",
+                f"5-tuples observed: {len(pktmon_df):,}",
+                f"Total packets: {int(pktmon_df['Total Pkts'].sum()):,}",
+                "",
+                format_table(pktmon_df, max_rows=top_n),
+            ]
+            return "\n".join(lines)
+        if pktmon_error:
+            return f"{_NO_PACKET_CAPTURE_MSG}\n\nPktmon fallback was unavailable: {pktmon_error}."
         return _NO_PACKET_CAPTURE_MSG
 
     aggregates: dict[str, dict[str, Any]] = {}
@@ -889,9 +1857,81 @@ def decode_packet(trace_id: str, timestamp_us: float) -> str:
     return "\n".join(lines)
 
 
+@mcp.tool()
+def get_pktmon_layer_latency(
+    trace_id: str,
+    five_tuple: str | None = None,
+    direction: str | None = None,
+    max_rows: int = 30,
+) -> str:
+    """Estimate pktmon per-layer traversal latency by component/edge hop.
+
+    Uses pktmon text metadata plus PCAPNG packet bytes to group appearances
+    from the same packet journey. TCP journeys use a strong packet
+    fingerprint (5-tuple, seq/ack/flags, payload length, IP ID, size). UDP
+    and IP-only journeys use weaker fingerprints and are marked with lower
+    confidence. This tool requires a pktmon ETL collected with
+    ``pktmon start --capture --pkt-size 0``.
+
+    Args:
+        trace_id: ID returned by load_trace.
+        five_tuple: Optional flow selector such as
+            ``"10.0.0.1:5000 -> 10.0.0.2:6000/tcp"``. Matching is
+            direction-agnostic.
+        direction: Optional ``"tx"``/``"send"`` or ``"rx"``/``"recv"``
+            filter.
+        max_rows: Maximum hop rows to return. Default: 30.
+    """
+    trace = require_trace(trace_id)
+    _ensure_dumper_ready(trace)
+
+    df, error = _pktmon_packet_capture_df(trace, boundary_only=False)
+    if df is None or df.empty:
+        if error:
+            return f"*No pktmon packet-layer data available.*\n\nPktmon fallback was unavailable: {error}."
+        return "*No pktmon packet-layer data available.*"
+
+    component_map, component_source = _pktmon_component_map(trace)
+    journeys = _group_pktmon_journeys(df, five_tuple=five_tuple, direction_filter=direction)
+    hop_df, slow_df = _layer_latency_tables(journeys, component_map)
+    if hop_df.empty:
+        return "*No pktmon packet journeys could be grouped for layer-latency analysis.*"
+
+    complete_count = sum(1 for journey in journeys if journey.get("Complete"))
+    lines = [
+        "**Pktmon Layer Latency**",
+        "",
+        f"Journeys grouped: {len(journeys):,}",
+        f"Complete journeys: {complete_count:,}",
+        f"Grouping window: {_PKTMON_LAYER_WINDOW_US:,} us",
+        (
+            f"Component names: {component_source}"
+            if component_source
+            else "Component names: unavailable; showing raw component IDs"
+        ),
+    ]
+    if five_tuple:
+        lines.append(f"5-tuple filter: `{five_tuple}`")
+    if direction:
+        lines.append(f"Direction filter: `{direction}`")
+    lines.extend([
+        "",
+        format_table(hop_df, max_rows=max_rows),
+    ])
+    if not slow_df.empty:
+        lines.extend([
+            "",
+            "**Slowest grouped journeys**",
+            "",
+            format_table(slow_df, max_rows=min(10, max_rows)),
+        ])
+    return "\n".join(lines)
+
+
 __all__ = [
     "decode_packet",
     "get_packet_capture_summary",
     "get_packet_timeline",
+    "get_pktmon_layer_latency",
     "get_send_recv_latency",
 ]

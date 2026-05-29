@@ -56,7 +56,9 @@ def get_memory_pools(
 
     Requires trace collected with Pool profiling (wpr -start Pool).
     Shows which drivers are allocating kernel memory, how much is
-    outstanding, and the pool tags used.
+    outstanding, and the pool tags used. Native mode currently decodes a
+    coverage subset and may not include xperf's pool allocation tables;
+    use ``mode="xperf"`` when pool parity is required.
 
     Args:
         trace_id: ID returned by load_trace.

@@ -50,4 +50,11 @@ testpaths = ["tests"]
 addopts = "-m 'not slow'"
 markers = [
     "slow: tests that load multi-100MB traces (~60s+). Run with: pytest -m slow",
+    "fixture: tests that require optional ETL fixtures. Run with: pytest --run-fixture",
+    "golden: tests that compare stable golden trace invariants. Run with: pytest --run-golden",
+    "xperf: tests that require xperf.exe. Run with: pytest --run-xperf",
+    "admin: tests that require administrator privileges. Run with: pytest --run-admin",
+    "network: tests that require network access. Run with: pytest --run-network",
+    "benchmark: tests that measure performance. Run with: pytest --run-benchmark",
+    "live: tests that attach to live systems or processes. Run with: pytest --run-live",
 ]

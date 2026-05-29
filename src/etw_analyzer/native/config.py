@@ -5,12 +5,16 @@ The resolution order is documented in the design doc §8.1:
     1. The explicit ``mode=...`` argument on ``load_trace``.
     2. The ``WPR_MCP_MODE`` environment variable.
     3. The hard-coded default ``"auto"`` (Phase N5 flipped this from
-       ``"xperf"`` once the native pipeline reached parity).
+       ``"xperf"`` once the native pipeline became a fast-path coverage
+       subset for common analysis).
 
 When ``"auto"`` is requested, the resolved mode is computed by probing
-the native consumer; on failure the result is ``"xperf"`` and the
-auto-detect failure is cached for the lifetime of the process so we
-don't re-probe on every load.
+the native consumer; on success the native fast path is used, and on
+failure the result is ``"xperf"``. The auto-detect result is cached for
+the lifetime of the process so we don't re-probe on every load. Native
+mode is not full xperf parity: it decodes a curated subset of providers
+and aggregations, while ``mode="xperf"`` remains the broadest-coverage
+fallback.
 
 When ``"native"`` is requested explicitly but the consumer is not
 available (e.g. running on a non-Windows host, or ``tdh.dll`` failed

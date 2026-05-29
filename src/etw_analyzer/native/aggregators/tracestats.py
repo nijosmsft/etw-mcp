@@ -123,7 +123,9 @@ def build_tracestats_text(trace: "TraceData") -> Optional[str]:
     """Build a ``tracestats``-equivalent text block.
 
     Pulls the per-provider counts and lost-event totals off
-    ``trace.event_counts`` and any cached ``ExtractStats``.
+    ``trace.event_counts`` and any cached ``ExtractStats``. The native text
+    is a compact xperf-compatible subset, not a byte-for-byte
+    ``xperf -a tracestats`` clone.
     """
     counts = getattr(trace, "event_counts", None) or {}
     extract_stats = getattr(trace, "_native_extract_stats", None)
@@ -135,6 +137,7 @@ def build_tracestats_text(trace: "TraceData") -> Optional[str]:
         lines.append("")
     if extract_stats is not None:
         lines.append(f"Total events:    {extract_stats.event_count}")
+        lines.append(f"EventCount:      {extract_stats.event_count}")
         lines.append(f"Bytes processed: {extract_stats.bytes_processed}")
         lines.append(f"Events lost:     {extract_stats.events_lost}")
         lines.append(f"Stacks paired:   {extract_stats.stacks_paired}")
@@ -145,6 +148,7 @@ def build_tracestats_text(trace: "TraceData") -> Optional[str]:
         provider_counts = getattr(extract_stats, "provider_counts", None) or {}
         for guid, count in sorted(provider_counts.items(), key=lambda kv: -kv[1]):
             lines.append(f"  {guid}: {count}")
+            lines.append(f"  {guid} EventCount={count}")
         lines.append("")
         decoded_counts = getattr(extract_stats, "decoded_counts", None) or {}
         if decoded_counts:

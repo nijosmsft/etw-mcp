@@ -417,7 +417,11 @@ class NativeEventStore:
                 include_time,
             )
 
-        physical_columns = _physical_columns(schema, requested_columns, include_time)
+        physical_columns = _physical_columns(
+            schema,
+            _columns_with_filter_dependencies(requested_columns, event_filters),
+            include_time,
+        )
         tables: list[pa.Table] = []
         for part in dataset.parts:
             if _part_excluded_by_qpc(part, start_qpc, end_qpc):
@@ -471,7 +475,11 @@ class NativeEventStore:
             return
         schema = schema_for_event_class(cname).schema
         requested_columns = list(columns) if columns is not None else None
-        physical_columns = _physical_columns(schema, requested_columns, include_time)
+        physical_columns = _physical_columns(
+            schema,
+            _columns_with_filter_dependencies(requested_columns, event_filters),
+            include_time,
+        )
         safe_batch_size = max(1, int(batch_size or 65_536))
 
         for part in dataset.parts:
@@ -657,6 +665,29 @@ def _physical_columns(
     names = set(schema.names)
     columns = [name for name in requested_columns if name in names]
     if include_time and "TimeStampQpc" in names and "TimeStampQpc" not in columns:
+        columns.append("TimeStampQpc")
+    return columns
+
+
+def _columns_with_filter_dependencies(
+    requested_columns: list[str] | None,
+    filters: EventFilters,
+) -> list[str] | None:
+    if requested_columns is None:
+        return None
+    columns = list(requested_columns)
+    if filters.cpu_filter is not None and "CPU" not in columns:
+        columns.append("CPU")
+    needs_qpc = any(
+        value is not None
+        for value in (
+            filters.start_time,
+            filters.end_time,
+            filters.start_qpc,
+            filters.end_qpc,
+        )
+    )
+    if needs_qpc and "TimeStampQpc" not in columns:
         columns.append("TimeStampQpc")
     return columns
 
