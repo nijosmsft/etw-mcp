@@ -66,6 +66,7 @@ def _run_xperf(
     cmd = [str(xperf), "-i", str(etl_path)]
     if symbols:
         cmd.append("-symbols")
+    cmd.append("-tle")
     cmd.extend(["-a", action])
     if action_args:
         cmd.extend(action_args)
