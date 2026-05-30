@@ -355,15 +355,59 @@ def _rewrite_manifest(
     aggregator_stems: list[str],
     producer: str,
 ) -> native_cache.CacheManifest:
-    """Build and write the post-aggregation manifest."""
+    """Build and write the post-aggregation manifest.
+
+    Sidecar datasets are remapped to the kinds ``trace_mgmt`` expects on
+    the native rehydrate path: dumper event-class parquets become
+    ``kind="dumper-parquet"`` with ``materialize_on_load=False`` so the
+    cache loader can stream them without buffering. Aux parquets and
+    the sysconfig text are preserved as the sidecar wrote them.
+    """
+
+    # Stems trace_mgmt recognizes as dumper parquets — these must use
+    # ``dumper-parquet`` kind + ``materialize_on_load=False`` for the
+    # native-cache loader to find them.
+    dumper_stems = {stem for stem, _ in _SIDECAR_STEM_TO_ATTR.items()}
 
     datasets: list[native_cache.CacheDataset] = []
-    # Preserve every dataset from the sidecar manifest first — kind +
-    # row_count + materialize_on_load come from there.
-    existing_names = set()
+    existing_names: set[str] = set()
     for dataset in sidecar_manifest.datasets:
+        # Remap dumper datasets from the sidecar's flat ``parquet`` kind
+        # to the ``dumper-parquet`` kind trace_mgmt rehydrates.
+        if dataset.name in dumper_stems and dataset.kind == "parquet":
+            dataset = native_cache.CacheDataset(
+                name=dataset.name,
+                kind="dumper-parquet",
+                path=dataset.path,
+                schema_version=dataset.schema_version,
+                row_count=dataset.row_count,
+                materialize_on_load=False,
+            )
         datasets.append(dataset)
         existing_names.add(dataset.name)
+
+    # The sidecar may not emit every dumper stem (e.g. an empty UDP recv
+    # parquet is skipped). trace_mgmt needs every stem present for the
+    # ``_required_dumper_stems_for_mode("native")`` check to pass, so
+    # synthesise zero-row parquets for the missing ones.
+    for stem in dumper_stems:
+        if stem in existing_names:
+            continue
+        parquet = staging_dir / f"{stem}.parquet"
+        if not parquet.exists():
+            try:
+                pd.DataFrame().to_parquet(parquet, index=False)
+            except Exception:
+                continue
+        datasets.append(native_cache.CacheDataset(
+            name=stem,
+            kind="dumper-parquet",
+            path=f"{stem}.parquet",
+            schema_version=native_cache.DATASET_SCHEMA_VERSION,
+            row_count=0,
+            materialize_on_load=False,
+        ))
+        existing_names.add(stem)
 
     for stem in aggregator_stems:
         if stem in existing_names:

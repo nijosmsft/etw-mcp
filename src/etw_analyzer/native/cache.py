@@ -74,6 +74,26 @@ class EtlIdentity:
             and self.mtime_ns == current.mtime_ns
         )
 
+    def matches_loose(self, etl_path: Path) -> bool:
+        """Identity match ignoring ``mtime_ns``.
+
+        The C# sidecar currently encodes ``mtime_ns`` as .NET ``Ticks * 100``
+        (nanoseconds since year 0001) rather than Python's ``st_mtime_ns``
+        (nanoseconds since Unix epoch 1970). The two will never line up.
+
+        Until the C# emitter is fixed, csharp-producer manifests use the
+        loose check — same filename + same size — which is enough to catch
+        the "ETL was replaced by a different file" case without breaking
+        on the cross-runtime epoch mismatch. Same-size in-place edits will
+        return a stale cache; this is an accepted POC trade-off.
+        """
+
+        try:
+            current = EtlIdentity.from_path(etl_path)
+        except OSError:
+            return False
+        return self.name == current.name and self.size == current.size
+
 
 @dataclass(frozen=True)
 class NativeStoreGeneration:
@@ -366,7 +386,15 @@ def validate_manifest(
         )
     if manifest.complete is not True:
         raise NativeCacheError("native cache manifest is incomplete")
-    if not manifest.etl.matches(etl_path):
+    # csharp-produced manifests carry an mtime_ns encoded in .NET ticks
+    # rather than Python's st_mtime_ns. Fall back to size + name matching
+    # for those until the C# sidecar emitter is harmonised. Native- and
+    # xperf-written manifests still get the strict three-field check.
+    if manifest.producer == "csharp":
+        identity_ok = manifest.etl.matches_loose(etl_path)
+    else:
+        identity_ok = manifest.etl.matches(etl_path)
+    if not identity_ok:
         raise NativeCacheError("native cache manifest ETL identity is stale")
 
 
