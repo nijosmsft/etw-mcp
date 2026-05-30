@@ -42,9 +42,9 @@ Every analysis tool's signature starts with `trace_id: str` and calls `require_t
 
 ## Trace lifecycle
 
-Phase N5 flipped the default extraction mode from `"xperf"` to `"auto"`. `resolve_mode()` in `src/etw_analyzer/native/config.py` collapses `"auto"` to `"native"` whenever the native bindings load and to `"xperf"` otherwise. Resolution precedence: explicit `mode=` arg > `WPR_MCP_MODE` env var > the `"auto"` default. Explicit `mode="native"` raises if the consumer is unavailable; explicit `mode="xperf"` always works as the opt-out.
+Phase N5 flipped the default extraction mode from `"xperf"` to `"auto"`. `resolve_mode()` in `src/etw_analyzer/native/config.py` now walks a three-step fallback chain: `csharp → native → xperf`. `"csharp"` wins when the C# sidecar binary is locatable via the `WPR_MCP_CSHARP_SIDECAR` env var or `wpr-mcp-extract.exe` on PATH (the in-tree `csharp/publish/win-x64/` path is intentionally skipped during auto-detect so a stray dev build does not silently change the default pipeline — explicit `mode="csharp"` does use it). `"native"` wins next when the in-process bindings load. `"xperf"` is the universal last resort. Resolution precedence: explicit `mode=` arg > `WPR_MCP_MODE` env var > the `"auto"` default. Explicit `mode="native"` raises `RuntimeError` if the consumer is unavailable; explicit `mode="csharp"` raises `ValueError` (naming the env var override) if the binary is unfindable; explicit `mode="xperf"` always works as the opt-out.
 
-### Native path (default)
+### Native path (default when no sidecar is configured)
 ```
 load_trace(etl_path)               # mode defaults to "auto"
   → resolve_mode() → "native" when advapi32/tdh load (Windows Server / recent client)
@@ -63,6 +63,25 @@ load_trace(etl_path)               # mode defaults to "auto"
   → returns markdown summary including the trace_id
 ```
 
+### C# sidecar path (`mode="csharp"` or auto with sidecar configured)
+```
+load_trace(etl_path)               # mode defaults to "auto"
+  → resolve_mode() → "csharp" when WPR_MCP_CSHARP_SIDECAR is set
+  → worker_supervisor.run_csharp_worker_extraction:
+       1. build request.json (spike-contract.md §3 schema)
+       2. spawn wpr-mcp-extract.exe --request <path>
+       3. stream stdout JSONL: heartbeat / progress / result
+       4. validate sidecar's v3 manifest (producer="csharp")
+       5. aggregation_worker.run_aggregation_worker(staging_dir, …):
+            hydrate TraceData from sidecar parquets
+            _run_native_aggregators(trace) ← Layer-3 outputs
+            rewrite manifest in place with aggregator parquets added
+       6. atomic promote staging_dir → final cache dir
+  → cache hydrates the same way as the native path on next load
+```
+
+Full developer docs: `src/etw_analyzer/native/SIDECAR.md`.
+
 ### xperf fallback (`mode="xperf"` or `WPR_MCP_MODE=xperf`)
 ```
 load_trace(etl_path, mode="xperf")
@@ -79,7 +98,7 @@ load_trace(etl_path, mode="xperf")
   → _start_background_dumper() kicks off xperf -a dumper in a thread for per-CPU events
 ```
 
-trace_id format: `"trace_<sha256[:12]>"` of (lowercase path | size | mtime_ns) — stable per ETL version. Both pipelines produce the same trace_id and parquet schema, so a trace loaded in one mode can rehydrate from cache in the other.
+trace_id format: `"trace_<sha256[:12]>"` of (lowercase path | size | mtime_ns) — stable per ETL version. All three pipelines produce the same trace_id and parquet schema, so a trace loaded in one mode can rehydrate from cache in any other (subject to the schema-v3 manifest's `producer` field being preserved across reloads). The cache manifest is schema v3 with a `producer ∈ {csharp, native, xperf}` field; v2 manifests still load and are back-filled to `producer="native"`.
 
 require_trace(trace_id) raises ValueError listing loaded IDs when the ID is unknown — propagate that message, don't swallow it.
 
