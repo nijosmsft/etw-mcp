@@ -398,6 +398,35 @@ def _load_phase_b_process(
             trace.raw_csv[canonical] = df
 
 
+def _load_phase_b_diskio(
+    staging_dir: Path,
+    trace: TraceData,
+    warnings: list[str],
+) -> None:
+    """Promote Phase B diskio_* parquets into raw_csv[<canonical>].
+
+    The Phase B sidecar gates DiskIo emission on the combined buffer
+    being non-empty — traces with zero disk events (e.g. the real
+    spike-fixture lab ETL) have NO diskio_*.parquet files at all.
+    ``_read_phase_b_parquet`` returns None for absent files and this
+    loop simply does nothing in that case. The downstream
+    ``build_diskio_text`` aggregator returns None when no DiskIo
+    canonical keys are populated, and the persist hook skips None
+    silently — no diskio.txt is written, which is the documented
+    "zero events" behaviour.
+    """
+
+    from etw_analyzer.native import aggregation_worker_adapters as adapters
+
+    for stem, canonical in adapters.PHASE_B_DISKIO_STEMS.items():
+        df = _read_phase_b_parquet(staging_dir, stem, warnings)
+        if df is None or df.empty:
+            continue
+        df = adapters.adapt_csharp_diskio_dataframe(df)
+        if df is not None and not df.empty:
+            trace.raw_csv[canonical] = df
+
+
 def _build_trace_from_staging(
     *,
     staging_dir: Path,
@@ -458,6 +487,7 @@ def _build_trace_from_staging(
     # column-synthesis work first.
     _load_phase_b_dpc_isr(staging_dir, trace, warnings)
     _load_phase_b_process(staging_dir, trace, warnings)
+    _load_phase_b_diskio(staging_dir, trace, warnings)
 
     # sysconfig.txt — preserve as raw text so the text aggregator finds it.
     sysconfig_path = staging_dir / "sysconfig.txt"

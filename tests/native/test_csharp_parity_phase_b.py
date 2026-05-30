@@ -614,3 +614,97 @@ class TestPhaseBProcessInfo:
         ptable = captured["ptable"]
         assert "ProcessId" in ptable.columns
         assert len(ptable) > 0
+
+
+# ---- Adapter unit tests: diskio ----------------------------------------
+
+
+class TestAdaptCsharpDiskioDataframe:
+    def test_renames_timestampqpc_to_timestamp(self):
+        df = pd.DataFrame({
+            "TimeStampQpc": [1, 2],
+            "CPU": [0, 0],
+            "DiskNumber": [0, 0],
+            "TransferSize": [4096, 8192],
+        })
+        out = adapters.adapt_csharp_diskio_dataframe(df)
+        assert "TimeStamp" in out.columns
+        assert "TimeStampQpc" not in out.columns
+
+    def test_handles_none(self):
+        assert adapters.adapt_csharp_diskio_dataframe(None) is None
+
+    def test_handles_empty(self):
+        empty = pd.DataFrame()
+        assert adapters.adapt_csharp_diskio_dataframe(empty) is empty
+
+    def test_preserves_disknumber_and_transfersize(self):
+        df = pd.DataFrame({
+            "TimeStampQpc": [1, 2, 3],
+            "DiskNumber": [0, 1, 0],
+            "TransferSize": [4096, 8192, 0],
+        })
+        out = adapters.adapt_csharp_diskio_dataframe(df)
+        assert list(out["DiskNumber"]) == [0, 1, 0]
+        assert list(out["TransferSize"]) == [4096, 8192, 0]
+
+
+# ---- Integration: diskio -----------------------------------------------
+
+
+class TestPhaseBDiskio:
+    def test_missing_diskio_parquets_does_not_fail(self, tmp_path: Path):
+        """Real fixture has zero disk events; the loader must no-op."""
+        etl = _make_etl(tmp_path)
+        staging = tmp_path / "staging"
+        _seed_phase_b_staging(staging, etl, include_diskio=False)
+        result = aggregation_worker.run_aggregation_worker(
+            staging, etl, trace_id="trace_diskio_missing",
+        )
+        assert result.ok is True, f"{result.message} / {result.warnings}"
+        # No diskio.txt is the documented "zero events" outcome.
+        assert not (staging / "diskio.txt").exists()
+        # Aggregator warnings list must not contain a diskio failure —
+        # the loader stayed quiet.
+        assert not any("diskio" in w.lower() for w in result.warnings), (
+            f"warnings mention diskio: {result.warnings}"
+        )
+
+    def test_diskio_read_only_produces_text(self, tmp_path: Path):
+        """When only diskio_read.parquet exists, the aggregator still runs.
+
+        (The integration test fixture in this file omits write/flushbuffers
+        — the adapter must cope.)
+        """
+        etl = _make_etl(tmp_path)
+        staging = tmp_path / "staging"
+        _seed_phase_b_staging(staging, etl, include_diskio=True)
+        result = aggregation_worker.run_aggregation_worker(
+            staging, etl, trace_id="trace_diskio_read_only",
+        )
+        assert result.ok is True
+        # build_diskio_text needs DiskNumber and renders one line per disk.
+        text_path = staging / "diskio.txt"
+        assert text_path.exists()
+        text = text_path.read_text(encoding="utf-8")
+        assert "Disk 0" in text
+        assert "reads=" in text
+
+    def test_diskio_canonical_key_populated_when_present(self, tmp_path: Path):
+        etl = _make_etl(tmp_path)
+        staging = tmp_path / "staging"
+        _seed_phase_b_staging(staging, etl, include_diskio=True)
+        from etw_analyzer.native import aggregation_worker as aw
+        captured: dict[str, set[str]] = {}
+        real_persist = aw._persist_aggregator_outputs
+
+        def cap(staging_dir, trace, warnings):
+            captured["keys"] = set(trace.raw_csv.keys())
+            return real_persist(staging_dir, trace, warnings)
+
+        aw._persist_aggregator_outputs = cap
+        try:
+            aw.run_aggregation_worker(staging, etl, trace_id="trace_diskio_keys")
+        finally:
+            aw._persist_aggregator_outputs = real_persist
+        assert "DiskIo/Read" in captured["keys"]

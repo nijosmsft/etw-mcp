@@ -292,6 +292,8 @@ __all__ = [
     "PHASE_B_DPC_STEMS",
     "adapt_csharp_process_dataframe",
     "PHASE_B_PROCESS_STEMS",
+    "adapt_csharp_diskio_dataframe",
+    "PHASE_B_DISKIO_STEMS",
 ]
 
 
@@ -414,4 +416,35 @@ def adapt_csharp_process_dataframe(df: pd.DataFrame | None) -> pd.DataFrame | No
         df = df.rename(columns=rename_map)
     if "SessionId" not in df.columns:
         df["SessionId"] = 0
+    return df
+
+
+# Phase B per-opcode stems that feed the diskio aggregator.
+PHASE_B_DISKIO_STEMS: dict[str, str] = {
+    "diskio_read":         "DiskIo/Read",
+    "diskio_write":        "DiskIo/Write",
+    "diskio_flushbuffers": "DiskIo/FlushBuffers",
+}
+
+
+def adapt_csharp_diskio_dataframe(df: pd.DataFrame | None) -> pd.DataFrame | None:
+    """Adapt a Phase B diskio_* parquet to the diskio aggregator schema.
+
+    Phase B columns vary by opcode but generally include ``DiskNumber``
+    and ``TransferSize`` already in the schema the in-tree aggregator
+    expects. Only the ``TimeStampQpc -> TimeStamp`` rename is needed
+    today; documented as its own adapter so the field stems still match
+    the other adapters' surface, and so future schema drift has a
+    single place to land.
+
+    Important: the test fixture used by the Phase B smoke run has
+    **zero disk events**, so the corresponding parquets are absent
+    rather than empty (per the sidecar's gating policy). Callers must
+    treat absence as a no-op, not an error.
+    """
+
+    if df is None or df.empty:
+        return df
+    if "TimeStampQpc" in df.columns and "TimeStamp" not in df.columns:
+        df = df.rename(columns={"TimeStampQpc": "TimeStamp"})
     return df
