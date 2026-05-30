@@ -310,6 +310,66 @@ def run_aggregation_worker(
     return result
 
 
+def _read_phase_b_parquet(
+    staging_dir: Path, stem: str, warnings: list[str]
+) -> pd.DataFrame | None:
+    """Load a Phase B per-opcode parquet, or return None if absent.
+
+    Missing files are not warnings — the sidecar legitimately skips
+    classes with zero events (matches the documented Phase B behaviour).
+    Read errors ARE recorded so we can debug schema drift.
+    """
+    parquet = staging_dir / f"{stem}.parquet"
+    if not parquet.exists():
+        return None
+    try:
+        return pd.read_parquet(parquet)
+    except Exception as exc:
+        warnings.append(f"failed to read {stem}.parquet: {exc}")
+        return None
+
+
+def _load_phase_b_dpc_isr(
+    staging_dir: Path,
+    trace: TraceData,
+    warnings: list[str],
+) -> None:
+    """Promote Phase B perfinfo_* parquets into raw_csv[<canonical>].
+
+    The sidecar emits one parquet per (PerfInfo, opcode) pair. The
+    in-tree DPC aggregator iterates the canonical class names
+    ``PerfInfo/DPC``, ``PerfInfo/ThreadedDPC``, ``PerfInfo/TimerDPC``,
+    ``PerfInfo/ISR`` looking for matching DataFrames in ``raw_csv``
+    (``_gather_dpc_events`` fallback). We adapt each parquet and write
+    it to the matching canonical key, replacing any combined-buffer
+    DataFrame the auxiliary loader may have placed there earlier.
+
+    Adapter synthesises an ``InitialTime`` column from
+    ``ElapsedMicros`` so the aggregator's standard duration-from-QPC
+    code path works unchanged.
+    """
+    # Use perf_freq from trace_metadata when available so the
+    # InitialTime synthesis aligns with the aggregator's perf_freq
+    # lookup. Falls back to 10 MHz (the QPC default) when missing.
+    perf_freq = 10_000_000.0
+    metadata_df = trace.raw_csv.get("trace_metadata")
+    if metadata_df is not None and not metadata_df.empty and "PerfFreq" in metadata_df.columns:
+        try:
+            freq = float(metadata_df["PerfFreq"].iloc[0])
+            if freq > 0:
+                perf_freq = freq
+        except (TypeError, ValueError):
+            pass
+
+    for stem, canonical in csharp_adapters.PHASE_B_DPC_STEMS.items():
+        df = _read_phase_b_parquet(staging_dir, stem, warnings)
+        if df is None or df.empty:
+            continue
+        df = csharp_adapters.adapt_csharp_dpc_dataframe(df, perf_freq_hz=perf_freq)
+        if df is not None and not df.empty:
+            trace.raw_csv[canonical] = df
+
+
 def _build_trace_from_staging(
     *,
     staging_dir: Path,
@@ -360,6 +420,15 @@ def _build_trace_from_staging(
             warnings.append(f"failed to read {stem}.parquet: {exc}")
             continue
         trace.raw_csv[canonical] = df
+
+    # Phase B per-opcode parquets. These take precedence over the
+    # combined-buffer parquets above: when present they carry the same
+    # rows with cleaner per-class boundaries, and the existing
+    # aggregator fallback path iterates _DPC_CLASSES /
+    # _PROCESS_CLASSES / _DISKIO_CLASSES looking for canonical keys, so
+    # we just need to land them there. Adapters do the column-rename /
+    # column-synthesis work first.
+    _load_phase_b_dpc_isr(staging_dir, trace, warnings)
 
     # sysconfig.txt — preserve as raw text so the text aggregator finds it.
     sysconfig_path = staging_dir / "sysconfig.txt"

@@ -287,4 +287,86 @@ __all__ = [
     "apply_metadata_to_trace",
     "build_trace_metadata_dataframe",
     "populate_event_counts_from_manifest",
+    # Phase B per-opcode adapters.
+    "adapt_csharp_dpc_dataframe",
+    "PHASE_B_DPC_STEMS",
 ]
+
+
+# ----- Phase B: per-opcode kernel-meta adapters --------------------------
+#
+# The sidecar (Phase B build, 39.9 MB) writes per-opcode parquets for
+# kernel-meta event classes. Column names follow the layer-2 schema
+# documented in csharp/docs/event-class-mapping.md, which intentionally
+# differs from the native MOF-handler shape the in-tree aggregators were
+# written against. These adapters do the column-rename / column-synthesis
+# work so the same aggregator code can consume both producers.
+#
+# Track P1 chose:
+#   * sidecar process/thread rows use PID / ParentPID / TID,
+#     not ProcessId / ParentId / ThreadId;
+#   * sidecar DPC/ISR rows carry ElapsedMicros (the already-computed
+#     duration in microseconds), not a separate InitialTime column;
+#   * sidecar process rows do NOT carry SessionId at all
+#     (a documented Phase B limitation; the native worker derives
+#     SessionId from a separate manifest event we have no plans to add).
+#
+# We DO NOT modify the aggregators themselves — these adapters keep the
+# Phase A "thin in-place rename" contract intact.
+
+
+# Phase B per-opcode stems that feed the DPC/ISR aggregator. Track P2
+# concatenates these into raw_csv[<canonical event class>] before the
+# aggregator runs, so the existing _gather_dpc_events fallback path
+# (which iterates _DPC_CLASSES) finds rows.
+PHASE_B_DPC_STEMS: dict[str, str] = {
+    "perfinfo_dpc":          "PerfInfo/DPC",
+    "perfinfo_threaded_dpc": "PerfInfo/ThreadedDPC",
+    "perfinfo_timer_dpc":    "PerfInfo/TimerDPC",
+    "perfinfo_isr":          "PerfInfo/ISR",
+}
+
+
+def adapt_csharp_dpc_dataframe(
+    df: pd.DataFrame | None,
+    *,
+    perf_freq_hz: float = 10_000_000.0,
+) -> pd.DataFrame | None:
+    """Adapt a Phase B perfinfo_* parquet to the dpc_isr aggregator schema.
+
+    Phase B columns: ``EventSequence, TimeStampQpc, CPU, Routine,
+    ElapsedMicros``.
+
+    The native aggregator (``aggregators/dpcisr.py``) requires
+    ``{"TimeStamp", "CPU", "Routine", "InitialTime"}`` and computes the
+    per-event duration as ``(TimeStamp - InitialTime) * 1e6 / perf_freq``.
+    To re-use that code path unchanged, we synthesise ``InitialTime`` as
+    ``TimeStamp - ElapsedMicros * perf_freq / 1e6`` — i.e. we project the
+    already-computed duration back onto the QPC timeline. The aggregator
+    then recomputes the same number and gets ElapsedMicros back. This
+    keeps the duration math in one place (the aggregator) and avoids a
+    parallel division-by-QPC code path in the adapter.
+
+    Returns the same DataFrame (mutated) for chaining. ``None`` and empty
+    DataFrames pass through unchanged.
+    """
+
+    if df is None or df.empty:
+        return df
+    if "TimeStamp" not in df.columns and "TimeStampQpc" in df.columns:
+        df = df.rename(columns={"TimeStampQpc": "TimeStamp"})
+    # ElapsedMicros → InitialTime synth. If ElapsedMicros is absent the
+    # sidecar didn't emit it (older builds), and InitialTime is left
+    # missing — the aggregator silently drops rows that don't satisfy
+    # the column-set check.
+    if (
+        "InitialTime" not in df.columns
+        and "ElapsedMicros" in df.columns
+        and "TimeStamp" in df.columns
+    ):
+        ticks_per_us = max(1.0, float(perf_freq_hz) / 1_000_000.0)
+        elapsed_ticks = pd.to_numeric(df["ElapsedMicros"], errors="coerce") * ticks_per_us
+        df["InitialTime"] = (
+            pd.to_numeric(df["TimeStamp"], errors="coerce") - elapsed_ticks
+        )
+    return df
