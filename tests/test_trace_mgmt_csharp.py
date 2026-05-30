@@ -295,7 +295,11 @@ def test_explicit_csharp_failure_does_not_fallback_or_register(
 
     result = trace_mgmt.load_trace(str(etl), mode="csharp")
 
-    assert "Native ETW worker extraction failed" in result
+    assert "C# sidecar ETW worker extraction failed" in result
     assert "timeout: synthetic csharp sidecar failure" in result
     assert "bounded stderr" in result
+    # Producer-aware fallback hints must name both alternative pipelines so
+    # the caller can recover without guessing.
+    assert "mode='native'" in result
+    assert "mode='xperf'" in result
     assert list_loaded_trace_ids() == []

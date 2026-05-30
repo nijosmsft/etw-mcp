@@ -106,9 +106,21 @@ def load_trace(
     """
     path = Path(etl_path)
     if not path.exists():
-        return f"File not found: {etl_path}"
+        return (
+            f"File not found: {etl_path}\n\n"
+            "Use list_traces(directory=...) to enumerate .etl files in a "
+            "directory, or check the path for typos / drive-letter case. "
+            "load_trace needs an absolute path to an existing .etl file."
+        )
     if not path.suffix.lower() == ".etl":
-        return f"Expected .etl file, got: {path.suffix}"
+        return (
+            f"Expected .etl file, got: {path.suffix or '(no suffix)'}\n\n"
+            f"Path: {etl_path}\n\n"
+            "load_trace only accepts ETW trace files with a .etl extension. "
+            "Use list_traces(directory=...) to find .etl files in a "
+            "directory, or rename the file if you know it is a valid ETW "
+            "trace under a different extension."
+        )
 
     _load_start_monotonic = time.monotonic()
     try:
@@ -180,7 +192,14 @@ def load_trace(
         return prefix + (
             "xperf.exe not found. Install Windows Performance Toolkit "
             "(part of Windows SDK/ADK) or add it to PATH.\n\n"
-            "Expected at: C:\\Program Files (x86)\\Windows Kits\\10\\Windows Performance Toolkit\\xperf.exe"
+            "Expected at: C:\\Program Files (x86)\\Windows Kits\\10\\Windows Performance Toolkit\\xperf.exe\n\n"
+            "Alternatives that do not need xperf:\n"
+            "  - Pass mode='native' (or set WPR_MCP_MODE=native) to use the "
+            "in-process ETW consumer when its bindings load on this host.\n"
+            "  - Build the C# sidecar (cd csharp && dotnet publish -c Release "
+            "-r win-x64 --self-contained), set WPR_MCP_CSHARP_SIDECAR to the "
+            "published wpr-mcp-extract.exe path, and pass mode='csharp' (or "
+            "set WPR_MCP_MODE=csharp)."
         )
 
     # Check if we can skip re-export (cached parquet/csv files exist and are newer than ETL)
@@ -263,7 +282,7 @@ def load_trace(
                 pass
 
         if csharp_was_forced:
-            return _native_worker_load_failed(worker_result)
+            return _native_worker_load_failed(worker_result, producer="csharp")
 
         # Auto-resolved csharp failed; fall back along the documented
         # chain csharp → native → xperf. Drop to native first when its
@@ -303,7 +322,7 @@ def load_trace(
                     from_cache=True,
                 )
         else:
-            return _native_worker_load_failed(worker_result)
+            return _native_worker_load_failed(worker_result, producer="csharp")
 
     if resolved_mode == "native" and _native_worker_enabled():
         _telemetry.emit_with(
@@ -654,18 +673,46 @@ def _load_csharp_with_worker(
     )
 
 
-def _native_worker_load_failed(worker_result) -> str:
-    """Return an actionable message for a failed native worker load."""
+def _native_worker_load_failed(worker_result, *, producer: str = "native") -> str:
+    """Return an actionable message for a failed worker load.
+
+    ``producer`` names which extraction backend produced ``worker_result``
+    so the suggested next steps point at the right alternative(s).
+    """
 
     detail = worker_result.message
-    if getattr(worker_result, "failure_kind", None):
-        detail = f"{worker_result.failure_kind}: {detail}"
+    failure_kind = getattr(worker_result, "failure_kind", None)
+    if failure_kind:
+        detail = f"{failure_kind}: {detail}"
     stderr_tail = getattr(worker_result, "stderr_tail", "")
     if stderr_tail:
         detail = f"{detail}\n\nWorker stderr tail:\n{stderr_tail[-2000:]}"
     invalid_tail = getattr(worker_result, "invalid_stdout_tail", "")
     if invalid_tail:
         detail = f"{detail}\n\nInvalid worker stdout tail:\n{invalid_tail[-2000:]}"
+
+    if producer == "csharp":
+        # The csharp sidecar can fail for build-incompatibility reasons that
+        # mode='native' / mode='xperf' will not hit. Surface the rebuild hint
+        # alongside the standard fallback suggestion so callers do not stay
+        # stuck on a stale binary.
+        rebuild_hint = ""
+        if failure_kind in {"invalid-stdout", "invalid-jsonl", "exit-code"}:
+            rebuild_hint = (
+                "\n\nThe sidecar binary may be a stale build. Rebuild with "
+                "`cd csharp && dotnet publish -c Release -r win-x64 "
+                "--self-contained` and retry. If WPR_MCP_CSHARP_SIDECAR "
+                "points at an old install, update it to the newly-published "
+                "wpr-mcp-extract.exe."
+            )
+        return (
+            "C# sidecar ETW worker extraction failed: "
+            f"{detail}{rebuild_hint}\n\n"
+            "No trace was loaded. Use mode='native' or mode='xperf' to "
+            "bypass the sidecar (the cache is shared, so a successful run "
+            "under either mode satisfies subsequent loads)."
+        )
+
     return (
         "Native ETW worker extraction failed: "
         f"{detail}\n\n"
@@ -2462,7 +2509,16 @@ def _resolve_symbols_impl(trace_id: str, modules: str | None) -> str:
 
     xperf = find_xperf()
     if xperf is None:
-        return "xperf.exe not found."
+        return (
+            "xperf.exe not found.\n\n"
+            "resolve_symbols uses xperf to build the symcache and download "
+            "PDBs. Install Windows Performance Toolkit (part of Windows "
+            "SDK/ADK) or add it to PATH.\n\n"
+            "Expected at: C:\\Program Files (x86)\\Windows Kits\\10\\Windows Performance Toolkit\\xperf.exe\n\n"
+            "Note: load_trace itself can run under mode='native' or "
+            "mode='csharp' without xperf, but symbol resolution still "
+            "requires xperf today."
+        )
 
     if not sym_path:
         lines.append("**WARNING:** `_NT_SYMBOL_PATH` is not set. Configure it in `.mcp.json` env.")
