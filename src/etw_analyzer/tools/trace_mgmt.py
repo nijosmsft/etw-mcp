@@ -683,6 +683,34 @@ _DUMPER_EVENT_CLASSES: dict[str, tuple[str, str]] = {
     "Quic/PacketRecv":        ("quic_packet_recv_df",  "quic_packet_recv"),
     "Quic/PacketSend":        ("quic_packet_send_df",  "quic_packet_send"),
     "Quic/AckReceived":       ("quic_ack_recv_df",     "quic_ack_recv"),
+    # Phase B (csharp sidecar): per-opcode kernel-meta event classes.
+    # Names and stem mappings come verbatim from Track P1's handoff in
+    # ``manager-log/phase-b-sidecar-status.md`` ("Stem-name additions to
+    # _DUMPER_EVENT_CLASSES"). The sidecar consumes this dict via
+    # ``requested_event_classes`` to know which event classes to emit
+    # per-opcode parquets for. The native worker has no handlers for
+    # these so the attr fields stay None under mode="native" (the
+    # in-process consumer continues to use the combined parquets from
+    # _SIDECAR_AUX_STEMS instead).
+    "PerfInfo/DPC":          ("perfinfo_dpc_df",          "perfinfo_dpc"),
+    "PerfInfo/ThreadedDPC":  ("perfinfo_threaded_dpc_df", "perfinfo_threaded_dpc"),
+    "PerfInfo/TimerDPC":     ("perfinfo_timer_dpc_df",    "perfinfo_timer_dpc"),
+    "PerfInfo/ISR":          ("perfinfo_isr_df",          "perfinfo_isr"),
+    "Process/Start":         ("process_start_df",         "process_start"),
+    "Process/End":           ("process_end_df",           "process_end"),
+    "Process/DCStart":       ("process_dcstart_df",       "process_dcstart"),
+    "Process/DCEnd":         ("process_dcend_df",         "process_dcend"),
+    "Process/Defunct":       ("process_defunct_df",       "process_defunct"),
+    "Thread/Start":          ("thread_start_df",          "thread_start"),
+    "Thread/End":            ("thread_end_df",            "thread_end"),
+    "Thread/DCStart":        ("thread_dcstart_df",        "thread_dcstart"),
+    "Thread/DCEnd":          ("thread_dcend_df",          "thread_dcend"),
+    "DiskIo/Read":           ("diskio_read_df",           "diskio_read"),
+    "DiskIo/Write":          ("diskio_write_df",          "diskio_write"),
+    "DiskIo/FlushBuffers":   ("diskio_flushbuffers_df",   "diskio_flushbuffers"),
+    "Image/Load":            ("image_load_df",            "image_load"),
+    "Image/DCStart":         ("image_dcstart_df",         "image_dcstart"),
+    "EventTrace/Header":     ("eventtrace_header_df",     "eventtrace_header"),
 }
 
 
@@ -761,7 +789,7 @@ def _start_background_dumper(trace: TraceData) -> None:
     with trace.lock:
         # Already fully populated, or a background thread is already running.
         all_loaded = all(
-            getattr(trace, attr) is not None
+            getattr(trace, attr, None) is not None
             for attr, _ in _DUMPER_EVENT_CLASSES.values()
         )
         if all_loaded or trace._dumper_future is not None:
@@ -774,7 +802,7 @@ def _start_background_dumper(trace: TraceData) -> None:
             if cached_dumper_paths is not None and stem not in cached_dumper_paths:
                 continue
             parquet = _parquet_for(stem)
-            if getattr(trace, attr) is None and parquet.exists():
+            if getattr(trace, attr, None) is None and parquet.exists():
                 try:
                     setattr(trace, attr, pd.read_parquet(parquet))
                 except Exception:
@@ -782,7 +810,7 @@ def _start_background_dumper(trace: TraceData) -> None:
 
         # If everything is cached now, signal ready and return.
         if all(
-            getattr(trace, attr) is not None
+            getattr(trace, attr, None) is not None
             for attr, _ in _DUMPER_EVENT_CLASSES.values()
         ):
             trace._dumper_ready.set()
@@ -797,7 +825,7 @@ def _start_background_dumper(trace: TraceData) -> None:
             wanted: set[str] = {
                 canonical
                 for canonical, (attr, _) in _DUMPER_EVENT_CLASSES.items()
-                if getattr(trace, attr) is None
+                if getattr(trace, attr, None) is None
             }
 
             if not wanted:
@@ -927,7 +955,7 @@ def _start_background_dumper(trace: TraceData) -> None:
         # Re-check after thread construction — another caller may have
         # raced us in.
         if all(
-            getattr(trace, attr) is not None
+            getattr(trace, attr, None) is not None
             for attr, _ in _DUMPER_EVENT_CLASSES.values()
         ) or trace._dumper_future is not None:
             return
@@ -1356,6 +1384,30 @@ _PARQUET_EXCLUDED = frozenset({
     "quic_packet_recv",
     "quic_packet_send",
     "quic_ack_recv",
+    # Phase B csharp-sidecar per-opcode kernel-meta parquets. Loaded into
+    # dedicated trace.<class>_df attributes via _DUMPER_EVENT_CLASSES, then
+    # adapted into raw_csv under canonical event-class names by the csharp
+    # aggregation worker. The glob skip avoids a duplicate stem entry in
+    # raw_csv that would shadow the adapter-normalized canonical keys.
+    "perfinfo_dpc",
+    "perfinfo_threaded_dpc",
+    "perfinfo_timer_dpc",
+    "perfinfo_isr",
+    "process_start",
+    "process_end",
+    "process_dcstart",
+    "process_dcend",
+    "process_defunct",
+    "thread_start",
+    "thread_end",
+    "thread_dcstart",
+    "thread_dcend",
+    "diskio_read",
+    "diskio_write",
+    "diskio_flushbuffers",
+    "image_load",
+    "image_dcstart",
+    "eventtrace_header",
 })
 
 # Cache manifest written after successful exports. Xperf continues to use the

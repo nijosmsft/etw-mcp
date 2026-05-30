@@ -77,6 +77,30 @@ _SIDECAR_STEM_TO_ATTR: dict[str, tuple[str, str]] = {
     "quic_packet_recv":  ("quic_packet_recv_df",  "Quic/PacketRecv"),
     "quic_packet_send":  ("quic_packet_send_df",  "Quic/PacketSend"),
     "quic_ack_recv":     ("quic_ack_recv_df",     "Quic/AckReceived"),
+    # Phase B (csharp sidecar): per-opcode kernel-meta parquets. Stems
+    # mirror trace_mgmt._DUMPER_EVENT_CLASSES so _rewrite_manifest
+    # creates dumper-parquet placeholders for classes the sidecar
+    # skipped (zero-event classes). Adapters in this module promote the
+    # rows into raw_csv[<canonical>] for the native aggregators.
+    "perfinfo_dpc":          ("perfinfo_dpc_df",          "PerfInfo/DPC"),
+    "perfinfo_threaded_dpc": ("perfinfo_threaded_dpc_df", "PerfInfo/ThreadedDPC"),
+    "perfinfo_timer_dpc":    ("perfinfo_timer_dpc_df",    "PerfInfo/TimerDPC"),
+    "perfinfo_isr":          ("perfinfo_isr_df",          "PerfInfo/ISR"),
+    "process_start":         ("process_start_df",         "Process/Start"),
+    "process_end":           ("process_end_df",           "Process/End"),
+    "process_dcstart":       ("process_dcstart_df",       "Process/DCStart"),
+    "process_dcend":         ("process_dcend_df",         "Process/DCEnd"),
+    "process_defunct":       ("process_defunct_df",       "Process/Defunct"),
+    "thread_start":          ("thread_start_df",          "Thread/Start"),
+    "thread_end":            ("thread_end_df",            "Thread/End"),
+    "thread_dcstart":        ("thread_dcstart_df",        "Thread/DCStart"),
+    "thread_dcend":          ("thread_dcend_df",          "Thread/DCEnd"),
+    "diskio_read":           ("diskio_read_df",           "DiskIo/Read"),
+    "diskio_write":          ("diskio_write_df",          "DiskIo/Write"),
+    "diskio_flushbuffers":   ("diskio_flushbuffers_df",   "DiskIo/FlushBuffers"),
+    "image_load":            ("image_load_df",            "Image/Load"),
+    "image_dcstart":         ("image_dcstart_df",         "Image/DCStart"),
+    "eventtrace_header":     ("eventtrace_header_df",     "EventTrace/Header"),
 }
 
 
