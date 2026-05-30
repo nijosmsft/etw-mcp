@@ -307,41 +307,115 @@ For full WPA/butterfly stack parity, load with `mode="xperf"` or set `WPR_MCP_MO
 
 ### Trace Loading Modes
 
-`load_trace` accepts a `mode` argument that selects the extraction pipeline:
+`load_trace` accepts a `mode` argument that selects the extraction pipeline. Three modern pipelines coexist, each with the same trace_id and parquet cache layout so a trace extracted in one mode can be reloaded in another. The default `mode="auto"` walks the fallback chain **`.NET sidecar → native → xperf`** and picks the first one available.
 
-| Mode | Behavior |
-|------|----------|
-| `"auto"` (default) | Walks the fallback chain `csharp → native → xperf`. Uses the C# sidecar when `WPR_MCP_CSHARP_SIDECAR` is set (or `wpr-mcp-extract.exe` is on PATH), otherwise the in-process native consumer, otherwise xperf. The in-tree `csharp/publish/win-x64/` path is intentionally skipped during auto-detect so a stray dev build does not silently flip the default pipeline. |
-| `"csharp"` | Forces the C# sidecar (`wpr-mcp-extract.exe`). Resolves the binary via `WPR_MCP_CSHARP_SIDECAR` first, then PATH, then the in-tree publish dir. Raises a `ValueError` naming the env var if the binary is unfindable — does not fall back. Cache manifest records `producer="csharp"`. |
-| `"native"` | Forces the in-process `OpenTraceW`/`tdh.dll` consumer. Decodes manifest providers (TCPIP, AFD, MsQuic, HTTP.sys) that xperf cannot enumerate. Raises an error if the native bindings aren't available — does not fall back. |
-| `"xperf"` | Forces the legacy Windows Performance Toolkit path. It runs WPA-style xperf actions (`profile`, `dpcisr`, `stack -butterfly`, `cswitch`, `sysconfig`, `process`, `diskio`, `tracestats`) plus `xperf -a dumper` for raw events. Requires the Windows Performance Toolkit in a standard install location or on PATH. Use this if you hit a native-mode bug or need full WPA-style stack coverage. |
+The `WPR_MCP_MODE` environment variable overrides the default when `mode=` is left unspecified. The explicit `mode=` arg always wins over the env var.
 
-The `WPR_MCP_MODE` environment variable overrides the default when `mode=` is left unspecified. Set `WPR_MCP_MODE=csharp` (and `WPR_MCP_CSHARP_SIDECAR=<path-to-exe>`) in your MCP config to use the sidecar for every load_trace call:
+> **Naming note.** The `.NET sidecar` mode is named `"csharp"` in the API (env vars, mode args, manifest producer field) for backward compatibility with the spike. The user-facing label is `.NET` because the binary embeds the .NET 8 runtime, not the C# compiler. A future rename to `"dotnet"` is under consideration.
 
-```json
-{
-  "mcpServers": {
-    "wpr-trace-analyzer": {
-      "type": "stdio",
-      "command": "uv",
-      "args": ["run", "--no-project", "--with", "https://github.com/nijosmsft/wpr-mcp-server/releases/download/<release-tag>/<wheel-file>.whl", "python", "-m", "etw_analyzer.server"],
-      "env": {
-        "_NT_SYMBOL_PATH": "srv*C:\\symbols*https://msdl.microsoft.com/download/symbols",
-        "WPR_MCP_MODE": "csharp",
-        "WPR_MCP_CSHARP_SIDECAR": "C:\\install\\wpr-mcp-extract.exe"
-      }
-    }
-  }
-}
-```
+---
 
-`WPR_MCP_CSHARP_SIDECAR` should point at the published binary, for example `<repo>\csharp\publish\win-x64\wpr-mcp-extract.exe` after `dotnet publish -c Release -r win-x64 --self-contained`. Set `WPR_MCP_MODE=xperf` instead to opt every call back to the legacy pipeline.
+#### .NET sidecar mode — recommended (fast, default-preferred in `auto`)
 
-The explicit `mode=` arg always wins over the env var. All three modern pipelines (csharp, native, xperf) write the same parquet cache layout (schema v3, with a `producer` field on the manifest), so traces loaded in one mode may reuse existing cached data from another mode. Use `force=True` when you need to re-extract with the selected mode.
+**What it is.** A self-contained .NET 8 binary (`wpr-mcp-extract.exe`, ~40 MB single-file deploy) that decodes ETW Layer-1 events from an ETL into per-class parquet files. The Python server invokes it as a subprocess, streams its JSONL progress, then runs the same Layer-3 aggregators it would for native mode.
 
-#### What is the C# sidecar?
+**When to use it.** The default choice for everything. ~9× faster end-to-end than native on a 1 GB ETL (45s vs 429s on the lab fixture), correct TraceLogging decode out of the box, and the cache layout is identical to native mode so you don't lock yourself in.
 
-`wpr-mcp-extract.exe` is a separately-built helper that decodes ETW Layer-1 events from an ETL into per-class parquet files. The Python server invokes it as a subprocess, streams its JSONL progress, then runs the same Layer-3 aggregators it would for native mode. Two strategies are available: `materialized-small` (default, fastest) and `event-store-streaming` (bounded RSS for very large traces). Full build + run docs live in [`csharp/README.md`](csharp/README.md); supervisor / debugging notes in [`src/etw_analyzer/native/SIDECAR.md`](src/etw_analyzer/native/SIDECAR.md).
+**How to enable it.**
+
+1. Build the binary once:
+
+   ```powershell
+   cd <repo>\csharp
+   dotnet publish -c Release -r win-x64 --self-contained -o publish\win-x64
+   ```
+
+2. Point the server at it. Either set `WPR_MCP_CSHARP_SIDECAR` to the absolute path, or drop `wpr-mcp-extract.exe` on `PATH`. Once `WPR_MCP_CSHARP_SIDECAR` is set, `mode="auto"` picks it automatically:
+
+   ```json
+   {
+     "mcpServers": {
+       "wpr-trace-analyzer": {
+         "type": "stdio",
+         "command": "uv",
+         "args": ["run", "--no-project", "--with", "https://github.com/nijosmsft/wpr-mcp-server/releases/download/<release-tag>/<wheel-file>.whl", "python", "-m", "etw_analyzer.server"],
+         "env": {
+           "_NT_SYMBOL_PATH": "srv*C:\\symbols*https://msdl.microsoft.com/download/symbols",
+           "WPR_MCP_CSHARP_SIDECAR": "C:\\install\\wpr-mcp-extract.exe"
+         }
+       }
+     }
+   }
+   ```
+
+3. Force this mode unconditionally with `WPR_MCP_MODE=csharp`, or pass `mode="csharp"` to `load_trace`. With the explicit form, the server raises a `ValueError` (naming the env var) if the binary can't be found instead of silently falling back.
+
+Cache manifests record `producer="csharp"`. Two strategies are available: `materialized-small` (default, fastest) and `event-store-streaming` (bounded RSS for very large traces). Full build + run docs live in [`csharp/README.md`](csharp/README.md); supervisor / debugging notes in [`src/etw_analyzer/native/SIDECAR.md`](src/etw_analyzer/native/SIDECAR.md).
+
+---
+
+#### Native mode — in-process Python consumer
+
+**What it is.** An in-process `OpenTraceW` + `tdh.dll` consumer that decodes ETW events directly in Python via `advapi32`. Decodes manifest providers (TCPIP, AFD, MsQuic, HTTP.sys) that xperf can't enumerate. No subprocess, no separate binary.
+
+**When to use it.** When the .NET sidecar isn't available (no `dotnet publish` access, restricted machine, etc.) but the native consumer bindings load. Best fallback in the `auto` chain.
+
+**How to enable it.**
+
+1. Nothing to install — it's bundled with the Python server. Verify the consumer is available on your host:
+
+   ```powershell
+   uv run python -c "from etw_analyzer.native.consumer import is_available; print(is_available())"
+   ```
+
+2. Force it with `WPR_MCP_MODE=native` or `mode="native"`. With the explicit form, the server raises if the bindings can't load instead of falling back:
+
+   ```json
+   "env": {
+     "_NT_SYMBOL_PATH": "srv*C:\\symbols*https://msdl.microsoft.com/download/symbols",
+     "WPR_MCP_MODE": "native"
+   }
+   ```
+
+3. For ETLs larger than the safety guardrail (default 1 GB), also set `WPR_MCP_NATIVE_ALLOW_LARGE=1`. The native pipeline buffers events in pandas DataFrames in-process, so memory grows with trace size.
+
+Cache manifests record `producer="native"`. Same parquet schema as .NET mode, so caches are interchangeable.
+
+---
+
+#### xperf mode — legacy WPA-based extraction
+
+**What it is.** A subprocess pipeline that shells out to `xperf.exe` from the Windows Performance Toolkit, running WPA-style actions (`profile`, `dpcisr`, `stack -butterfly`, `cswitch`, `sysconfig`, `process`, `diskio`, `tracestats`) plus `xperf -a dumper` for raw events.
+
+**When to use it.** When you hit a native-mode bug, need full WPA-style stack coverage, or you're on a machine where WPT is installed but you can't or don't want to run the .NET sidecar.
+
+**How to enable it.**
+
+1. Install the Windows Performance Toolkit (part of the Windows SDK or ADK). The server auto-detects `xperf.exe` at the standard install path:
+
+   ```
+   C:\Program Files (x86)\Windows Kits\10\Windows Performance Toolkit\xperf.exe
+   ```
+
+   Or put it on `PATH`.
+
+2. Force it with `WPR_MCP_MODE=xperf` or `mode="xperf"`. xperf is also the final fallback in the `auto` chain when neither the .NET sidecar nor the native consumer are available:
+
+   ```json
+   "env": {
+     "_NT_SYMBOL_PATH": "srv*C:\\symbols*https://msdl.microsoft.com/download/symbols",
+     "WPR_MCP_MODE": "xperf"
+   }
+   ```
+
+xperf mode is the slowest path but the broadest in tool coverage. Cache manifests for legacy xperf runs (pre-v3) may carry no producer field; the loader treats them as `producer="xperf"` on read.
+
+---
+
+#### Forcing re-extraction across modes
+
+All three pipelines write the same cache layout, so reloads can short-circuit even if you switch modes. Use `force=True` on `load_trace` when you need to re-extract with the selected mode (e.g. after rebuilding the .NET sidecar with a new event class).
+
 
 ### Evidence federation (optional)
 
