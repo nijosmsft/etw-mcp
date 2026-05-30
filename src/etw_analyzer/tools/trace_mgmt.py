@@ -1401,6 +1401,18 @@ def _run_native_aggregators(trace: TraceData) -> None:
     except Exception:
         pass
 
+    # Phase 3 federation hook: register Machine / Module / Process entities
+    # in the optional evidence-store. No-op when the library is not
+    # installed OR ``WPR_MCP_EVIDENCE_PATH`` is unset. See
+    # ``evidence-mcp-poc-plan.md`` §1.1 G3.
+    try:
+        from etw_analyzer.evidence_integration import (
+            safe_register_entities_from_trace,
+        )
+        safe_register_entities_from_trace(trace)
+    except Exception:
+        pass
+
 
 def _synthesize_native_cpu_sampling(trace: TraceData) -> None:
     """Build a ``cpu_sampling`` DataFrame from the native SampledProfile dump.
