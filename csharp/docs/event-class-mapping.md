@@ -26,10 +26,12 @@ whichever the caller finds easiest. The sidecar `Want()` helper in
 | `TcpIp/Disconnect`, `tcpip_disconnect`  | `kernel.TcpIpDisconnect` (+ IPV6)      | `TcpipDisconnect`            | `tcpip_disconnect.parquet`    | *(not in Python list)* |
 | `UdpIp/Recv`, `udp_recv`                | `kernel.UdpIpRecv` + `UdpIpRecvIPV6`   | `UdpRecv`                    | `udp_recv.parquet`            | `UdpIp/Recv`           |
 | `UdpIp/Send`, `udp_send`                | `kernel.UdpIpSend` + `UdpIpSendIPV6`   | `UdpSend`                    | `udp_send.parquet`            | `UdpIp/Send`           |
-| `Process`, `process`                    | `kernel.ProcessStart/Stop/DCStart/Stop`| `Process`                    | `process.parquet`             | *(aggregate in Py)*    |
-| `Image/Load`, `Image/DCStart`, `image`  | `kernel.ImageLoad`, `kernel.ImageDCStart` | `Image`                   | `image.parquet`               | *(aggregate in Py)*    |
-| `DiskIo`, `diskio`                      | `kernel.DiskIORead/Write/FlushBuffers` | `DiskIo`                     | `diskio.parquet`              | *(aggregate in Py)*    |
-| `PerfInfo`, `dpcisr`, `dpc_isr`         | `kernel.PerfInfoDPC/ThreadedDPC/ISR`   | `DpcIsr`                     | `dpc_isr.parquet`             | *(aggregate in Py)*    |
+| `Process`, `process`                    | `kernel.ProcessStart/Stop/DCStart/Stop/Defunct`| `Process`                | `process.parquet` + per-opcode `process_{start,end,dcstart,dcend,defunct}.parquet` | *(aggregate in Py)*    |
+| `Image/Load`, `Image/DCStart`, `image`  | `kernel.ImageLoad`, `kernel.ImageDCStart` | `Image`                   | `image.parquet` + per-opcode `image_{load,dcstart}.parquet` | *(aggregate in Py)*    |
+| `DiskIo`, `diskio`                      | `kernel.DiskIORead/Write/FlushBuffers` | `DiskIo`                     | `diskio.parquet` + per-opcode `diskio_{read,write,flushbuffers}.parquet` | *(aggregate in Py)*    |
+| `PerfInfo`, `dpcisr`, `dpc_isr`         | `kernel.PerfInfoDPC/ThreadedDPC/TimerDPC/ISR` | `DpcIsr`               | `dpc_isr.parquet` + per-opcode `perfinfo_{dpc,threaded_dpc,timer_dpc,isr}.parquet` | *(aggregate in Py)*    |
+| `Thread`, `thread`                      | `kernel.ThreadStart/Stop/DCStart/Stop`  | `Thread`                     | per-opcode `thread_{start,end,dcstart,dcend}.parquet` | *(Track P2 wiring)* |
+| `EventTrace/Header`, `eventtrace_header`| `kernel.EventTraceHeader`               | `EventTraceHeader`           | `eventtrace_header.parquet` | *(Track P2 wiring)* |
 | `SystemConfig`, `sysconfig`             | `kernel.SystemConfig*` family          | `Sysconfig`                  | `sysconfig.txt`               | *(aggregate in Py)*    |
 
 The four `Process`/`Image`/`DiskIo`/`PerfInfo` classes have no canonical
@@ -38,6 +40,24 @@ data inside `_run_native_aggregators` rather than persisting a per-event
 parquet. The sidecar persists them when the caller asks for them, because
 the Rust/C# split-out keeps the aggregator-on-load architecture purely
 Python-side.
+
+### Phase B per-opcode parquets
+
+Each combined kernel-meta buffer (`Process`, `Image`, `DiskIo`, `DpcIsr`) is
+also emitted as a set of per-opcode parquets — same row schema as the combined
+file but with the `Kind` column dropped (each file is a single opcode). Stem
+names match the convention `<class>_<opcode>` in lowercase snake-case, e.g.
+`perfinfo_dpc.parquet`, `process_dcstart.parquet`. These stems align with the
+naming pattern Track P2 will use when it extends Python's
+`_DUMPER_EVENT_CLASSES` to surface these opcodes individually.
+
+`Thread/*` and `EventTrace/Header` are new in Phase B and have no combined
+parquet — only the per-opcode `thread_{start,end,dcstart,dcend}.parquet`
+and the single-row `eventtrace_header.parquet`. The latter contains the
+authoritative `PerfFreq`, `NumberOfProcessors`, `TimerResolution`,
+`StartTime100Ns`, `EndTime100Ns`, `BootTime100Ns`, `CpuSpeedMHz`, and
+`PointerSize` for `derive_metadata_from_sidecar` to consume instead of
+guessing 10 MHz.
 
 ## Manifest providers (decoded via parser `.All` or `RegisteredTraceEventParser`)
 

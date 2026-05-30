@@ -66,7 +66,9 @@ Last green run (Server 2025, 80 CPUs):
 ([trace_mgmt.py:555-585](../../wpr-mcp-server/src/etw_analyzer/tools/trace_mgmt.py)):
 
 Kernel MOF: `SampledProfile`, `CSwitch`, `ReadyThread`, `TcpIp/Recv|Send|Connect|Accept|Retransmit|Disconnect`,
-`UdpIp/Recv|Send`, `Process`, `Image/Load|DCStart`, `DiskIo`, `PerfInfo` (DPC/ISR), `SystemConfig`.
+`UdpIp/Recv|Send`, `Process` (Start/End/DCStart/DCEnd/Defunct), `Thread` (Start/End/DCStart/DCEnd),
+`Image/Load|DCStart`, `DiskIo` (Read/Write/FlushBuffers), `PerfInfo` (DPC/ThreadedDPC/TimerDPC/ISR),
+`EventTrace/Header`, `SystemConfig`.
 
 Manifest providers: `AFD/Recv|Send|Connect|Accept|Close|Bind`,
 `NdisDrop`, `NdisPacketCapture`, `HttpService/Recv|Deliver|Send|Close`,
@@ -94,7 +96,13 @@ full request-name → TraceEvent handler → parquet stem table and the
 ├── packet_capture.parquet
 ├── http_{recv,deliver,send,close}.parquet
 ├── quic_{conn_created,conn_closed,packet_recv,packet_send,ack_recv}.parquet
-├── [process|image|diskio|dpc_isr].parquet  (when collected)
+├── [process|image|diskio|dpc_isr].parquet  (combined, kept for back-compat)
+├── [process_{start,end,dcstart,dcend,defunct}.parquet]   (Phase B per-opcode)
+├── [thread_{start,end,dcstart,dcend}.parquet]            (Phase B per-opcode)
+├── [image_{load,dcstart}.parquet]                        (Phase B per-opcode, drives symbolizer)
+├── [diskio_{read,write,flushbuffers}.parquet]            (Phase B per-opcode)
+├── [perfinfo_{dpc,threaded_dpc,timer_dpc,isr}.parquet]   (Phase B per-opcode)
+├── [eventtrace_header.parquet]                           (Phase B authoritative metadata)
 ├── [tracelogging_events.parquet]           (when --include-tracelogging)
 └── sysconfig.txt
 ```
