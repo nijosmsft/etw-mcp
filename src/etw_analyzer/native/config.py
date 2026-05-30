@@ -105,12 +105,12 @@ def find_csharp_sidecar(*, auto_detect: bool = False) -> Path | None:
         env_only = True
     elif not auto_detect:
         # ``config.py`` lives at ``src/etw_analyzer/native/config.py``. The
-        # in-tree publish output is at ``csharp/publish/win-x64/`` from the
+        # in-tree publish output is at ``dotnet/publish/win-x64/`` from the
         # repo root, i.e. three directories up.
         here = Path(__file__).resolve()
         repo_root_guess = here.parent.parent.parent.parent
         candidates.append(
-            repo_root_guess / "csharp" / "publish" / "win-x64" / CSHARP_SIDECAR_EXE
+            repo_root_guess / "dotnet" / "publish" / "win-x64" / CSHARP_SIDECAR_EXE
         )
 
     found: Path | None = None
