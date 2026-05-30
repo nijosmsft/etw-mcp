@@ -370,6 +370,34 @@ def _load_phase_b_dpc_isr(
             trace.raw_csv[canonical] = df
 
 
+def _load_phase_b_process(
+    staging_dir: Path,
+    trace: TraceData,
+    warnings: list[str],
+) -> None:
+    """Promote Phase B process_* parquets into raw_csv[<canonical>].
+
+    The native ``process_info`` aggregator's ``_gather_process_events``
+    fallback iterates ``Process/Start``, ``Process/End``,
+    ``Process/DCStart``, ``Process/DCEnd``, ``Process/Defunct`` looking
+    for matching DataFrames in raw_csv. Phase B writes one parquet per
+    opcode with PID / ParentPID columns; the adapter renames those to
+    the aggregator-expected ProcessId / ParentId and adds a SessionId=0
+    column (the sidecar doesn't decode SessionId — a documented Phase
+    B limitation).
+    """
+
+    from etw_analyzer.native import aggregation_worker_adapters as adapters
+
+    for stem, canonical in adapters.PHASE_B_PROCESS_STEMS.items():
+        df = _read_phase_b_parquet(staging_dir, stem, warnings)
+        if df is None or df.empty:
+            continue
+        df = adapters.adapt_csharp_process_dataframe(df)
+        if df is not None and not df.empty:
+            trace.raw_csv[canonical] = df
+
+
 def _build_trace_from_staging(
     *,
     staging_dir: Path,
@@ -429,6 +457,7 @@ def _build_trace_from_staging(
     # we just need to land them there. Adapters do the column-rename /
     # column-synthesis work first.
     _load_phase_b_dpc_isr(staging_dir, trace, warnings)
+    _load_phase_b_process(staging_dir, trace, warnings)
 
     # sysconfig.txt — preserve as raw text so the text aggregator finds it.
     sysconfig_path = staging_dir / "sysconfig.txt"

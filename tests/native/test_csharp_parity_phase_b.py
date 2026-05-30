@@ -477,3 +477,140 @@ class _DpcStubSymbolizer:
 
     def close(self) -> None:
         self.cache.clear()
+
+
+# ---- Adapter unit tests: process ---------------------------------------
+
+
+class TestAdaptCsharpProcessDataframe:
+    def test_renames_pid_to_processid(self):
+        df = _make_process_dcstart(rows=3)
+        out = adapters.adapt_csharp_process_dataframe(df)
+        assert "ProcessId" in out.columns
+        assert "PID" not in out.columns
+
+    def test_renames_parentpid_to_parentid(self):
+        df = _make_process_dcstart(rows=3)
+        out = adapters.adapt_csharp_process_dataframe(df)
+        assert "ParentId" in out.columns
+        assert "ParentPID" not in out.columns
+
+    def test_synthesises_sessionid_zero(self):
+        df = _make_process_dcstart(rows=3)
+        out = adapters.adapt_csharp_process_dataframe(df)
+        assert "SessionId" in out.columns
+        assert (out["SessionId"] == 0).all()
+
+    def test_renames_timestampqpc_to_timestamp(self):
+        df = _make_process_dcstart(rows=3)
+        out = adapters.adapt_csharp_process_dataframe(df)
+        assert "TimeStamp" in out.columns
+        assert "TimeStampQpc" not in out.columns
+
+    def test_preserves_image_and_command(self):
+        df = _make_process_dcstart(rows=3)
+        out = adapters.adapt_csharp_process_dataframe(df)
+        assert out["ImageFileName"].iloc[0] == "proc_0.exe"
+        assert out["CommandLine"].iloc[1] == "proc_1.exe --foo"
+
+    def test_handles_none_and_empty(self):
+        assert adapters.adapt_csharp_process_dataframe(None) is None
+        empty = pd.DataFrame()
+        out = adapters.adapt_csharp_process_dataframe(empty)
+        assert out is empty
+
+    def test_idempotent_when_already_native_shape(self):
+        df = pd.DataFrame({
+            "TimeStamp": [1],
+            "ProcessId": [42],
+            "ParentId": [4],
+            "SessionId": [1],
+            "ImageFileName": ["x.exe"],
+            "CommandLine": ["x"],
+        })
+        out = adapters.adapt_csharp_process_dataframe(df)
+        # Already-native shape: SessionId preserved (not overwritten).
+        assert out["SessionId"].iloc[0] == 1
+
+
+# ---- Integration: process_info -----------------------------------------
+
+
+class TestPhaseBProcessInfo:
+    def test_process_info_text_produced(self, tmp_path: Path):
+        etl = _make_etl(tmp_path)
+        staging = tmp_path / "staging"
+        _seed_phase_b_staging(staging, etl, include_process=True)
+        result = aggregation_worker.run_aggregation_worker(
+            staging, etl, trace_id="trace_proc",
+        )
+        assert result.ok is True, f"{result.message} / {result.warnings}"
+        text_path = staging / "process_info.txt"
+        assert text_path.exists(), "process_info.txt not written"
+        text = text_path.read_text(encoding="utf-8")
+        assert "proc_0.exe" in text
+        # Each row has TimeStamp / PID / Parent / Session / Image / CmdLine.
+        assert "PID=1000" in text
+        assert "Parent=4" in text
+
+    def test_process_canonical_key_populated(self, tmp_path: Path):
+        etl = _make_etl(tmp_path)
+        staging = tmp_path / "staging"
+        _seed_phase_b_staging(staging, etl, include_process=True)
+        from etw_analyzer.native import aggregation_worker as aw
+        captured: dict[str, set[str]] = {}
+        real_persist = aw._persist_aggregator_outputs
+
+        def cap(staging_dir, trace, warnings):
+            captured["keys"] = set(trace.raw_csv.keys())
+            return real_persist(staging_dir, trace, warnings)
+
+        aw._persist_aggregator_outputs = cap
+        try:
+            aw.run_aggregation_worker(staging, etl, trace_id="trace_proc_keys")
+        finally:
+            aw._persist_aggregator_outputs = real_persist
+        assert "Process/DCStart" in captured["keys"]
+
+    def test_process_info_registered_in_manifest(self, tmp_path: Path):
+        etl = _make_etl(tmp_path)
+        staging = tmp_path / "staging"
+        _seed_phase_b_staging(staging, etl, include_process=True)
+        aggregation_worker.run_aggregation_worker(
+            staging, etl, trace_id="trace_proc_m",
+        )
+        loaded = native_cache.read_manifest(staging)
+        kinds_by_name = {d.name: d.kind for d in loaded.datasets}
+        assert kinds_by_name.get("process_info") == "text"
+
+    def test_process_table_drives_cpu_sampling_process_name(self, tmp_path: Path):
+        """The cpu_sampling aggregator looks up Process Name via build_process_table.
+
+        After Phase B per-opcode adaptation, ProcessId is correctly
+        populated, so cpu_sampling rows can be linked back to image
+        names. We don't try to assert the full join here (cpu_sampling
+        has its own quirks); this just smoke-tests that
+        _native_process_events gets populated.
+        """
+        etl = _make_etl(tmp_path)
+        staging = tmp_path / "staging"
+        _seed_phase_b_staging(staging, etl, include_process=True)
+        from etw_analyzer.native import aggregation_worker as aw
+        captured: dict[str, pd.DataFrame] = {}
+        real_persist = aw._persist_aggregator_outputs
+
+        def cap(staging_dir, trace, warnings):
+            ptable = trace.raw_csv.get("_native_process_events")
+            if ptable is not None:
+                captured["ptable"] = ptable.copy()
+            return real_persist(staging_dir, trace, warnings)
+
+        aw._persist_aggregator_outputs = cap
+        try:
+            aw.run_aggregation_worker(staging, etl, trace_id="trace_ptable")
+        finally:
+            aw._persist_aggregator_outputs = real_persist
+        assert "ptable" in captured
+        ptable = captured["ptable"]
+        assert "ProcessId" in ptable.columns
+        assert len(ptable) > 0

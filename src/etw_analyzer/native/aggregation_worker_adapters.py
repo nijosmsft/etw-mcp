@@ -290,6 +290,8 @@ __all__ = [
     # Phase B per-opcode adapters.
     "adapt_csharp_dpc_dataframe",
     "PHASE_B_DPC_STEMS",
+    "adapt_csharp_process_dataframe",
+    "PHASE_B_PROCESS_STEMS",
 ]
 
 
@@ -369,4 +371,47 @@ def adapt_csharp_dpc_dataframe(
         df["InitialTime"] = (
             pd.to_numeric(df["TimeStamp"], errors="coerce") - elapsed_ticks
         )
+    return df
+
+
+# Phase B per-opcode stems that feed the process_info aggregator.
+PHASE_B_PROCESS_STEMS: dict[str, str] = {
+    "process_start":    "Process/Start",
+    "process_end":      "Process/End",
+    "process_dcstart":  "Process/DCStart",
+    "process_dcend":    "Process/DCEnd",
+    "process_defunct":  "Process/Defunct",
+}
+
+
+def adapt_csharp_process_dataframe(df: pd.DataFrame | None) -> pd.DataFrame | None:
+    """Adapt a Phase B process_* parquet to the process_info schema.
+
+    Phase B columns: ``EventSequence, TimeStampQpc, CPU, PID, ParentPID,
+    ImageFileName, CommandLine``.
+
+    The native ``process_info`` aggregator reads ``ProcessId``,
+    ``ParentId``, ``SessionId``, ``ImageFileName``, ``CommandLine``,
+    ``TimeStamp``. Map PID -> ProcessId, ParentPID -> ParentId, and
+    synthesise SessionId=0 (the sidecar does not decode session IDs —
+    documented in csharp/docs/event-class-mapping.md). TimeStampQpc ->
+    TimeStamp is the same rename ``normalize_csharp_dataframe`` does.
+
+    Returns the same DataFrame (mutated) for chaining; ``None`` /
+    empty inputs are returned unchanged.
+    """
+
+    if df is None or df.empty:
+        return df
+    rename_map: dict[str, str] = {}
+    if "TimeStampQpc" in df.columns and "TimeStamp" not in df.columns:
+        rename_map["TimeStampQpc"] = "TimeStamp"
+    if "PID" in df.columns and "ProcessId" not in df.columns:
+        rename_map["PID"] = "ProcessId"
+    if "ParentPID" in df.columns and "ParentId" not in df.columns:
+        rename_map["ParentPID"] = "ParentId"
+    if rename_map:
+        df = df.rename(columns=rename_map)
+    if "SessionId" not in df.columns:
+        df["SessionId"] = 0
     return df
