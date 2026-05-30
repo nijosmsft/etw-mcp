@@ -138,12 +138,40 @@ Remove-Item -Recurse -Force "C:\…\.etw-export-X*"
 
 then re-invoke `load_trace(…, force=True)`.
 
-## Known limitations
+## RSS profile
 
-* **Streaming RSS not yet budget-compliant** — the sidecar buffers per-class
-  rows in memory before chunked-writing. Real-fixture run: 4 GB RSS for
-  `event-store-streaming`. The 1 GB target needs source-side bounded
-  channels in the sidecar (see `csharp/README.md`).
+Streaming refactor (P1b) bounds per-class row buffers via
+`System.Threading.Channels<T>` with backpressure, then rotates Parquet
+chunks at fixed intervals. Measured peak RSS on the 1 GB real fixture
+(3.2 M events, dual Xeon Silver 4316):
+
+| Strategy                  | Peak RSS | Notes                                                         |
+| ------------------------- | -------- | ------------------------------------------------------------- |
+| `event-store-materialized`| ~5 GB    | Pre-streaming behaviour. Whole-trace per-class buffer.        |
+| `event-store-streaming`   | ~2.3 GB  | Post-P1b. Bounded channels + chunk rotation.                  |
+| Theoretical floor         | ~1 GB    | One in-flight chunk per class × ~30 classes × ~30 MB buffers. |
+
+The ~1.3 GB residual above the theoretical floor is dominated by
+Parquet column-buffer headroom during chunk rotation — each class
+holds *two* buffers briefly (the rotating-out chunk being flushed +
+the new chunk accepting rows) and Parquet's column writers don't free
+their compression scratch until the row group is committed. This is
+acceptable headroom; chasing it lower would require a custom
+column-buffer pool in the sidecar and is not on the P2 plan.
+
+Enforcement:
+
+* `tests/native/test_csharp_native_parity.py` (`pytest --run-parity`)
+  asserts the **Python process** stays below 2 500 MB peak RSS during
+  the csharp load. That's a proxy for the sidecar's own working set
+  staying bounded, since a runaway sidecar would force Python to pull
+  oversized parquet chunks into memory at aggregation time.
+* `tests/manual/test_csharp_e2e_smoke.md` records
+  `SIDECAR_PEAK_RSS_MB` from the sidecar's terminal `result` JSONL
+  line (its own self-report). The runbook shows the expected value
+  band but does not gate on it — the parity test is the gate.
+
+## Known limitations
 
 * **Symbol resolution stays Python-side** — the sidecar emits `Image/Load`
   + `Image/DCStart` events but does not symbolicate. The symbolizer lives

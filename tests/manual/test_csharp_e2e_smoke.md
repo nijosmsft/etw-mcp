@@ -59,7 +59,7 @@ MSG=csharp sidecar completed: aggregation completed: 1 aggregator parquets writt
 WALL_E2E_S=25.3
 SIDECAR_WALL_S=19.648
 SIDECAR_EPS=163720
-SIDECAR_PEAK_RSS_MB=5945.3
+SIDECAR_PEAK_RSS_MB=2287.4
 EVENT_SAMPLED=55652
 EVENT_CSWITCH=2100633
 MANIFEST_PRODUCER=csharp
@@ -121,9 +121,12 @@ behaviour).
 | Atomic promotion (rename)   | < 1 s    |                                                                                        |
 | **Total (`WALL_E2E_S`)**    | ~25 s    |                                                                                        |
 
-The 6 GB peak RSS is a known issue from the C# sidecar's per-class
-buffering — see `csharp-sidecar-prod-status.md` for the streaming-channel
-refactor planned for v0.2.0 of the sidecar.
+The post-P1b streaming sidecar typically reports `SIDECAR_PEAK_RSS_MB`
+in the 2 000–2 400 MB range on this fixture. The number is recorded
+for trend tracking; the parity test
+(`tests/native/test_csharp_native_parity.py --run-parity`) is what
+enforces the 2 500 MB ceiling. See `SIDECAR.md` "RSS profile" for
+strategy comparison and the residual-headroom breakdown.
 
 ## Known issues / caveats
 
@@ -131,8 +134,3 @@ refactor planned for v0.2.0 of the sidecar.
    + `Image/DCStart` rows but does not symbolicate. After cache promote,
    `etw_analyzer.native.symbolizer` runs in-process. If symbols are slow
    or missing, that's a Python-path issue, not a sidecar issue.
-
-2. **Streaming RSS > budget.** Per the production status doc, the
-   sidecar buffers per-class rows before chunked write. Target of 1 GB
-   RSS requires a future refactor in C# (`EventCollector` →
-   `System.Threading.Channels<T>`).
