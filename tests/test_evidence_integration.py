@@ -199,6 +199,81 @@ def test_processes_registered_with_correct_count(
         store.close()
 
 
+def test_moduleload_observations_written_per_image_load(
+    tmp_path: Path, evidence_root: Path
+) -> None:
+    """Each Image/Load → one ModuleLoad observation joined to the Module.
+
+    This is the producer side of the schema v2 cross-tool contract:
+    the consumer (``evidence-query.correlate_trace_and_dump``) reads
+    from the ``ModuleLoad`` view, which projects observations of kind
+    ``ModuleLoad`` plus their ``observation_entities`` membership. If
+    we stop writing those observations, the consumer's ``in_dump``
+    column silently goes empty — hence this test pins the contract.
+    """
+    pytest.importorskip("evidence_store")
+    from evidence_store import EvidenceStore
+
+    trace = _make_trace(tmp_path)
+    mid = evidence_integration.register_entities_from_trace(trace)
+    assert mid is not None
+
+    store = EvidenceStore.open(evidence_root / mid / "evidence.duckdb")
+    try:
+        # One ModuleLoad observation per distinct (name, version,
+        # base_addr). The fixture has 2 distinct modules
+        # (ntoskrnl, tcpip); the DCStart duplicate of ntoskrnl shares
+        # the same base_addr so it collapses.
+        rows = store.query(
+            "SELECT module_id, base_addr FROM ModuleLoad "
+            "ORDER BY base_addr"
+        ).to_pandas()
+        assert len(rows) >= 2, f"expected at least 2 ModuleLoad rows, got {len(rows)}"
+        assert rows["base_addr"].nunique() == len(rows), \
+            "ModuleLoad rows should have distinct base_addrs"
+        # Every ModuleLoad row must reference a real Module entity.
+        modules = store.query(
+            "SELECT entity_id FROM Module WHERE machine_id = ?", [mid]
+        ).to_pandas()
+        module_ids = set(modules["entity_id"].tolist())
+        for mod_id in rows["module_id"].tolist():
+            assert mod_id in module_ids, f"orphan module_id: {mod_id}"
+    finally:
+        store.close()
+
+
+def test_moduleload_carries_evidence_pointer(
+    tmp_path: Path, evidence_root: Path
+) -> None:
+    """The ModuleLoad observation must link to an evidence row pointing
+    at the source ETL — that is the audit trail for the load event."""
+    pytest.importorskip("evidence_store")
+    from evidence_store import EvidenceStore
+
+    trace = _make_trace(tmp_path)
+    mid = evidence_integration.register_entities_from_trace(trace)
+    assert mid is not None
+
+    store = EvidenceStore.open(evidence_root / mid / "evidence.duckdb")
+    try:
+        rows = store.query(
+            "SELECT e.source_kind, e.source_path, e.source_locator "
+            "FROM observations o "
+            "JOIN evidence e ON e.evidence_id = o.evidence_id "
+            "WHERE o.kind = 'ModuleLoad' "
+            "ORDER BY e.source_locator"
+        ).to_pandas()
+        assert len(rows) > 0
+        # All ModuleLoad evidence rows must reference the trace ETL.
+        assert all(rows["source_kind"] == "etl_row")
+        assert all(rows["source_path"].str.endswith("fake.etl"))
+        # Locator distinguishes Image/Load vs Image/DCStart.
+        locators = set(rows["source_locator"].tolist())
+        assert locators.issubset({"Image/Load", "Image/DCStart"})
+    finally:
+        store.close()
+
+
 def test_safe_register_swallows_exception(
     tmp_path: Path, evidence_root: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

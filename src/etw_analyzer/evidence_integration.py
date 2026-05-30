@@ -133,15 +133,23 @@ def _extract_architecture(trace: "TraceData") -> str | None:
 # --- Module registration ----------------------------------------------------
 
 def _iter_modules(trace: "TraceData") -> list[dict[str, Any]]:
-    """Yield ``{name, version, path}`` rows from Image/Load events.
+    """Yield ``{name, version, path, base_addr, load_time}`` rows from Image/Load events.
 
     Module identity in evidence-store is ``(machine, name_lower, version)``
     — see ``evidence-store`` identifiers.py. We pack ``TimeDateStamp`` +
     ``ImageSize`` into the version string so two MCPs registering the
     same on-disk binary collapse into one Module entity even when they
     have no human-readable version handy.
+
+    ``base_addr`` and ``load_time`` come from the same row and travel
+    with the module so the caller can write a ModuleLoad observation
+    per (module, load-site) — see ``register_entities_from_trace`` for
+    the wire-up. Multiple Image/Load rows for the same (name, version)
+    are still deduped at the Module entity level, but each distinct
+    (name, version, base_addr) keeps its own load observation so the
+    consumer side can correlate per-process loads.
     """
-    by_key: dict[tuple[str, str], dict[str, Any]] = {}
+    by_key: dict[tuple[str, str, int], dict[str, Any]] = {}
     for key in ("Image/Load", "Image/DCStart"):
         df = trace.raw_csv.get(key)
         if df is None or df.empty:
@@ -164,14 +172,26 @@ def _iter_modules(trace: "TraceData") -> list[dict[str, Any]]:
                 size = int(row.get("ImageSize", 0) or 0)
             except (TypeError, ValueError):
                 size = 0
+            try:
+                base_addr = int(row.get("ImageBase", 0) or 0)
+            except (TypeError, ValueError):
+                base_addr = 0
+            try:
+                load_time = int(row.get("TimeStamp", 0) or 0)
+            except (TypeError, ValueError):
+                load_time = 0
             version = f"tds={tds:08x};size={size}"
-            dedup_key = (name, version)
+            dedup_key = (name, version, base_addr)
             if dedup_key in by_key:
                 continue
             by_key[dedup_key] = {
                 "name": name,
                 "version": version,
                 "path": file_name,
+                "base_addr": base_addr,
+                "load_time": load_time,
+                "image_size": size,
+                "source_kind": key,  # "Image/Load" vs "Image/DCStart"
             }
     return list(by_key.values())
 
@@ -259,17 +279,63 @@ def register_entities_from_trace(
             hostname=hostname, os_build=os_build, architecture=architecture
         )
 
+        # Pre-resolve EvidenceRef per Image/* source kind so identical
+        # rows collapse to a single evidence row in the DB (the store
+        # dedups by (kind, path, locator)).
+        from evidence_store import EvidenceRef  # type: ignore[import-not-found]
+
+        load_refs: dict[str, EvidenceRef] = {
+            "Image/Load": EvidenceRef(
+                kind="etl_row", path=source_path, locator="Image/Load"
+            ),
+            "Image/DCStart": EvidenceRef(
+                kind="etl_row", path=source_path, locator="Image/DCStart"
+            ),
+        }
+
         for mod in _iter_modules(trace):
             try:
-                store.register_module(
+                module_eid = store.register_module(
                     machine_id=machine_id,
                     name=mod["name"],
                     version=mod["version"],
                     path=mod.get("path"),
                 )
             except Exception:
-                logger.debug("evidence: register_module failed for %r", mod.get("name"),
-                             exc_info=True)
+                logger.debug(
+                    "evidence: register_module failed for %r",
+                    mod.get("name"), exc_info=True,
+                )
+                continue
+
+            # Write one ModuleLoad observation per (module, base_addr)
+            # so the evidence-query ``ModuleLoad`` view (v2 schema)
+            # can join against this trace. This is the bridge that
+            # makes the cross-tool ``correlate_trace_and_dump`` query
+            # work — without it, the consumer side sees Module
+            # entities but no load events and the "in_dump" column
+            # stays empty for everything.
+            try:
+                ref = load_refs.get(mod.get("source_kind", "Image/Load"),
+                                    load_refs["Image/Load"])
+                payload: dict[str, Any] = {
+                    "base_addr": int(mod.get("base_addr", 0) or 0),
+                    "load_time": int(mod.get("load_time", 0) or 0),
+                    "image_size": int(mod.get("image_size", 0) or 0),
+                    "path": mod.get("path"),
+                }
+                store.add_observation(
+                    kind="ModuleLoad",
+                    entity_ids=[module_eid],
+                    timestamp_utc=int(mod.get("load_time", 0) or 0) or None,
+                    payload=payload,
+                    source=ref,
+                )
+            except Exception:
+                logger.debug(
+                    "evidence: add ModuleLoad observation failed for %r",
+                    mod.get("name"), exc_info=True,
+                )
 
         for proc in _iter_processes(trace):
             try:
@@ -289,7 +355,6 @@ def register_entities_from_trace(
         # friendly_name as structured fields yet (see plan §3.4). When
         # the upstream aggregator grows those columns this is the right
         # hook point.
-        del source_path  # currently unused; reserved for future observations.
         return machine_id
     finally:
         store.close()
