@@ -26,11 +26,25 @@ internal sealed class ExtractRunner
     public readonly SysconfigCollector Sysconfig = new();
     public long EventsLost;
     public long QpcOrigin;
+    public double PerfFreq;
 
-    private readonly bool _wantSampled, _wantCSwitch, _wantReady, _wantTcpip, _wantAfd, _wantNdisDrop, _wantSysconfig;
+    private readonly bool _wantSampled, _wantCSwitch, _wantReady, _wantSysconfig;
+    private readonly bool _wantTcpipRecv, _wantTcpipSend, _wantTcpipConnect, _wantTcpipAccept;
+    private readonly bool _wantTcpipRetransmit, _wantTcpipDisconnect;
+    private readonly bool _wantUdpRecv, _wantUdpSend;
+    private readonly bool _wantAfdRecv, _wantAfdSend, _wantAfdConnect, _wantAfdAccept, _wantAfdClose, _wantAfdBind;
+    private readonly bool _wantNdisDrop, _wantNdisPacketCapture;
+    private readonly bool _wantHttpRecv, _wantHttpDeliver, _wantHttpSend, _wantHttpClose;
+    private readonly bool _wantQuicCreate, _wantQuicClose, _wantQuicPktRecv, _wantQuicPktSend, _wantQuicAck;
+    private readonly bool _wantProcess, _wantImage, _wantDiskIo, _wantDpcIsr;
     private readonly bool _includeTracelogging;
     private readonly bool _panicCallback;
     private bool _panicFired;
+
+    // Provider GUIDs for the manifest providers we route by ProviderGuid below.
+    private static readonly Guid s_httpServiceGuid = new("dd5ef90a-6398-47a4-ad34-4dcecdef795f");
+    // MsQuic ETW provider (well-known GUID).
+    private static readonly Guid s_msquicGuid = new("ff15e657-4f26-570e-88ab-0796b258d11c");
 
     // (ProviderGuid, EventID) pairs already routed to a typed buffer; skip those in
     // the generic TraceLogging path so we don't double-record known events.
@@ -43,11 +57,37 @@ internal sealed class ExtractRunner
         var lc = req.RequestedEventClasses.Select(s => s.ToLowerInvariant()).ToHashSet();
         bool Want(params string[] aliases) => aliases.Any(a => lc.Contains(a.ToLowerInvariant()));
         _wantSampled = Want("SampledProfile", "sampled_profile");
-        _wantCSwitch = Want("CSwitch", "cswitch");
+        _wantCSwitch = Want("CSwitch", "cswitch", "cswitch_events");
         _wantReady = Want("ReadyThread", "readythread");
-        _wantTcpip = Want("TcpIp/Recv", "tcpip_recv");
-        _wantAfd = Want("AFD/Recv", "afd_recv");
+        _wantTcpipRecv = Want("TcpIp/Recv", "tcpip_recv");
+        _wantTcpipSend = Want("TcpIp/Send", "tcpip_send");
+        _wantTcpipConnect = Want("TcpIp/Connect", "tcpip_connect");
+        _wantTcpipAccept = Want("TcpIp/Accept", "tcpip_accept");
+        _wantTcpipRetransmit = Want("TcpIp/Retransmit", "tcpip_retransmit");
+        _wantTcpipDisconnect = Want("TcpIp/Disconnect", "tcpip_disconnect");
+        _wantUdpRecv = Want("UdpIp/Recv", "udp_recv");
+        _wantUdpSend = Want("UdpIp/Send", "udp_send");
+        _wantAfdRecv = Want("AFD/Recv", "afd_recv");
+        _wantAfdSend = Want("AFD/Send", "afd_send");
+        _wantAfdConnect = Want("AFD/Connect", "afd_connect");
+        _wantAfdAccept = Want("AFD/Accept", "afd_accept");
+        _wantAfdClose = Want("AFD/Close", "afd_close");
+        _wantAfdBind = Want("AFD/Bind", "afd_bind");
         _wantNdisDrop = Want("NdisDrop", "ndis_drops");
+        _wantNdisPacketCapture = Want("NdisPacketCapture", "packet_capture");
+        _wantHttpRecv = Want("HttpService/Recv", "http_recv");
+        _wantHttpDeliver = Want("HttpService/Deliver", "http_deliver");
+        _wantHttpSend = Want("HttpService/Send", "http_send");
+        _wantHttpClose = Want("HttpService/Close", "http_close");
+        _wantQuicCreate = Want("Quic/ConnectionCreated", "quic_conn_created");
+        _wantQuicClose = Want("Quic/ConnectionClosed", "quic_conn_closed");
+        _wantQuicPktRecv = Want("Quic/PacketRecv", "quic_packet_recv");
+        _wantQuicPktSend = Want("Quic/PacketSend", "quic_packet_send");
+        _wantQuicAck = Want("Quic/AckReceived", "quic_ack_recv");
+        _wantProcess = Want("Process", "process");
+        _wantImage = Want("Image/Load", "Image/DCStart", "image", "images");
+        _wantDiskIo = Want("DiskIo", "diskio");
+        _wantDpcIsr = Want("PerfInfo", "PerfInfo/DPC", "PerfInfo/ISR", "dpcisr", "dpc_isr");
         _wantSysconfig = Want("SystemConfig", "sysconfig");
         _includeTracelogging = req.IncludeTracelogging;
         _panicCallback = req.PanicProbe == "callback_panic";
@@ -62,6 +102,18 @@ internal sealed class ExtractRunner
 
         Sysconfig.Hostname = Environment.MachineName;
         Sysconfig.OsArch = source.PointerSize == 8 ? "x64" : "x86";
+
+        // QueryPerformanceFrequency from the ETL header — required by the
+        // event-store-streaming manifest's timebase.perf_freq field.
+        // TraceEvent 3.1 exposes QPCFreq as an internal property; access via
+        // reflection so we stay compatible without forking the package.
+        try
+        {
+            var prop = typeof(ETWTraceEventSource).GetProperty("QPCFreq",
+                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Public);
+            if (prop?.GetValue(source) is long qpcFreq) PerfFreq = qpcFreq;
+        }
+        catch { PerfFreq = 0.0; }
 
         var kernel = source.Kernel;
 
@@ -179,11 +231,101 @@ internal sealed class ExtractRunner
                 Collector.StacksPaired++;
         });
 
-        if (_wantTcpip)
+        if (_wantTcpipRecv)
         {
             // MOF route — kernel TCP/IP provider
-            kernel.TcpIpRecv += (TcpIpTraceData data) => Wrap(() => EmitTcpipRecv(data, isV6: false));
-            kernel.TcpIpRecvIPV6 += (TcpIpV6TraceData data) => Wrap(() => EmitTcpipRecvV6(data));
+            kernel.TcpIpRecv += (TcpIpTraceData data) => Wrap(() => AddFlow(Collector.TcpipRecv, BuildFlowRow(data)));
+            kernel.TcpIpRecvIPV6 += (TcpIpV6TraceData data) => Wrap(() => AddFlow(Collector.TcpipRecv, BuildFlowRowV6(data)));
+        }
+        if (_wantTcpipSend)
+        {
+            kernel.TcpIpSend += (TcpIpSendTraceData data) => Wrap(() => Collector.TcpipSend.Add(BuildFlowRow(data)));
+            kernel.TcpIpSendIPV6 += (TcpIpV6SendTraceData data) => Wrap(() => Collector.TcpipSend.Add(BuildFlowRowV6(data)));
+        }
+        if (_wantTcpipConnect)
+        {
+            kernel.TcpIpConnect += (TcpIpConnectTraceData data) => Wrap(() => Collector.TcpipConnect.Add(BuildFlowRow(data)));
+            kernel.TcpIpConnectIPV6 += (TcpIpV6ConnectTraceData data) => Wrap(() => Collector.TcpipConnect.Add(BuildFlowRowV6(data)));
+        }
+        if (_wantTcpipAccept)
+        {
+            kernel.TcpIpAccept += (TcpIpConnectTraceData data) => Wrap(() => Collector.TcpipAccept.Add(BuildFlowRow(data)));
+            kernel.TcpIpAcceptIPV6 += (TcpIpV6ConnectTraceData data) => Wrap(() => Collector.TcpipAccept.Add(BuildFlowRowV6(data)));
+        }
+        if (_wantTcpipRetransmit)
+        {
+            kernel.TcpIpRetransmit += (TcpIpTraceData data) => Wrap(() => Collector.TcpipRetransmit.Add(BuildFlowRow(data)));
+            kernel.TcpIpRetransmitIPV6 += (TcpIpV6TraceData data) => Wrap(() => Collector.TcpipRetransmit.Add(BuildFlowRowV6(data)));
+        }
+        if (_wantTcpipDisconnect)
+        {
+            kernel.TcpIpDisconnect += (TcpIpTraceData data) => Wrap(() => Collector.TcpipDisconnect.Add(BuildFlowRow(data)));
+            kernel.TcpIpDisconnectIPV6 += (TcpIpV6TraceData data) => Wrap(() => Collector.TcpipDisconnect.Add(BuildFlowRowV6(data)));
+        }
+        if (_wantUdpRecv)
+        {
+            kernel.UdpIpRecv += (UdpIpTraceData data) => Wrap(() => Collector.UdpRecv.Add(BuildFlowRow(data)));
+            kernel.UdpIpRecvIPV6 += (UpdIpV6TraceData data) => Wrap(() => Collector.UdpRecv.Add(BuildFlowRowV6(data)));
+        }
+        if (_wantUdpSend)
+        {
+            kernel.UdpIpSend += (UdpIpTraceData data) => Wrap(() => Collector.UdpSend.Add(BuildFlowRow(data)));
+            kernel.UdpIpSendIPV6 += (UpdIpV6TraceData data) => Wrap(() => Collector.UdpSend.Add(BuildFlowRowV6(data)));
+        }
+        if (_wantProcess)
+        {
+            kernel.ProcessStart += (ProcessTraceData data) => Wrap(() => AddProcess(data, "Start"));
+            kernel.ProcessStop += (ProcessTraceData data) => Wrap(() => AddProcess(data, "End"));
+            kernel.ProcessDCStart += (ProcessTraceData data) => Wrap(() => AddProcess(data, "DCStart"));
+            kernel.ProcessDCStop += (ProcessTraceData data) => Wrap(() => AddProcess(data, "DCEnd"));
+        }
+        if (_wantImage)
+        {
+            kernel.ImageLoad += (ImageLoadTraceData data) => Wrap(() => AddImage(data, "Load"));
+            kernel.ImageDCStart += (ImageLoadTraceData data) => Wrap(() => AddImage(data, "DCStart"));
+        }
+        if (_wantDiskIo)
+        {
+            kernel.DiskIORead += (DiskIOTraceData data) => Wrap(() => AddDiskIo(data, "Read"));
+            kernel.DiskIOWrite += (DiskIOTraceData data) => Wrap(() => AddDiskIo(data, "Write"));
+            kernel.DiskIOFlushBuffers += (DiskIOFlushBuffersTraceData data) => Wrap(() => Collector.DiskIo.Add(new DiskIoRow
+            {
+                EventSequence = Collector.NextSeq(),
+                TimeStampQpc = data.TimeStampQPC,
+                Cpu = data.ProcessorNumber,
+                Kind = "FlushBuffers",
+                DiskNumber = data.DiskNumber,
+            }));
+        }
+        if (_wantDpcIsr)
+        {
+            kernel.PerfInfoDPC += (DPCTraceData data) => Wrap(() => Collector.DpcIsr.Add(new DpcIsrRow
+            {
+                EventSequence = Collector.NextSeq(),
+                TimeStampQpc = data.TimeStampQPC,
+                Cpu = data.ProcessorNumber,
+                Kind = "DPC",
+                Routine = (ulong)data.Routine,
+                ElapsedMicros = (long)((data.ElapsedTimeMSec) * 1000.0),
+            }));
+            kernel.PerfInfoThreadedDPC += (DPCTraceData data) => Wrap(() => Collector.DpcIsr.Add(new DpcIsrRow
+            {
+                EventSequence = Collector.NextSeq(),
+                TimeStampQpc = data.TimeStampQPC,
+                Cpu = data.ProcessorNumber,
+                Kind = "ThreadedDPC",
+                Routine = (ulong)data.Routine,
+                ElapsedMicros = (long)((data.ElapsedTimeMSec) * 1000.0),
+            }));
+            kernel.PerfInfoISR += (ISRTraceData data) => Wrap(() => Collector.DpcIsr.Add(new DpcIsrRow
+            {
+                EventSequence = Collector.NextSeq(),
+                TimeStampQpc = data.TimeStampQPC,
+                Cpu = data.ProcessorNumber,
+                Kind = "ISR",
+                Routine = (ulong)data.Routine,
+                ElapsedMicros = (long)((data.ElapsedTimeMSec) * 1000.0),
+            }));
         }
 
         if (_wantSysconfig)
@@ -241,29 +383,64 @@ internal sealed class ExtractRunner
         void DispatchManifest(TraceEvent data)
         {
             // Counter bookkeeping is done by AllEvents; do not double-count.
-            if (_wantAfd && data.ProviderGuid == AfdProviderGuid)
+            if (data.ProviderGuid == AfdProviderGuid)
             {
                 var name = (data.TaskName ?? "") + "/" + (data.OpcodeName ?? "") + "/" + (data.EventName ?? "");
-                if (name.Contains("Receive", StringComparison.OrdinalIgnoreCase) ||
-                    name.Contains("Recv", StringComparison.OrdinalIgnoreCase))
+                if (_wantAfdRecv && (name.Contains("Receive", StringComparison.OrdinalIgnoreCase) || name.Contains("Recv", StringComparison.OrdinalIgnoreCase)))
                 {
-                    EmitAfdRecv(data);
+                    EmitAfd(data, Collector.AfdRecv);
+                    _consumedKeys.Add((data.ProviderGuid, (int)data.ID));
+                    return;
+                }
+                if (_wantAfdSend && name.Contains("Send", StringComparison.OrdinalIgnoreCase))
+                {
+                    EmitAfdEvent(data, Collector.AfdSend);
+                    _consumedKeys.Add((data.ProviderGuid, (int)data.ID));
+                    return;
+                }
+                if (_wantAfdConnect && name.Contains("Connect", StringComparison.OrdinalIgnoreCase))
+                {
+                    EmitAfdEvent(data, Collector.AfdConnect);
+                    _consumedKeys.Add((data.ProviderGuid, (int)data.ID));
+                    return;
+                }
+                if (_wantAfdAccept && name.Contains("Accept", StringComparison.OrdinalIgnoreCase))
+                {
+                    EmitAfdEvent(data, Collector.AfdAccept);
+                    _consumedKeys.Add((data.ProviderGuid, (int)data.ID));
+                    return;
+                }
+                if (_wantAfdClose && name.Contains("Close", StringComparison.OrdinalIgnoreCase))
+                {
+                    EmitAfdEvent(data, Collector.AfdClose);
+                    _consumedKeys.Add((data.ProviderGuid, (int)data.ID));
+                    return;
+                }
+                if (_wantAfdBind && name.Contains("Bind", StringComparison.OrdinalIgnoreCase))
+                {
+                    EmitAfdEvent(data, Collector.AfdBind);
                     _consumedKeys.Add((data.ProviderGuid, (int)data.ID));
                     return;
                 }
             }
-            if (_wantNdisDrop && (data.ProviderGuid == NdisManifestGuid || data.ProviderGuid == NdisPacketCaptureGuid))
+            if (data.ProviderGuid == NdisManifestGuid || data.ProviderGuid == NdisPacketCaptureGuid)
             {
                 var name = (data.TaskName ?? "") + "/" + (data.OpcodeName ?? "") + "/" + (data.EventName ?? "");
-                if (name.Contains("Drop", StringComparison.OrdinalIgnoreCase) ||
-                    name.Contains("Discard", StringComparison.OrdinalIgnoreCase))
+                if (_wantNdisDrop && (name.Contains("Drop", StringComparison.OrdinalIgnoreCase) || name.Contains("Discard", StringComparison.OrdinalIgnoreCase)))
                 {
                     EmitNdisDrop(data);
                     _consumedKeys.Add((data.ProviderGuid, (int)data.ID));
                     return;
                 }
+                if (_wantNdisPacketCapture && data.ProviderGuid == NdisPacketCaptureGuid &&
+                    (name.Contains("Packet", StringComparison.OrdinalIgnoreCase) || name.Contains("Capture", StringComparison.OrdinalIgnoreCase) || name.Contains("Fragment", StringComparison.OrdinalIgnoreCase)))
+                {
+                    EmitNdisPacketCapture(data);
+                    _consumedKeys.Add((data.ProviderGuid, (int)data.ID));
+                    return;
+                }
             }
-            if (_wantTcpip && data.ProviderGuid == TcpipManifestGuid)
+            if (_wantTcpipRecv && data.ProviderGuid == TcpipManifestGuid)
             {
                 var name = (data.TaskName ?? "") + "/" + (data.EventName ?? "");
                 if (name.Contains("Receive", StringComparison.OrdinalIgnoreCase) ||
@@ -274,6 +451,32 @@ internal sealed class ExtractRunner
                     _consumedKeys.Add((data.ProviderGuid, (int)data.ID));
                     return;
                 }
+            }
+            if (data.ProviderGuid == s_httpServiceGuid)
+            {
+                var name = (data.TaskName ?? "") + "/" + (data.OpcodeName ?? "") + "/" + (data.EventName ?? "");
+                if (_wantHttpRecv && name.Contains("Recv", StringComparison.OrdinalIgnoreCase))
+                { EmitHttp(data, Collector.HttpRecv); _consumedKeys.Add((data.ProviderGuid, (int)data.ID)); return; }
+                if (_wantHttpDeliver && name.Contains("Deliver", StringComparison.OrdinalIgnoreCase))
+                { EmitHttp(data, Collector.HttpDeliver); _consumedKeys.Add((data.ProviderGuid, (int)data.ID)); return; }
+                if (_wantHttpSend && name.Contains("Send", StringComparison.OrdinalIgnoreCase))
+                { EmitHttp(data, Collector.HttpSend); _consumedKeys.Add((data.ProviderGuid, (int)data.ID)); return; }
+                if (_wantHttpClose && name.Contains("Close", StringComparison.OrdinalIgnoreCase))
+                { EmitHttp(data, Collector.HttpClose); _consumedKeys.Add((data.ProviderGuid, (int)data.ID)); return; }
+            }
+            if (data.ProviderGuid == s_msquicGuid)
+            {
+                var name = (data.TaskName ?? "") + "/" + (data.OpcodeName ?? "") + "/" + (data.EventName ?? "");
+                if (_wantQuicCreate && (name.Contains("ConnectionCreated", StringComparison.OrdinalIgnoreCase) || name.Contains("Created", StringComparison.OrdinalIgnoreCase)))
+                { EmitQuic(data, Collector.QuicConnCreated); _consumedKeys.Add((data.ProviderGuid, (int)data.ID)); return; }
+                if (_wantQuicClose && (name.Contains("ConnectionClosed", StringComparison.OrdinalIgnoreCase) || name.Contains("Closed", StringComparison.OrdinalIgnoreCase)))
+                { EmitQuic(data, Collector.QuicConnClosed); _consumedKeys.Add((data.ProviderGuid, (int)data.ID)); return; }
+                if (_wantQuicPktRecv && name.Contains("PacketRecv", StringComparison.OrdinalIgnoreCase))
+                { EmitQuic(data, Collector.QuicPacketRecv); _consumedKeys.Add((data.ProviderGuid, (int)data.ID)); return; }
+                if (_wantQuicPktSend && name.Contains("PacketSend", StringComparison.OrdinalIgnoreCase))
+                { EmitQuic(data, Collector.QuicPacketSend); _consumedKeys.Add((data.ProviderGuid, (int)data.ID)); return; }
+                if (_wantQuicAck && name.Contains("Ack", StringComparison.OrdinalIgnoreCase))
+                { EmitQuic(data, Collector.QuicAckReceived); _consumedKeys.Add((data.ProviderGuid, (int)data.ID)); return; }
             }
         }
 
@@ -349,49 +552,155 @@ internal sealed class ExtractRunner
         if (fatalError != null) throw fatalError;
     }
 
-    // ----- TcpIp -----
+    // ----- TcpIp / UdpIp helpers (MOF kernel) -----
 
-    private void EmitTcpipRecv(TcpIpTraceData data, bool isV6)
+    private NetworkFlowRow BuildFlowRow(TcpIpTraceData data) => new()
     {
-        var row = new TcpipRecvRow
-        {
-            EventSequence = Collector.NextSeq(),
-            TimeStampQpc = data.TimeStampQPC,
-            Cpu = data.ProcessorNumber,
-            ProcessName = data.ProcessName,
-            Pid = data.ProcessID,
-            ThreadId = data.ThreadID,
-            LocalAddr = data.daddr?.ToString(),
-            LocalPort = data.dport,
-            RemoteAddr = data.saddr?.ToString(),
-            RemotePort = data.sport,
-            Size = data.size,
-            SeqNo = (ulong)(uint)data.seqnum,
-            ConnId = (ulong)data.connid,
-        };
-        Collector.TcpipRecv.Add(row);
-    }
+        EventSequence = Collector.NextSeq(),
+        TimeStampQpc = data.TimeStampQPC,
+        Cpu = data.ProcessorNumber,
+        ProcessName = data.ProcessName,
+        Pid = data.ProcessID,
+        ThreadId = data.ThreadID,
+        LocalAddr = data.daddr?.ToString(),
+        LocalPort = data.dport,
+        RemoteAddr = data.saddr?.ToString(),
+        RemotePort = data.sport,
+        Size = data.size,
+        SeqNo = (ulong)(uint)data.seqnum,
+        ConnId = (ulong)data.connid,
+    };
 
-    private void EmitTcpipRecvV6(TcpIpV6TraceData data)
+    private NetworkFlowRow BuildFlowRow(TcpIpSendTraceData data) => new()
     {
-        var row = new TcpipRecvRow
+        EventSequence = Collector.NextSeq(),
+        TimeStampQpc = data.TimeStampQPC,
+        Cpu = data.ProcessorNumber,
+        ProcessName = data.ProcessName,
+        Pid = data.ProcessID,
+        ThreadId = data.ThreadID,
+        LocalAddr = data.saddr?.ToString(),
+        LocalPort = data.sport,
+        RemoteAddr = data.daddr?.ToString(),
+        RemotePort = data.dport,
+        Size = data.size,
+        SeqNo = (ulong)(uint)data.startime,
+        ConnId = (ulong)data.connid,
+    };
+
+    private NetworkFlowRow BuildFlowRow(TcpIpConnectTraceData data) => new()
+    {
+        EventSequence = Collector.NextSeq(),
+        TimeStampQpc = data.TimeStampQPC,
+        Cpu = data.ProcessorNumber,
+        ProcessName = data.ProcessName,
+        Pid = data.ProcessID,
+        ThreadId = data.ThreadID,
+        LocalAddr = data.saddr?.ToString(),
+        LocalPort = data.sport,
+        RemoteAddr = data.daddr?.ToString(),
+        RemotePort = data.dport,
+        Size = data.size,
+        ConnId = (ulong)data.connid,
+    };
+
+    private NetworkFlowRow BuildFlowRowV6(TcpIpV6TraceData data) => new()
+    {
+        EventSequence = Collector.NextSeq(),
+        TimeStampQpc = data.TimeStampQPC,
+        Cpu = data.ProcessorNumber,
+        ProcessName = data.ProcessName,
+        Pid = data.ProcessID,
+        ThreadId = data.ThreadID,
+        LocalAddr = data.daddr?.ToString(),
+        LocalPort = data.dport,
+        RemoteAddr = data.saddr?.ToString(),
+        RemotePort = data.sport,
+        Size = data.size,
+        SeqNo = (ulong)(uint)data.seqnum,
+        ConnId = (ulong)data.connid,
+    };
+
+    private NetworkFlowRow BuildFlowRowV6(TcpIpV6SendTraceData data) => new()
+    {
+        EventSequence = Collector.NextSeq(),
+        TimeStampQpc = data.TimeStampQPC,
+        Cpu = data.ProcessorNumber,
+        ProcessName = data.ProcessName,
+        Pid = data.ProcessID,
+        ThreadId = data.ThreadID,
+        LocalAddr = data.saddr?.ToString(),
+        LocalPort = data.sport,
+        RemoteAddr = data.daddr?.ToString(),
+        RemotePort = data.dport,
+        Size = data.size,
+        SeqNo = (ulong)(uint)data.startime,
+        ConnId = (ulong)data.connid,
+    };
+
+    private NetworkFlowRow BuildFlowRowV6(TcpIpV6ConnectTraceData data) => new()
+    {
+        EventSequence = Collector.NextSeq(),
+        TimeStampQpc = data.TimeStampQPC,
+        Cpu = data.ProcessorNumber,
+        ProcessName = data.ProcessName,
+        Pid = data.ProcessID,
+        ThreadId = data.ThreadID,
+        LocalAddr = data.saddr?.ToString(),
+        LocalPort = data.sport,
+        RemoteAddr = data.daddr?.ToString(),
+        RemotePort = data.dport,
+        Size = data.size,
+        ConnId = (ulong)data.connid,
+    };
+
+    private NetworkFlowRow BuildFlowRow(UdpIpTraceData data) => new()
+    {
+        EventSequence = Collector.NextSeq(),
+        TimeStampQpc = data.TimeStampQPC,
+        Cpu = data.ProcessorNumber,
+        ProcessName = data.ProcessName,
+        Pid = data.ProcessID,
+        ThreadId = data.ThreadID,
+        LocalAddr = data.daddr?.ToString(),
+        LocalPort = data.dport,
+        RemoteAddr = data.saddr?.ToString(),
+        RemotePort = data.sport,
+        Size = data.size,
+    };
+
+    private NetworkFlowRow BuildFlowRowV6(UpdIpV6TraceData data) => new()
+    {
+        EventSequence = Collector.NextSeq(),
+        TimeStampQpc = data.TimeStampQPC,
+        Cpu = data.ProcessorNumber,
+        ProcessName = data.ProcessName,
+        Pid = data.ProcessID,
+        ThreadId = data.ThreadID,
+        LocalAddr = data.daddr?.ToString(),
+        LocalPort = data.dport,
+        RemoteAddr = data.saddr?.ToString(),
+        RemotePort = data.sport,
+        Size = data.size,
+    };
+
+    private static void AddFlow(List<TcpipRecvRow> dest, NetworkFlowRow src)
+        => dest.Add(new TcpipRecvRow
         {
-            EventSequence = Collector.NextSeq(),
-            TimeStampQpc = data.TimeStampQPC,
-            Cpu = data.ProcessorNumber,
-            ProcessName = data.ProcessName,
-            Pid = data.ProcessID,
-            ThreadId = data.ThreadID,
-            LocalAddr = data.daddr?.ToString(),
-            LocalPort = data.dport,
-            RemoteAddr = data.saddr?.ToString(),
-            RemotePort = data.sport,
-            Size = data.size,
-            SeqNo = (ulong)(uint)data.seqnum,
-            ConnId = (ulong)data.connid,
-        };
-        Collector.TcpipRecv.Add(row);
-    }
+            EventSequence = src.EventSequence,
+            TimeStampQpc = src.TimeStampQpc,
+            Cpu = src.Cpu,
+            ProcessName = src.ProcessName,
+            Pid = src.Pid,
+            ThreadId = src.ThreadId,
+            LocalAddr = src.LocalAddr,
+            LocalPort = src.LocalPort,
+            RemoteAddr = src.RemoteAddr,
+            RemotePort = src.RemotePort,
+            Size = src.Size,
+            SeqNo = src.SeqNo,
+            ConnId = src.ConnId,
+        });
 
     private void EmitTcpipManifestRecv(TraceEvent data)
     {
@@ -416,9 +725,9 @@ internal sealed class ExtractRunner
 
     // ----- AFD -----
 
-    private void EmitAfdRecv(TraceEvent data)
+    private void EmitAfd(TraceEvent data, List<AfdRecvRow> dest)
     {
-        var row = new AfdRecvRow
+        dest.Add(new AfdRecvRow
         {
             EventSequence = Collector.NextSeq(),
             TimeStampQpc = data.TimeStampQPC,
@@ -429,11 +738,26 @@ internal sealed class ExtractRunner
             SocketHandle = AsUlong(data.PayloadByName("Endpoint") ?? data.PayloadByName("SocketHandle") ?? data.PayloadByName("EndpointAddr")),
             Size = AsLong(data.PayloadByName("BytesTransferred") ?? data.PayloadByName("Size") ?? data.PayloadByName("NumBytes")),
             CompletionStatus = AsLong(data.PayloadByName("Status") ?? data.PayloadByName("CompletionStatus")),
-        };
-        Collector.AfdRecv.Add(row);
+        });
     }
 
-    // ----- NDIS drop -----
+    private void EmitAfdEvent(TraceEvent data, List<AfdEventRow> dest)
+    {
+        dest.Add(new AfdEventRow
+        {
+            EventSequence = Collector.NextSeq(),
+            TimeStampQpc = data.TimeStampQPC,
+            Cpu = data.ProcessorNumber,
+            ProcessName = data.ProcessName,
+            Pid = data.ProcessID,
+            ThreadId = data.ThreadID,
+            SocketHandle = AsUlong(data.PayloadByName("Endpoint") ?? data.PayloadByName("SocketHandle") ?? data.PayloadByName("EndpointAddr")),
+            Size = AsLong(data.PayloadByName("BytesTransferred") ?? data.PayloadByName("Size") ?? data.PayloadByName("NumBytes")),
+            CompletionStatus = AsLong(data.PayloadByName("Status") ?? data.PayloadByName("CompletionStatus")),
+        });
+    }
+
+    // ----- NDIS drop / packet capture -----
 
     private void EmitNdisDrop(TraceEvent data)
     {
@@ -451,6 +775,114 @@ internal sealed class ExtractRunner
             Size = AsLong(data.PayloadByName("Size") ?? data.PayloadByName("NumBytes") ?? data.PayloadByName("FragmentSize")),
         };
         Collector.NdisDrops.Add(row);
+    }
+
+    private void EmitNdisPacketCapture(TraceEvent data)
+    {
+        var fragment = data.PayloadByName("Fragment") as byte[];
+        Collector.NdisPacketCapture.Add(new NdisPacketCaptureRow
+        {
+            EventSequence = Collector.NextSeq(),
+            TimeStampQpc = data.TimeStampQPC,
+            Cpu = data.ProcessorNumber,
+            MiniportName = AsString(data.PayloadByName("MiniportName") ?? data.PayloadByName("FriendlyName") ?? data.PayloadByName("MiniportIfName")),
+            Direction = data.OpcodeName ?? data.EventName,
+            FragmentSize = AsLong(data.PayloadByName("FragmentSize") ?? data.PayloadByName("Size")) ?? fragment?.Length,
+            Fragment = fragment,
+        });
+    }
+
+    // ----- HTTP.sys -----
+
+    private void EmitHttp(TraceEvent data, List<HttpRow> dest)
+    {
+        dest.Add(new HttpRow
+        {
+            EventSequence = Collector.NextSeq(),
+            TimeStampQpc = data.TimeStampQPC,
+            Cpu = data.ProcessorNumber,
+            ProcessName = data.ProcessName,
+            Pid = data.ProcessID,
+            ThreadId = data.ThreadID,
+            RequestId = AsUlong(data.PayloadByName("RequestId") ?? data.PayloadByName("RequestObj")),
+            ConnectionId = AsUlong(data.PayloadByName("ConnectionId") ?? data.PayloadByName("ConnObj")),
+            UrlGroupId = AsUlong(data.PayloadByName("UrlGroupId")),
+            Url = AsString(data.PayloadByName("Url")),
+            Verb = AsString(data.PayloadByName("Verb")),
+            Status = AsLong(data.PayloadByName("StatusCode") ?? data.PayloadByName("Status")),
+            BytesSent = AsLong(data.PayloadByName("BytesSent")),
+            BytesReceived = AsLong(data.PayloadByName("BytesReceived")),
+        });
+    }
+
+    // ----- MsQuic -----
+
+    private void EmitQuic(TraceEvent data, List<QuicRow> dest)
+    {
+        dest.Add(new QuicRow
+        {
+            EventSequence = Collector.NextSeq(),
+            TimeStampQpc = data.TimeStampQPC,
+            Cpu = data.ProcessorNumber,
+            ProcessName = data.ProcessName,
+            Pid = data.ProcessID,
+            ThreadId = data.ThreadID,
+            ConnectionId = AsUlong(data.PayloadByName("ConnectionId") ?? data.PayloadByName("Connection")),
+            Cid = AsString(data.PayloadByName("Cid") ?? data.PayloadByName("ClientCid") ?? data.PayloadByName("SrcCid") ?? data.PayloadByName("DstCid")),
+            PacketNumber = AsUlong(data.PayloadByName("PacketNumber") ?? data.PayloadByName("PacketNum") ?? data.PayloadByName("PktNum")),
+            PacketSize = AsLong(data.PayloadByName("PacketSize") ?? data.PayloadByName("PktSize") ?? data.PayloadByName("Length")),
+            AckDelayUs = AsLong(data.PayloadByName("AckDelay") ?? data.PayloadByName("AckDelayUs")),
+        });
+    }
+
+    // ----- Process / Image / DiskIo -----
+
+    private void AddProcess(ProcessTraceData data, string kind)
+    {
+        Collector.Process.Add(new ProcessRow
+        {
+            EventSequence = Collector.NextSeq(),
+            TimeStampQpc = data.TimeStampQPC,
+            Cpu = data.ProcessorNumber,
+            Kind = kind,
+            Pid = data.ProcessID,
+            ParentPid = data.ParentID,
+            ImageFileName = data.ImageFileName,
+            CommandLine = data.CommandLine,
+        });
+    }
+
+    private void AddImage(ImageLoadTraceData data, string kind)
+    {
+        Collector.Image.Add(new ImageRow
+        {
+            EventSequence = Collector.NextSeq(),
+            TimeStampQpc = data.TimeStampQPC,
+            Cpu = data.ProcessorNumber,
+            Kind = kind,
+            Pid = data.ProcessID,
+            ImageBase = (ulong)data.ImageBase,
+            ImageSize = data.ImageSize,
+            TimeDateStamp = data.TimeDateStamp,
+            FileName = data.FileName,
+        });
+    }
+
+    private void AddDiskIo(DiskIOTraceData data, string kind)
+    {
+        Collector.DiskIo.Add(new DiskIoRow
+        {
+            EventSequence = Collector.NextSeq(),
+            TimeStampQpc = data.TimeStampQPC,
+            Cpu = data.ProcessorNumber,
+            Kind = kind,
+            DiskNumber = data.DiskNumber,
+            ByteOffset = (ulong)data.ByteOffset,
+            TransferSize = data.TransferSize,
+            Pid = data.ProcessID,
+            FileName = data.FileName,
+            ElapsedMicros = (long)(data.ElapsedTimeMSec * 1000.0),
+        });
     }
 
     // ----- Generic TraceLogging -----

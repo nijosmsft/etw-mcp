@@ -147,6 +147,7 @@ catch (Exception ex)
 long parquetBytes = 0;
 long sysconfigBytes = 0;
 long manifestBytes = 0;
+var datasets = new List<DatasetEntry>();
 try
 {
     phase = "writing-parquet";
@@ -163,19 +164,50 @@ try
     if (req.PanicProbe == "manifest_write_panic")
         throw new InvalidOperationException("panic_probe=manifest_write_panic triggered");
 
-    var datasets = new List<DatasetEntry>
+    datasets.AddRange(new[]
     {
-        new("sampled_profile", "parquet", "sampled_profile.parquet", 1, runner.Collector.SampledProfile.Count, true),
-        new("cswitch",         "parquet", "cswitch.parquet",         1, runner.Collector.CSwitch.Count,         true),
-        new("readythread",     "parquet", "readythread.parquet",     1, runner.Collector.ReadyThread.Count,     true),
-        new("tcpip_recv",      "parquet", "tcpip_recv.parquet",      1, runner.Collector.TcpipRecv.Count,       true),
-        new("afd_recv",        "parquet", "afd_recv.parquet",        1, runner.Collector.AfdRecv.Count,         true),
-        new("ndis_drops",      "parquet", "ndis_drops.parquet",      1, runner.Collector.NdisDrops.Count,       true),
-        new("sysconfig",       "text",    "sysconfig.txt",           1, 1,                                       true),
-    };
+        new DatasetEntry("sampled_profile",  "parquet", "sampled_profile.parquet",  1, runner.Collector.SampledProfile.Count, true),
+        new DatasetEntry("cswitch_events",   "parquet", "cswitch_events.parquet",   1, runner.Collector.CSwitch.Count,        true),
+        new DatasetEntry("readythread",      "parquet", "readythread.parquet",      1, runner.Collector.ReadyThread.Count,    true),
+        new DatasetEntry("tcpip_recv",       "parquet", "tcpip_recv.parquet",       1, runner.Collector.TcpipRecv.Count,      true),
+        new DatasetEntry("tcpip_send",       "parquet", "tcpip_send.parquet",       1, runner.Collector.TcpipSend.Count,      false),
+        new DatasetEntry("tcpip_connect",    "parquet", "tcpip_connect.parquet",    1, runner.Collector.TcpipConnect.Count,   false),
+        new DatasetEntry("tcpip_accept",     "parquet", "tcpip_accept.parquet",     1, runner.Collector.TcpipAccept.Count,    false),
+        new DatasetEntry("tcpip_retransmit", "parquet", "tcpip_retransmit.parquet", 1, runner.Collector.TcpipRetransmit.Count, false),
+        new DatasetEntry("tcpip_disconnect", "parquet", "tcpip_disconnect.parquet", 1, runner.Collector.TcpipDisconnect.Count, false),
+        new DatasetEntry("udp_recv",         "parquet", "udp_recv.parquet",         1, runner.Collector.UdpRecv.Count,         false),
+        new DatasetEntry("udp_send",         "parquet", "udp_send.parquet",         1, runner.Collector.UdpSend.Count,         false),
+        new DatasetEntry("afd_recv",         "parquet", "afd_recv.parquet",         1, runner.Collector.AfdRecv.Count,         true),
+        new DatasetEntry("afd_send",         "parquet", "afd_send.parquet",         1, runner.Collector.AfdSend.Count,         false),
+        new DatasetEntry("afd_connect",      "parquet", "afd_connect.parquet",      1, runner.Collector.AfdConnect.Count,      false),
+        new DatasetEntry("afd_accept",       "parquet", "afd_accept.parquet",       1, runner.Collector.AfdAccept.Count,       false),
+        new DatasetEntry("afd_close",        "parquet", "afd_close.parquet",        1, runner.Collector.AfdClose.Count,        false),
+        new DatasetEntry("afd_bind",         "parquet", "afd_bind.parquet",         1, runner.Collector.AfdBind.Count,         false),
+        new DatasetEntry("ndis_drops",       "parquet", "ndis_drops.parquet",       1, runner.Collector.NdisDrops.Count,       true),
+        new DatasetEntry("packet_capture",   "parquet", "packet_capture.parquet",   1, runner.Collector.NdisPacketCapture.Count, false),
+        new DatasetEntry("http_recv",        "parquet", "http_recv.parquet",        1, runner.Collector.HttpRecv.Count,        false),
+        new DatasetEntry("http_deliver",     "parquet", "http_deliver.parquet",     1, runner.Collector.HttpDeliver.Count,     false),
+        new DatasetEntry("http_send",        "parquet", "http_send.parquet",        1, runner.Collector.HttpSend.Count,        false),
+        new DatasetEntry("http_close",       "parquet", "http_close.parquet",       1, runner.Collector.HttpClose.Count,       false),
+        new DatasetEntry("quic_conn_created","parquet", "quic_conn_created.parquet",1, runner.Collector.QuicConnCreated.Count, false),
+        new DatasetEntry("quic_conn_closed", "parquet", "quic_conn_closed.parquet", 1, runner.Collector.QuicConnClosed.Count,  false),
+        new DatasetEntry("quic_packet_recv", "parquet", "quic_packet_recv.parquet", 1, runner.Collector.QuicPacketRecv.Count,  false),
+        new DatasetEntry("quic_packet_send", "parquet", "quic_packet_send.parquet", 1, runner.Collector.QuicPacketSend.Count,  false),
+        new DatasetEntry("quic_ack_recv",    "parquet", "quic_ack_recv.parquet",    1, runner.Collector.QuicAckReceived.Count, false),
+        new DatasetEntry("sysconfig",        "text",    "sysconfig.txt",            1, 1,                                       true),
+    });
+    if (runner.Collector.Process.Count > 0)
+        datasets.Add(new("process", "parquet", "process.parquet", 1, runner.Collector.Process.Count, true));
+    if (runner.Collector.Image.Count > 0)
+        datasets.Add(new("image", "parquet", "image.parquet", 1, runner.Collector.Image.Count, true));
+    if (runner.Collector.DiskIo.Count > 0)
+        datasets.Add(new("diskio", "parquet", "diskio.parquet", 1, runner.Collector.DiskIo.Count, true));
+    if (runner.Collector.DpcIsr.Count > 0)
+        datasets.Add(new("dpc_isr", "parquet", "dpc_isr.parquet", 1, runner.Collector.DpcIsr.Count, true));
     if (req.IncludeTracelogging && runner.Collector.Tracelogging.Count > 0)
         datasets.Add(new("tracelogging_events", "parquet", "tracelogging_events.parquet", 1, runner.Collector.Tracelogging.Count, true));
-    manifestBytes = ManifestEmitter.WriteCacheManifest(req.StagingDir, req.EtlPath, req.Strategy, datasets, complete: true);
+    manifestBytes = ManifestEmitter.WriteCacheManifest(req.StagingDir, req.EtlPath, req.Strategy, datasets,
+        complete: true, runId: null, qpcOrigin: runner.QpcOrigin, perfFreq: runner.PerfFreq);
 }
 catch (Exception ex)
 {
@@ -193,7 +225,18 @@ catch (Exception ex)
 // ---- Emit success result ------------------------------------------------
 startTime.Stop();
 var wall = startTime.Elapsed.TotalSeconds;
-double eps = wall > 0 ? runner.Collector.EventsDecoded / wall : 0.0;
+// EventsDecoded only tracks manifest-routed events (kernel typed handlers
+// don't go through OnEvent). Compute the true total from the per-class
+// row counts so the eps metric is meaningful for kernel-heavy traces.
+long totalEvents = runner.Collector.EventsDecoded
+    + runner.Collector.SampledProfile.Count
+    + runner.Collector.CSwitch.Count
+    + runner.Collector.ReadyThread.Count
+    + runner.Collector.Process.Count
+    + runner.Collector.Image.Count
+    + runner.Collector.DiskIo.Count
+    + runner.Collector.DpcIsr.Count;
+double eps = wall > 0 ? totalEvents / wall : 0.0;
 double stackRate = runner.Collector.StackEligibleEvents > 0
     ? (double)runner.Collector.StacksPaired / runner.Collector.StackEligibleEvents
     : 0.0;
@@ -217,17 +260,41 @@ emit.Emit(new
     staging_dir = req.StagingDir,
     strategy = req.Strategy,
     manifest = "wpr-mcp-cache-manifest.json",
-    datasets = req.IncludeTracelogging && runner.Collector.Tracelogging.Count > 0
-        ? new[] { "sampled_profile", "cswitch", "readythread", "tcpip_recv", "afd_recv", "ndis_drops", "sysconfig", "tracelogging_events" }
-        : new[] { "sampled_profile", "cswitch", "readythread", "tcpip_recv", "afd_recv", "ndis_drops", "sysconfig" },
+    datasets = datasets.Select(d => d.Name).ToArray(),
     event_counts = new Dictionary<string, long>
     {
-        ["SampledProfile"] = runner.Collector.SampledProfile.Count,
-        ["CSwitch"] = runner.Collector.CSwitch.Count,
-        ["ReadyThread"] = runner.Collector.ReadyThread.Count,
-        ["TcpIp/Recv"] = runner.Collector.TcpipRecv.Count,
-        ["AFD/Recv"] = runner.Collector.AfdRecv.Count,
-        ["NdisDrop"] = runner.Collector.NdisDrops.Count,
+        ["SampledProfile"]    = runner.Collector.SampledProfile.Count,
+        ["CSwitch"]           = runner.Collector.CSwitch.Count,
+        ["ReadyThread"]       = runner.Collector.ReadyThread.Count,
+        ["TcpIp/Recv"]        = runner.Collector.TcpipRecv.Count,
+        ["TcpIp/Send"]        = runner.Collector.TcpipSend.Count,
+        ["TcpIp/Connect"]     = runner.Collector.TcpipConnect.Count,
+        ["TcpIp/Accept"]      = runner.Collector.TcpipAccept.Count,
+        ["TcpIp/Retransmit"]  = runner.Collector.TcpipRetransmit.Count,
+        ["TcpIp/Disconnect"]  = runner.Collector.TcpipDisconnect.Count,
+        ["UdpIp/Recv"]        = runner.Collector.UdpRecv.Count,
+        ["UdpIp/Send"]        = runner.Collector.UdpSend.Count,
+        ["AFD/Recv"]          = runner.Collector.AfdRecv.Count,
+        ["AFD/Send"]          = runner.Collector.AfdSend.Count,
+        ["AFD/Connect"]       = runner.Collector.AfdConnect.Count,
+        ["AFD/Accept"]        = runner.Collector.AfdAccept.Count,
+        ["AFD/Close"]         = runner.Collector.AfdClose.Count,
+        ["AFD/Bind"]          = runner.Collector.AfdBind.Count,
+        ["NdisDrop"]          = runner.Collector.NdisDrops.Count,
+        ["NdisPacketCapture"] = runner.Collector.NdisPacketCapture.Count,
+        ["HttpService/Recv"]    = runner.Collector.HttpRecv.Count,
+        ["HttpService/Deliver"] = runner.Collector.HttpDeliver.Count,
+        ["HttpService/Send"]    = runner.Collector.HttpSend.Count,
+        ["HttpService/Close"]   = runner.Collector.HttpClose.Count,
+        ["Quic/ConnectionCreated"] = runner.Collector.QuicConnCreated.Count,
+        ["Quic/ConnectionClosed"]  = runner.Collector.QuicConnClosed.Count,
+        ["Quic/PacketRecv"]        = runner.Collector.QuicPacketRecv.Count,
+        ["Quic/PacketSend"]        = runner.Collector.QuicPacketSend.Count,
+        ["Quic/AckReceived"]       = runner.Collector.QuicAckReceived.Count,
+        ["Process"]      = runner.Collector.Process.Count,
+        ["Image"]        = runner.Collector.Image.Count,
+        ["DiskIo"]       = runner.Collector.DiskIo.Count,
+        ["PerfInfo"]     = runner.Collector.DpcIsr.Count,
         ["SystemConfig"] = runner.Sysconfig.Nics.Count + runner.Sysconfig.Disks.Count + 1,
         ["TraceLogging"] = runner.Collector.Tracelogging.Count,
     },

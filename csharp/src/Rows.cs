@@ -43,6 +43,31 @@ internal sealed class ReadyThreadRow
     public List<ulong>? Stack;
 }
 
+/// <summary>
+/// Shared row shape for all TCP/UDP flow events (Recv/Send/Connect/Accept/
+/// Retransmit/UdpRecv/UdpSend). Python's <c>_DUMPER_EVENT_CLASSES</c> emits
+/// one parquet per (proto, opcode) but they share columns, so we share the
+/// row class and only differentiate by the destination buffer.
+/// Historical alias: also exposed via <see cref="TcpipRecvRow"/>.
+/// </summary>
+internal sealed class NetworkFlowRow
+{
+    public ulong EventSequence;
+    public long TimeStampQpc;
+    public int Cpu;
+    public string? ProcessName;
+    public long? Pid;
+    public long? ThreadId;
+    public string? LocalAddr;
+    public long? LocalPort;
+    public string? RemoteAddr;
+    public long? RemotePort;
+    public long? Size;
+    public ulong? SeqNo;
+    public ulong? ConnId;
+}
+
+// Alias used by the original spike handlers.
 internal sealed class TcpipRecvRow
 {
     public ulong EventSequence;
@@ -60,6 +85,24 @@ internal sealed class TcpipRecvRow
     public ulong? ConnId;
 }
 
+/// <summary>
+/// Shared row shape for AFD socket lifecycle events
+/// (Recv/Send/Connect/Accept/Close/Bind).
+/// </summary>
+internal sealed class AfdEventRow
+{
+    public ulong EventSequence;
+    public long TimeStampQpc;
+    public int Cpu;
+    public string? ProcessName;
+    public long? Pid;
+    public long? ThreadId;
+    public ulong? SocketHandle;
+    public long? Size;
+    public long? CompletionStatus;
+}
+
+// Alias used by the original spike handlers.
 internal sealed class AfdRecvRow
 {
     public ulong EventSequence;
@@ -84,6 +127,106 @@ internal sealed class NdisDropRow
     public string? MiniportName;
     public string? Reason;
     public long? Size;
+}
+
+/// <summary>NDIS PacketCapture decoded frame row.</summary>
+internal sealed class NdisPacketCaptureRow
+{
+    public ulong EventSequence;
+    public long TimeStampQpc;
+    public int Cpu;
+    public string? MiniportName;
+    public string? Direction;
+    public long? FragmentSize;
+    public byte[]? Fragment;
+}
+
+/// <summary>HTTP.sys request lifecycle row (Recv/Deliver/Send/Close share schema).</summary>
+internal sealed class HttpRow
+{
+    public ulong EventSequence;
+    public long TimeStampQpc;
+    public int Cpu;
+    public string? ProcessName;
+    public long? Pid;
+    public long? ThreadId;
+    public ulong? RequestId;
+    public ulong? ConnectionId;
+    public ulong? UrlGroupId;
+    public string? Url;
+    public string? Verb;
+    public long? Status;
+    public long? BytesSent;
+    public long? BytesReceived;
+}
+
+/// <summary>MsQuic connection / packet row.</summary>
+internal sealed class QuicRow
+{
+    public ulong EventSequence;
+    public long TimeStampQpc;
+    public int Cpu;
+    public string? ProcessName;
+    public long? Pid;
+    public long? ThreadId;
+    public ulong? ConnectionId;
+    public string? Cid;
+    public ulong? PacketNumber;
+    public long? PacketSize;
+    public long? AckDelayUs;
+}
+
+/// <summary>Process create/exit row.</summary>
+internal sealed class ProcessRow
+{
+    public ulong EventSequence;
+    public long TimeStampQpc;
+    public int Cpu;
+    public string Kind = ""; // "Start" | "End" | "DCStart" | "DCEnd"
+    public long Pid;
+    public long ParentPid;
+    public string? ImageFileName;
+    public string? CommandLine;
+}
+
+/// <summary>Image load / dcstart row (for symbol resolution downstream).</summary>
+internal sealed class ImageRow
+{
+    public ulong EventSequence;
+    public long TimeStampQpc;
+    public int Cpu;
+    public string Kind = ""; // "Load" | "DCStart"
+    public long Pid;
+    public ulong ImageBase;
+    public long ImageSize;
+    public long TimeDateStamp;
+    public string? FileName;
+}
+
+/// <summary>DiskIo row (read/write).</summary>
+internal sealed class DiskIoRow
+{
+    public ulong EventSequence;
+    public long TimeStampQpc;
+    public int Cpu;
+    public string Kind = ""; // "Read" | "Write" | "FlushBuffers"
+    public long? DiskNumber;
+    public ulong? ByteOffset;
+    public long? TransferSize;
+    public long? Pid;
+    public string? FileName;
+    public long? ElapsedMicros;
+}
+
+/// <summary>PerfInfo DPC/ISR event row.</summary>
+internal sealed class DpcIsrRow
+{
+    public ulong EventSequence;
+    public long TimeStampQpc;
+    public int Cpu;
+    public string Kind = ""; // "DPC" | "ISR" | "ThreadedDPC"
+    public ulong Routine;
+    public long ElapsedMicros;
 }
 
 internal sealed class TraceloggingRow

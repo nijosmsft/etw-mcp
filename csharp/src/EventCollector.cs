@@ -66,12 +66,54 @@ internal sealed class PendingStackBuffer
 /// </summary>
 internal sealed class EventCollector
 {
+    // Kernel + paired classes
     public readonly List<SampledProfileRow> SampledProfile = new(capacity: 1 << 16);
     public readonly List<CSwitchRow> CSwitch = new(capacity: 1 << 17);
     public readonly List<ReadyThreadRow> ReadyThread = new(capacity: 1 << 16);
+
+    // TCP/UDP flow buffers — share the NetworkFlowRow shape per Python's
+    // _DUMPER_EVENT_CLASSES contract.
     public readonly List<TcpipRecvRow> TcpipRecv = new();
+    public readonly List<NetworkFlowRow> TcpipSend = new();
+    public readonly List<NetworkFlowRow> TcpipConnect = new();
+    public readonly List<NetworkFlowRow> TcpipAccept = new();
+    public readonly List<NetworkFlowRow> TcpipRetransmit = new();
+    public readonly List<NetworkFlowRow> TcpipDisconnect = new();
+    public readonly List<NetworkFlowRow> UdpRecv = new();
+    public readonly List<NetworkFlowRow> UdpSend = new();
+
+    // AFD (Winsock) — share the AfdEventRow shape.
     public readonly List<AfdRecvRow> AfdRecv = new();
+    public readonly List<AfdEventRow> AfdSend = new();
+    public readonly List<AfdEventRow> AfdConnect = new();
+    public readonly List<AfdEventRow> AfdAccept = new();
+    public readonly List<AfdEventRow> AfdClose = new();
+    public readonly List<AfdEventRow> AfdBind = new();
+
+    // NDIS
     public readonly List<NdisDropRow> NdisDrops = new();
+    public readonly List<NdisPacketCaptureRow> NdisPacketCapture = new();
+
+    // HTTP.sys lifecycle
+    public readonly List<HttpRow> HttpRecv = new();
+    public readonly List<HttpRow> HttpDeliver = new();
+    public readonly List<HttpRow> HttpSend = new();
+    public readonly List<HttpRow> HttpClose = new();
+
+    // MsQuic
+    public readonly List<QuicRow> QuicConnCreated = new();
+    public readonly List<QuicRow> QuicConnClosed = new();
+    public readonly List<QuicRow> QuicPacketRecv = new();
+    public readonly List<QuicRow> QuicPacketSend = new();
+    public readonly List<QuicRow> QuicAckReceived = new();
+
+    // Kernel meta classes
+    public readonly List<ProcessRow> Process = new();
+    public readonly List<ImageRow> Image = new();
+    public readonly List<DiskIoRow> DiskIo = new();
+    public readonly List<DpcIsrRow> DpcIsr = new();
+
+    // Generic self-describing TraceLogging passthrough.
     public readonly List<TraceloggingRow> Tracelogging = new();
 
     public readonly PendingStackBuffer Pending = new();
