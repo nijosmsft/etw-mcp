@@ -87,7 +87,8 @@ internal sealed class ExtractRunner
         _wantProcess = Want("Process", "process");
         _wantImage = Want("Image/Load", "Image/DCStart", "image", "images");
         _wantDiskIo = Want("DiskIo", "diskio");
-        _wantDpcIsr = Want("PerfInfo", "PerfInfo/DPC", "PerfInfo/ISR", "dpcisr", "dpc_isr");
+        _wantDpcIsr = Want("PerfInfo", "PerfInfo/DPC", "PerfInfo/ThreadedDPC", "PerfInfo/TimerDPC", "PerfInfo/ISR",
+                            "dpcisr", "dpc_isr", "perfinfo_dpc", "perfinfo_threaded_dpc", "perfinfo_timer_dpc", "perfinfo_isr");
         _wantSysconfig = Want("SystemConfig", "sysconfig");
         _includeTracelogging = req.IncludeTracelogging;
         _panicCallback = req.PanicProbe == "callback_panic";
@@ -323,6 +324,15 @@ internal sealed class ExtractRunner
                 TimeStampQpc = data.TimeStampQPC,
                 Cpu = data.ProcessorNumber,
                 Kind = "ISR",
+                Routine = (ulong)data.Routine,
+                ElapsedMicros = (long)((data.ElapsedTimeMSec) * 1000.0),
+            }));
+            kernel.PerfInfoTimerDPC += (DPCTraceData data) => Wrap(() => Collector.DpcIsr.Add(new DpcIsrRow
+            {
+                EventSequence = Collector.NextSeq(),
+                TimeStampQpc = data.TimeStampQPC,
+                Cpu = data.ProcessorNumber,
+                Kind = "TimerDPC",
                 Routine = (ulong)data.Routine,
                 ElapsedMicros = (long)((data.ElapsedTimeMSec) * 1000.0),
             }));

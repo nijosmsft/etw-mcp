@@ -59,6 +59,16 @@ internal static class ParquetEmitter
         if (ec.Image.Count > 0)    total += await WriteImageAsync(ec.Image,     Path.Combine(stagingDir, "image.parquet"));
         if (ec.DiskIo.Count > 0)   total += await WriteDiskIoAsync(ec.DiskIo,   Path.Combine(stagingDir, "diskio.parquet"));
         if (ec.DpcIsr.Count > 0)   total += await WriteDpcIsrAsync(ec.DpcIsr,   Path.Combine(stagingDir, "dpc_isr.parquet"));
+        // Per-opcode PerfInfo parquets (Phase B). Always emit so Python aggregators
+        // can rely on stable filenames; the writer produces an empty parquet when
+        // the per-Kind filter is empty.
+        if (ec.DpcIsr.Count > 0)
+        {
+            total += await WriteDpcIsrByKindAsync(ec.DpcIsr, "DPC",         Path.Combine(stagingDir, "perfinfo_dpc.parquet"));
+            total += await WriteDpcIsrByKindAsync(ec.DpcIsr, "ThreadedDPC", Path.Combine(stagingDir, "perfinfo_threaded_dpc.parquet"));
+            total += await WriteDpcIsrByKindAsync(ec.DpcIsr, "TimerDPC",    Path.Combine(stagingDir, "perfinfo_timer_dpc.parquet"));
+            total += await WriteDpcIsrByKindAsync(ec.DpcIsr, "ISR",         Path.Combine(stagingDir, "perfinfo_isr.parquet"));
+        }
         if (ec.Tracelogging.Count > 0)
             total += await WriteTraceloggingAsync(ec.Tracelogging, Path.Combine(stagingDir, "tracelogging_events.parquet"));
         return total;
@@ -674,6 +684,36 @@ internal static class ParquetEmitter
             await rg.WriteColumnAsync(new DataColumn(fQpc, qpc));
             await rg.WriteColumnAsync(new DataColumn(fCpu, cpu));
             await rg.WriteColumnAsync(new DataColumn(fKind, kind));
+            await rg.WriteColumnAsync(new DataColumn(fRoutine, rt));
+            await rg.WriteColumnAsync(new DataColumn(fEla, ela));
+        });
+    }
+
+    /// <summary>
+    /// Per-opcode DPC/ISR parquet writer — filters a combined DpcIsr buffer by
+    /// the <c>Kind</c> discriminator. Schema matches <see cref="WriteDpcIsrAsync"/>
+    /// minus the <c>Kind</c> column (each file is a single opcode).
+    /// </summary>
+    internal static async Task<long> WriteDpcIsrByKindAsync(List<DpcIsrRow> rows, string kind, string path)
+    {
+        var fEventSeq = Df<ulong>("EventSequence", false);
+        var fQpc = Df<long>("TimeStampQpc", false);
+        var fCpu = Df<int>("CPU", false);
+        var fRoutine = Df<ulong>("Routine", false);
+        var fEla = Df<long>("ElapsedMicros", false);
+        var schema = new ParquetSchema(fEventSeq, fQpc, fCpu, fRoutine, fEla);
+        var filtered = new List<DpcIsrRow>(rows.Count);
+        for (int i = 0; i < rows.Count; i++)
+            if (string.Equals(rows[i].Kind, kind, StringComparison.Ordinal)) filtered.Add(rows[i]);
+        return await WriteRowGroupAsync(path, schema, async rg =>
+        {
+            int n = filtered.Count;
+            var es = new ulong[n]; var qpc = new long[n]; var cpu = new int[n];
+            var rt = new ulong[n]; var ela = new long[n];
+            for (int i = 0; i < n; i++) { var r = filtered[i]; es[i] = r.EventSequence; qpc[i] = r.TimeStampQpc; cpu[i] = r.Cpu; rt[i] = r.Routine; ela[i] = r.ElapsedMicros; }
+            await rg.WriteColumnAsync(new DataColumn(fEventSeq, es));
+            await rg.WriteColumnAsync(new DataColumn(fQpc, qpc));
+            await rg.WriteColumnAsync(new DataColumn(fCpu, cpu));
             await rg.WriteColumnAsync(new DataColumn(fRoutine, rt));
             await rg.WriteColumnAsync(new DataColumn(fEla, ela));
         });

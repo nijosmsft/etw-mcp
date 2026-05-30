@@ -229,7 +229,25 @@ try
         if (runner.Collector.DiskIo.Count > 0)
             datasets.Add(new("diskio", "parquet", "diskio.parquet", 1, runner.Collector.DiskIo.Count, true));
         if (runner.Collector.DpcIsr.Count > 0)
+        {
             datasets.Add(new("dpc_isr", "parquet", "dpc_isr.parquet", 1, runner.Collector.DpcIsr.Count, true));
+            // Phase B per-opcode PerfInfo parquets.
+            int nDpc = 0, nTdpc = 0, nTimDpc = 0, nIsr = 0;
+            foreach (var r in runner.Collector.DpcIsr)
+            {
+                switch (r.Kind)
+                {
+                    case "DPC": nDpc++; break;
+                    case "ThreadedDPC": nTdpc++; break;
+                    case "TimerDPC": nTimDpc++; break;
+                    case "ISR": nIsr++; break;
+                }
+            }
+            datasets.Add(new("perfinfo_dpc",          "parquet", "perfinfo_dpc.parquet",          1, nDpc,    false));
+            datasets.Add(new("perfinfo_threaded_dpc", "parquet", "perfinfo_threaded_dpc.parquet", 1, nTdpc,   false));
+            datasets.Add(new("perfinfo_timer_dpc",    "parquet", "perfinfo_timer_dpc.parquet",    1, nTimDpc, false));
+            datasets.Add(new("perfinfo_isr",          "parquet", "perfinfo_isr.parquet",          1, nIsr,    false));
+        }
         if (req.IncludeTracelogging && runner.Collector.Tracelogging.Count > 0)
             datasets.Add(new("tracelogging_events", "parquet", "tracelogging_events.parquet", 1, runner.Collector.Tracelogging.Count, true));
     }
