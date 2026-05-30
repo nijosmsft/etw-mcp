@@ -72,7 +72,7 @@ def test_emit_includes_event_and_named_fields(caplog: pytest.LogCaptureFixture):
 def test_emit_with_orders_mode_and_trace_id_first(caplog: pytest.LogCaptureFixture):
     caplog.set_level(logging.INFO, logger=telemetry.LOGGER_NAME)
     telemetry.emit_with(
-        telemetry.EVENT_CSHARP_RESULT,
+        telemetry.EVENT_DOTNET_RESULT,
         mode="dotnet",
         trace_id="trace_xyz",
         peak_rss_mb=2300.4,
@@ -191,7 +191,7 @@ def test_csharp_phase_telemetry_via_mocked_supervisor(
     """End-to-end-ish telemetry coverage for the dotnet pipeline using the
     mocked-sidecar pattern from ``test_csharp_worker_supervisor.py``.
 
-    Runs ``run_csharp_worker_extraction`` with a fake process_runner +
+    Runs ``run_dotnet_worker_extraction`` with a fake process_runner +
     aggregation_runner, then asserts the full event sequence:
 
         dotnet.spawn → dotnet.child_exit → dotnet.result → dotnet.cache_validate
@@ -221,7 +221,7 @@ def test_csharp_phase_telemetry_via_mocked_supervisor(
     # would raise ValueError before any telemetry fires).
     sidecar_stub = tmp_path / "wpr-mcp-extract.exe"
     sidecar_stub.write_bytes(b"stub")
-    monkeypatch.setattr(supervisor, "find_csharp_sidecar", lambda: sidecar_stub)
+    monkeypatch.setattr(supervisor, "find_dotnet_sidecar", lambda: sidecar_stub)
 
     def fake_runner(sidecar_path, request_path, **kwargs):
         # Locate the staging dir from the request file and seed it with the
@@ -265,7 +265,7 @@ def test_csharp_phase_telemetry_via_mocked_supervisor(
         )
 
     caplog.set_level(logging.INFO, logger=telemetry.LOGGER_NAME)
-    result = supervisor.run_csharp_worker_extraction(
+    result = supervisor.run_dotnet_worker_extraction(
         etl_path=etl,
         export_dir=export_dir,
         trace_id="trace_telemetry",
@@ -278,13 +278,13 @@ def test_csharp_phase_telemetry_via_mocked_supervisor(
 
     events = _events(caplog)
     expected = [
-        telemetry.EVENT_CSHARP_SPAWN,
-        telemetry.EVENT_CSHARP_CHILD_EXIT,
-        telemetry.EVENT_CSHARP_RESULT,
-        telemetry.EVENT_CSHARP_CACHE_VALIDATE,
-        telemetry.EVENT_CSHARP_AGGREGATION_START,
-        telemetry.EVENT_CSHARP_AGGREGATION_DONE,
-        telemetry.EVENT_CSHARP_CACHE_PROMOTE,
+        telemetry.EVENT_DOTNET_SPAWN,
+        telemetry.EVENT_DOTNET_CHILD_EXIT,
+        telemetry.EVENT_DOTNET_RESULT,
+        telemetry.EVENT_DOTNET_CACHE_VALIDATE,
+        telemetry.EVENT_DOTNET_AGGREGATION_START,
+        telemetry.EVENT_DOTNET_AGGREGATION_DONE,
+        telemetry.EVENT_DOTNET_CACHE_PROMOTE,
     ]
     for ev in expected:
         assert ev in events, f"missing {ev} in {events!r}"

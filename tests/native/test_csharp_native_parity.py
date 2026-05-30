@@ -17,7 +17,7 @@ The test silently skips unless **all** of:
 
 * ``--run-parity`` was passed on the command line, AND
 * the platform is Windows (``os.name == "nt"``), AND
-* ``find_csharp_sidecar()`` returns a binary (env var or PATH), AND
+* ``find_dotnet_sidecar()`` returns a binary (env var or PATH), AND
 * a real fixture ETL is reachable at ``WPR_MCP_CSHARP_E2E_FIXTURE`` or the
   default ``C:\\git\\wpr-mcp-poc-staging\\real-fixture\\spike-fixture.etl``.
 
@@ -251,11 +251,11 @@ def test_csharp_vs_native_row_count_parity_real_fixture(
     if os.name != "nt":
         pytest.skip("dotnet sidecar is Windows-only")
 
-    from etw_analyzer.native.config import find_csharp_sidecar
+    from etw_analyzer.native.config import find_dotnet_sidecar
 
-    if find_csharp_sidecar() is None:
+    if find_dotnet_sidecar() is None:
         pytest.skip(
-            "C# sidecar binary not locatable (set WPR_MCP_CSHARP_SIDECAR or "
+            "C# sidecar binary not locatable (set WPR_MCP_DOTNET_SIDECAR or "
             "place wpr-mcp-extract.exe on PATH)"
         )
 

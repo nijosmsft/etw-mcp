@@ -155,14 +155,14 @@ def _seed_csharp_staging(
 class TestNormalizeCsharpDataframe:
     def test_renames_timestampqpc_to_timestamp(self):
         df = pd.DataFrame({"TimeStampQpc": [1, 2], "CPU": [0, 1]})
-        result = adapters.normalize_csharp_dataframe(df)
+        result = adapters.normalize_dotnet_dataframe(df)
         assert "TimeStamp" in result.columns
         assert "TimeStampQpc" not in result.columns
         assert list(result["TimeStamp"]) == [1, 2]
 
     def test_noop_when_timestamp_already_present(self):
         df = pd.DataFrame({"TimeStamp": [3, 4], "TimeStampQpc": [9, 10]})
-        result = adapters.normalize_csharp_dataframe(df)
+        result = adapters.normalize_dotnet_dataframe(df)
         # Both columns survive; the existing TimeStamp wins.
         assert "TimeStamp" in result.columns
         assert "TimeStampQpc" in result.columns
@@ -170,15 +170,15 @@ class TestNormalizeCsharpDataframe:
 
     def test_noop_when_neither_column_present(self):
         df = pd.DataFrame({"X": [1]})
-        result = adapters.normalize_csharp_dataframe(df)
+        result = adapters.normalize_dotnet_dataframe(df)
         assert list(result.columns) == ["X"]
 
     def test_handles_none(self):
-        assert adapters.normalize_csharp_dataframe(None) is None
+        assert adapters.normalize_dotnet_dataframe(None) is None
 
     def test_handles_empty_dataframe(self):
         df = pd.DataFrame()
-        assert adapters.normalize_csharp_dataframe(df) is df
+        assert adapters.normalize_dotnet_dataframe(df) is df
 
 
 class TestDeriveMetadataFromSidecar:
@@ -240,7 +240,7 @@ class TestApplyMetadataToTrace:
             trace_id="t", etl_path=tmp_path / "x.etl",
             export_dir=tmp_path, raw_csv={},
         )
-        meta = adapters.CsharpMetadata(
+        meta = adapters.DotnetMetadata(
             cpu_count=16, duration_seconds=5.0, timestamp_frequency=10_000_000.0,
         )
         adapters.apply_metadata_to_trace(trace, meta)
@@ -257,7 +257,7 @@ class TestApplyMetadataToTrace:
             duration_seconds=42.0, cpu_count=2,
             timestamp_frequency=3_000_000.0,
         )
-        meta = adapters.CsharpMetadata(
+        meta = adapters.DotnetMetadata(
             cpu_count=16, duration_seconds=5.0, timestamp_frequency=10_000_000.0,
         )
         adapters.apply_metadata_to_trace(trace, meta)
@@ -268,7 +268,7 @@ class TestApplyMetadataToTrace:
 
 class TestBuildTraceMetadataDataframe:
     def test_columns_match_native_schema(self):
-        meta = adapters.CsharpMetadata(
+        meta = adapters.DotnetMetadata(
             cpu_count=8, duration_seconds=1.5, timestamp_frequency=10_000_000.0,
         )
         manifest = native_cache.CacheManifest(

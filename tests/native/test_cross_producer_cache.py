@@ -268,7 +268,7 @@ def test_csharp_e2e_against_real_fixture_rehydrates_from_cache(tmp_path: Path):
     Only runs when:
       * ``WPR_MCP_CSHARP_E2E_FIXTURE`` (or the default real-fixture path)
         points at an existing ETL, AND
-      * ``find_csharp_sidecar`` returns a binary, AND
+      * ``find_dotnet_sidecar`` returns a binary, AND
       * the platform is Windows.
 
     This test is intentionally light — it exercises only the "load,
@@ -280,9 +280,9 @@ def test_csharp_e2e_against_real_fixture_rehydrates_from_cache(tmp_path: Path):
     if os.name != "nt":
         pytest.skip("dotnet sidecar is Windows-only")
 
-    from etw_analyzer.native.config import find_csharp_sidecar
+    from etw_analyzer.native.config import find_dotnet_sidecar
 
-    if find_csharp_sidecar() is None:
+    if find_dotnet_sidecar() is None:
         pytest.skip(".NET sidecar binary not locatable")
 
     fixture = _resolve_real_fixture()
@@ -291,12 +291,12 @@ def test_csharp_e2e_against_real_fixture_rehydrates_from_cache(tmp_path: Path):
     # Stage the load into a private tree so we don't disturb the shared
     # .etw-export-* directory beside the fixture.
     from etw_analyzer.native.worker_supervisor import (
-        run_csharp_worker_extraction,
+        run_dotnet_worker_extraction,
     )
     import etw_analyzer.tools.trace_mgmt as trace_mgmt
 
     export_dir = tmp_path / ".etw-export-spike-fixture"
-    result = run_csharp_worker_extraction(
+    result = run_dotnet_worker_extraction(
         etl_path=fixture,
         export_dir=export_dir,
         trace_id="trace_e2e_smoke",

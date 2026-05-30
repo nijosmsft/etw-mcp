@@ -12,7 +12,7 @@ mcp = FastMCP(
         "the returned `trace_id`. There is no current-trace state -- pass the id "
         "explicitly on each call so multiple traces can be analyzed in parallel. "
         "`load_trace` walks the fallback chain dotnet -> native -> xperf. The "
-        ".NET sidecar wins when `WPR_MCP_CSHARP_SIDECAR` is set or "
+        ".NET sidecar wins when `WPR_MCP_DOTNET_SIDECAR` is set or "
         "`wpr-mcp-extract.exe` is on PATH; force a single backend with "
         "`mode='dotnet'|'native'|'xperf'` or the `WPR_MCP_MODE` env var.\n"
         "\n"

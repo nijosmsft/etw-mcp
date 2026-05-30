@@ -1,17 +1,17 @@
-from etw_analyzer.native.worker_supervisor import run_csharp_worker_extraction
+from etw_analyzer.native.worker_supervisor import run_dotnet_worker_extraction
 from etw_analyzer.native import cache as native_cache
-from etw_analyzer.native.config import find_csharp_sidecar
+from etw_analyzer.native.config import find_dotnet_sidecar
 from pathlib import Path
 import time
 
 etl = Path(r'C:\git\wpr-mcp-poc-staging\real-fixture\spike-fixture.etl')
 export_dir = Path(r'C:\Temp\etw-export-csharp-smoke')
 
-print('SIDECAR_PATH=' + str(find_csharp_sidecar()))
+print('SIDECAR_PATH=' + str(find_dotnet_sidecar()))
 print('ETL_SIZE_MB=' + str(etl.stat().st_size / (1024*1024)))
 
 start = time.monotonic()
-r = run_csharp_worker_extraction(
+r = run_dotnet_worker_extraction(
     etl_path=etl,
     export_dir=export_dir,
     trace_id='trace_smoke_csharp',

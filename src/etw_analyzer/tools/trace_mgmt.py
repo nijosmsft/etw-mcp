@@ -90,7 +90,7 @@ def load_trace(
         mode: Pipeline used to load the trace.
               ``"auto"`` (default — Phase N5) walks the documented
               fallback chain ``dotnet → native → xperf``: the .NET sidecar
-              when the ``WPR_MCP_CSHARP_SIDECAR`` env var is set (or
+              when the ``WPR_MCP_DOTNET_SIDECAR`` env var is set (or
               ``wpr-mcp-extract.exe`` is on PATH), then the in-process
               ``OpenTraceW`` consumer when its bindings load, then the
               legacy text-based ``xperf -a dumper`` as the universal
@@ -143,13 +143,13 @@ def load_trace(
     # silently falling back to xperf, so they know to flip to
     # ``mode="xperf"`` or ``mode="auto"``.
     from etw_analyzer.native.config import (
-        _csharp_was_forced,
+        _dotnet_was_forced,
         _native_was_forced,
         apply_native_size_guardrail,
         resolve_mode,
     )
     try:
-        csharp_was_forced = _csharp_was_forced(mode)
+        dotnet_was_forced = _dotnet_was_forced(mode)
         native_was_forced = _native_was_forced(mode)
         resolved_mode = resolve_mode(mode, etl_path=path)
         resolved_mode, guardrail_notice = apply_native_size_guardrail(
@@ -197,7 +197,7 @@ def load_trace(
             "  - Pass mode='native' (or set WPR_MCP_MODE=native) to use the "
             "in-process ETW consumer when its bindings load on this host.\n"
             "  - Build the .NET sidecar (cd dotnet && dotnet publish -c Release "
-            "-r win-x64 --self-contained), set WPR_MCP_CSHARP_SIDECAR to the "
+            "-r win-x64 --self-contained), set WPR_MCP_DOTNET_SIDECAR to the "
             "published wpr-mcp-extract.exe path, and pass mode='dotnet' (or "
             "set WPR_MCP_MODE=dotnet)."
         )
@@ -245,7 +245,7 @@ def load_trace(
             trace_id=make_trace_id(path),
             dispatch="dotnet_worker",
         )
-        worker_result = _load_csharp_with_worker(
+        worker_result = _load_dotnet_with_worker(
             path,
             export_dir,
             sym_path,
@@ -281,7 +281,7 @@ def load_trace(
             except Exception:
                 pass
 
-        if csharp_was_forced:
+        if dotnet_was_forced:
             return _native_worker_load_failed(worker_result, producer="dotnet")
 
         # Auto-resolved dotnet failed; fall back along the documented
@@ -650,21 +650,21 @@ def _load_native_with_worker(
     )
 
 
-def _load_csharp_with_worker(
+def _load_dotnet_with_worker(
     path: Path,
     export_dir: Path,
     sym_path: str | None,
 ):
-    """Dispatch to the C# sidecar via worker_supervisor.run_csharp_worker_extraction.
+    """Dispatch to the C# sidecar via worker_supervisor.run_dotnet_worker_extraction.
 
     Returns a ``NativeWorkerResult`` whose ``ok`` field signals success.
     The supervisor handles staging, validation, aggregation, and atomic
     promotion. On failure the staging directory is preserved for debugging
     per the spike contract.
     """
-    from etw_analyzer.native.worker_supervisor import run_csharp_worker_extraction
+    from etw_analyzer.native.worker_supervisor import run_dotnet_worker_extraction
 
-    return run_csharp_worker_extraction(
+    return run_dotnet_worker_extraction(
         etl_path=path,
         export_dir=export_dir,
         trace_id=make_trace_id(path),
@@ -701,7 +701,7 @@ def _native_worker_load_failed(worker_result, *, producer: str = "native") -> st
             rebuild_hint = (
                 "\n\nThe sidecar binary may be a stale build. Rebuild with "
                 "`cd dotnet && dotnet publish -c Release -r win-x64 "
-                "--self-contained` and retry. If WPR_MCP_CSHARP_SIDECAR "
+                "--self-contained` and retry. If WPR_MCP_DOTNET_SIDECAR "
                 "points at an old install, update it to the newly-published "
                 "wpr-mcp-extract.exe."
             )

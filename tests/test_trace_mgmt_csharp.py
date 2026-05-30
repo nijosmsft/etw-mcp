@@ -1,7 +1,7 @@
 """Integration tests for load_trace dispatch into the C# sidecar path.
 
 Mirrors tests/test_trace_mgmt_worker.py for the native worker. Stubs the
-sidecar supervisor (worker_supervisor.run_csharp_worker_extraction) and
+sidecar supervisor (worker_supervisor.run_dotnet_worker_extraction) and
 asserts that load_trace correctly:
 
 * dispatches to the csharp worker when ``mode="dotnet"`` (or
@@ -116,10 +116,10 @@ def test_load_trace_csharp_worker_success_loads_promoted_cache(
     export_dir = etl.parent / f".etw-export-{etl.stem}"
 
     monkeypatch.setenv(
-        native_config.CSHARP_SIDECAR_ENV,
+        native_config.DOTNET_SIDECAR_ENV,
         str(_fake_csharp_sidecar_path(tmp_path)),
     )
-    native_config.reset_csharp_cache()
+    native_config.reset_dotnet_cache()
     monkeypatch.setattr(trace_mgmt, "find_xperf", lambda: None)
 
     def fake_worker(**kwargs):
@@ -133,7 +133,7 @@ def test_load_trace_csharp_worker_success_loads_promoted_cache(
         )
 
     monkeypatch.setattr(
-        worker_supervisor, "run_csharp_worker_extraction", fake_worker
+        worker_supervisor, "run_dotnet_worker_extraction", fake_worker
     )
 
     result = trace_mgmt.load_trace(str(etl), mode="dotnet")
@@ -152,10 +152,10 @@ def test_load_trace_auto_picks_csharp_when_sidecar_is_configured(
     export_dir = etl.parent / f".etw-export-{etl.stem}"
 
     monkeypatch.setenv(
-        native_config.CSHARP_SIDECAR_ENV,
+        native_config.DOTNET_SIDECAR_ENV,
         str(_fake_csharp_sidecar_path(tmp_path)),
     )
-    native_config.reset_csharp_cache()
+    native_config.reset_dotnet_cache()
     monkeypatch.delenv("WPR_MCP_MODE", raising=False)
     monkeypatch.setattr(trace_mgmt, "find_xperf", lambda: None)
 
@@ -173,7 +173,7 @@ def test_load_trace_auto_picks_csharp_when_sidecar_is_configured(
         )
 
     monkeypatch.setattr(
-        worker_supervisor, "run_csharp_worker_extraction", fake_worker
+        worker_supervisor, "run_dotnet_worker_extraction", fake_worker
     )
     monkeypatch.setattr(
         worker_supervisor, "run_native_worker_extraction", refuse_native
@@ -194,10 +194,10 @@ def test_auto_csharp_failure_falls_back_to_native_worker(
     export_dir = etl.parent / f".etw-export-{etl.stem}"
 
     monkeypatch.setenv(
-        native_config.CSHARP_SIDECAR_ENV,
+        native_config.DOTNET_SIDECAR_ENV,
         str(_fake_csharp_sidecar_path(tmp_path)),
     )
-    native_config.reset_csharp_cache()
+    native_config.reset_dotnet_cache()
     monkeypatch.delenv("WPR_MCP_MODE", raising=False)
     monkeypatch.setenv(worker_supervisor.NATIVE_WORKER_ENV, "1")
     monkeypatch.setattr(native_config, "_etl_size_mb", lambda etl_path: 0.1)
@@ -243,7 +243,7 @@ def test_auto_csharp_failure_falls_back_to_native_worker(
         )
 
     monkeypatch.setattr(
-        worker_supervisor, "run_csharp_worker_extraction", fail_csharp
+        worker_supervisor, "run_dotnet_worker_extraction", fail_csharp
     )
     monkeypatch.setattr(
         worker_supervisor, "run_native_worker_extraction", fake_native
@@ -265,10 +265,10 @@ def test_explicit_csharp_failure_does_not_fallback_or_register(
     etl = _make_etl(tmp_path)
 
     monkeypatch.setenv(
-        native_config.CSHARP_SIDECAR_ENV,
+        native_config.DOTNET_SIDECAR_ENV,
         str(_fake_csharp_sidecar_path(tmp_path)),
     )
-    native_config.reset_csharp_cache()
+    native_config.reset_dotnet_cache()
     monkeypatch.setattr(trace_mgmt, "find_xperf", lambda: Path(r"C:\fake\xperf.exe"))
 
     def fail_csharp(**kwargs):
@@ -280,7 +280,7 @@ def test_explicit_csharp_failure_does_not_fallback_or_register(
         )
 
     monkeypatch.setattr(
-        worker_supervisor, "run_csharp_worker_extraction", fail_csharp
+        worker_supervisor, "run_dotnet_worker_extraction", fail_csharp
     )
     monkeypatch.setattr(
         worker_supervisor,

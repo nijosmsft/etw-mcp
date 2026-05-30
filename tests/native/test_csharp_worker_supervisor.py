@@ -80,7 +80,7 @@ def _seed_sidecar_outputs(staging_dir: Path, etl: Path) -> None:
 def test_build_csharp_request_matches_contract(tmp_path: Path):
     etl = _make_etl(tmp_path)
     staging = tmp_path / "staging"
-    req = worker_supervisor.build_csharp_request(
+    req = worker_supervisor.build_dotnet_request(
         trace_id="trace_abc",
         etl_path=etl,
         staging_dir=staging,
@@ -101,7 +101,7 @@ def test_build_csharp_request_matches_contract(tmp_path: Path):
 
 
 def test_build_csharp_request_dedupes_event_classes(tmp_path: Path):
-    req = worker_supervisor.build_csharp_request(
+    req = worker_supervisor.build_dotnet_request(
         trace_id="t",
         etl_path=_make_etl(tmp_path),
         staging_dir=tmp_path / "s",
@@ -113,7 +113,7 @@ def test_build_csharp_request_dedupes_event_classes(tmp_path: Path):
 def test_build_csharp_command_uses_only_request_flag(tmp_path: Path):
     sidecar = _fake_sidecar(tmp_path)
     req = tmp_path / "request.json"
-    cmd = worker_supervisor.build_csharp_command(sidecar, req)
+    cmd = worker_supervisor.build_dotnet_command(sidecar, req)
     assert cmd == [str(sidecar), "--request", str(req)]
 
 
@@ -144,7 +144,7 @@ def test_run_csharp_worker_success_promotes_to_export_dir(
                     "producer": "dotnet"},
         )
 
-    result = worker_supervisor.run_csharp_worker_extraction(
+    result = worker_supervisor.run_dotnet_worker_extraction(
         etl_path=etl,
         export_dir=export_dir,
         trace_id=trace_id,
@@ -183,7 +183,7 @@ def test_run_csharp_worker_sidecar_failure_leaves_staging_for_debug(
             failure_kind="dotnet_exception",
         )
 
-    result = worker_supervisor.run_csharp_worker_extraction(
+    result = worker_supervisor.run_dotnet_worker_extraction(
         etl_path=etl,
         export_dir=export_dir,
         trace_id="trace_csharp_fail",
@@ -202,15 +202,15 @@ def test_run_csharp_worker_sidecar_failure_leaves_staging_for_debug(
 def test_run_csharp_worker_missing_binary_raises(tmp_path: Path, monkeypatch):
     # Pin env var to a path that doesn't exist. Because env_override is
     # exclusive, the in-tree publish path won't be consulted, so
-    # find_csharp_sidecar returns None and the supervisor raises.
+    # find_dotnet_sidecar returns None and the supervisor raises.
     monkeypatch.setenv(
-        config.CSHARP_SIDECAR_ENV,
+        config.DOTNET_SIDECAR_ENV,
         str(tmp_path / "does-not-exist.exe"),
     )
-    config.reset_csharp_cache()
+    config.reset_dotnet_cache()
 
-    with pytest.raises(ValueError, match=config.CSHARP_SIDECAR_ENV):
-        worker_supervisor.run_csharp_worker_extraction(
+    with pytest.raises(ValueError, match=config.DOTNET_SIDECAR_ENV):
+        worker_supervisor.run_dotnet_worker_extraction(
             etl_path=_make_etl(tmp_path),
             export_dir=tmp_path / ".etw-export-x",
             trace_id="t",
@@ -236,7 +236,7 @@ def test_run_csharp_worker_invalid_manifest_returns_invalid_cache(tmp_path: Path
             result={"type": "result", "ok": True, "trace_id": "t"},
         )
 
-    result = worker_supervisor.run_csharp_worker_extraction(
+    result = worker_supervisor.run_dotnet_worker_extraction(
         etl_path=etl,
         export_dir=export_dir,
         trace_id="t",
@@ -272,7 +272,7 @@ def test_run_csharp_worker_aggregation_failure_returns_aggregation_kind(
             staging_dir=Path("/dev/null"),
         )
 
-    result = worker_supervisor.run_csharp_worker_extraction(
+    result = worker_supervisor.run_dotnet_worker_extraction(
         etl_path=etl,
         export_dir=export_dir,
         trace_id="t",
@@ -336,7 +336,7 @@ def test_run_csharp_process_parses_heartbeat_progress_result(tmp_path: Path):
             ],
         )
 
-    result = worker_supervisor.run_csharp_process(
+    result = worker_supervisor.run_dotnet_process(
         sidecar,
         request_path,
         popen_factory=fake_popen,
@@ -363,7 +363,7 @@ def test_run_csharp_process_structured_failure_surfaces_kind(tmp_path: Path):
             returncode=1,
         )
 
-    result = worker_supervisor.run_csharp_process(
+    result = worker_supervisor.run_dotnet_process(
         sidecar,
         request_path,
         popen_factory=fake_popen,
@@ -381,7 +381,7 @@ def test_run_csharp_process_no_result_treated_as_crash(tmp_path: Path):
     def fake_popen(command, **_):
         return _FakeProcess(stdout_lines=[], returncode=2)
 
-    result = worker_supervisor.run_csharp_process(
+    result = worker_supervisor.run_dotnet_process(
         sidecar,
         request_path,
         popen_factory=fake_popen,

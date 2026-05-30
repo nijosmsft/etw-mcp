@@ -281,7 +281,7 @@ def _seed_phase_b_staging(
 class TestAdaptCsharpDpcDataframe:
     def test_renames_timestampqpc_to_timestamp(self):
         df = _make_perfinfo_dpc(rows=3)
-        result = adapters.adapt_csharp_dpc_dataframe(df)
+        result = adapters.adapt_dotnet_dpc_dataframe(df)
         assert "TimeStamp" in result.columns
         assert "TimeStampQpc" not in result.columns
 
@@ -289,7 +289,7 @@ class TestAdaptCsharpDpcDataframe:
         df = _make_perfinfo_dpc(rows=5)
         # Elapsed at 10 MHz QPC is ElapsedMicros * 10 ticks; InitialTime
         # must therefore equal TimeStamp - ElapsedMicros * 10.
-        result = adapters.adapt_csharp_dpc_dataframe(df, perf_freq_hz=10_000_000.0)
+        result = adapters.adapt_dotnet_dpc_dataframe(df, perf_freq_hz=10_000_000.0)
         assert "InitialTime" in result.columns
         for i in range(5):
             ts = int(result["TimeStamp"].iloc[i])
@@ -297,16 +297,16 @@ class TestAdaptCsharpDpcDataframe:
             assert int(result["InitialTime"].iloc[i]) == ts - elapsed_us * 10
 
     def test_handles_none(self):
-        assert adapters.adapt_csharp_dpc_dataframe(None) is None
+        assert adapters.adapt_dotnet_dpc_dataframe(None) is None
 
     def test_handles_empty(self):
         df = pd.DataFrame()
-        out = adapters.adapt_csharp_dpc_dataframe(df)
+        out = adapters.adapt_dotnet_dpc_dataframe(df)
         assert out is df
 
     def test_preserves_routine_column(self):
         df = _make_perfinfo_dpc(rows=3, routine=0xFFFFF800_DEADBEEF)
-        out = adapters.adapt_csharp_dpc_dataframe(df)
+        out = adapters.adapt_dotnet_dpc_dataframe(df)
         assert "Routine" in out.columns
         assert int(out["Routine"].iloc[0]) == 0xFFFFF800_DEADBEEF
 
@@ -316,7 +316,7 @@ class TestAdaptCsharpDpcDataframe:
             "CPU": [0, 1],
             "Routine": [100, 200],
         })
-        out = adapters.adapt_csharp_dpc_dataframe(df)
+        out = adapters.adapt_dotnet_dpc_dataframe(df)
         assert "TimeStamp" in out.columns
         assert "InitialTime" not in out.columns
 
@@ -485,38 +485,38 @@ class _DpcStubSymbolizer:
 class TestAdaptCsharpProcessDataframe:
     def test_renames_pid_to_processid(self):
         df = _make_process_dcstart(rows=3)
-        out = adapters.adapt_csharp_process_dataframe(df)
+        out = adapters.adapt_dotnet_process_dataframe(df)
         assert "ProcessId" in out.columns
         assert "PID" not in out.columns
 
     def test_renames_parentpid_to_parentid(self):
         df = _make_process_dcstart(rows=3)
-        out = adapters.adapt_csharp_process_dataframe(df)
+        out = adapters.adapt_dotnet_process_dataframe(df)
         assert "ParentId" in out.columns
         assert "ParentPID" not in out.columns
 
     def test_synthesises_sessionid_zero(self):
         df = _make_process_dcstart(rows=3)
-        out = adapters.adapt_csharp_process_dataframe(df)
+        out = adapters.adapt_dotnet_process_dataframe(df)
         assert "SessionId" in out.columns
         assert (out["SessionId"] == 0).all()
 
     def test_renames_timestampqpc_to_timestamp(self):
         df = _make_process_dcstart(rows=3)
-        out = adapters.adapt_csharp_process_dataframe(df)
+        out = adapters.adapt_dotnet_process_dataframe(df)
         assert "TimeStamp" in out.columns
         assert "TimeStampQpc" not in out.columns
 
     def test_preserves_image_and_command(self):
         df = _make_process_dcstart(rows=3)
-        out = adapters.adapt_csharp_process_dataframe(df)
+        out = adapters.adapt_dotnet_process_dataframe(df)
         assert out["ImageFileName"].iloc[0] == "proc_0.exe"
         assert out["CommandLine"].iloc[1] == "proc_1.exe --foo"
 
     def test_handles_none_and_empty(self):
-        assert adapters.adapt_csharp_process_dataframe(None) is None
+        assert adapters.adapt_dotnet_process_dataframe(None) is None
         empty = pd.DataFrame()
-        out = adapters.adapt_csharp_process_dataframe(empty)
+        out = adapters.adapt_dotnet_process_dataframe(empty)
         assert out is empty
 
     def test_idempotent_when_already_native_shape(self):
@@ -528,7 +528,7 @@ class TestAdaptCsharpProcessDataframe:
             "ImageFileName": ["x.exe"],
             "CommandLine": ["x"],
         })
-        out = adapters.adapt_csharp_process_dataframe(df)
+        out = adapters.adapt_dotnet_process_dataframe(df)
         # Already-native shape: SessionId preserved (not overwritten).
         assert out["SessionId"].iloc[0] == 1
 
@@ -551,33 +551,33 @@ def _make_thread_dcstart(rows: int = 5) -> pd.DataFrame:
 class TestAdaptCsharpThreadDataframe:
     def test_renames_pid_to_processid(self):
         df = _make_thread_dcstart(rows=3)
-        out = adapters.adapt_csharp_thread_dataframe(df)
+        out = adapters.adapt_dotnet_thread_dataframe(df)
         assert "ProcessId" in out.columns
         assert "PID" not in out.columns
 
     def test_renames_tid_to_threadid(self):
         df = _make_thread_dcstart(rows=3)
-        out = adapters.adapt_csharp_thread_dataframe(df)
+        out = adapters.adapt_dotnet_thread_dataframe(df)
         assert "ThreadId" in out.columns
         assert "TID" not in out.columns
 
     def test_renames_timestampqpc_to_timestamp(self):
         df = _make_thread_dcstart(rows=3)
-        out = adapters.adapt_csharp_thread_dataframe(df)
+        out = adapters.adapt_dotnet_thread_dataframe(df)
         assert "TimeStamp" in out.columns
         assert "TimeStampQpc" not in out.columns
 
     def test_preserves_thread_metadata(self):
         df = _make_thread_dcstart(rows=3)
-        out = adapters.adapt_csharp_thread_dataframe(df)
+        out = adapters.adapt_dotnet_thread_dataframe(df)
         assert out["ProcessId"].tolist() == [1000, 1001, 1002]
         assert out["ThreadId"].tolist() == [4000, 4001, 4002]
         assert out["ImageFileName"].iloc[0] == "proc_0.exe"
 
     def test_handles_none_and_empty(self):
-        assert adapters.adapt_csharp_thread_dataframe(None) is None
+        assert adapters.adapt_dotnet_thread_dataframe(None) is None
         empty = pd.DataFrame()
-        out = adapters.adapt_csharp_thread_dataframe(empty)
+        out = adapters.adapt_dotnet_thread_dataframe(empty)
         assert out is empty
 
     def test_idempotent_when_already_native_shape(self):
@@ -586,7 +586,7 @@ class TestAdaptCsharpThreadDataframe:
             "ProcessId": [42],
             "ThreadId": [200],
         })
-        out = adapters.adapt_csharp_thread_dataframe(df)
+        out = adapters.adapt_dotnet_thread_dataframe(df)
         assert "ProcessId" in out.columns
         assert "ThreadId" in out.columns
         assert "TimeStamp" in out.columns
@@ -609,19 +609,19 @@ class TestAdaptCsharpThreadDataframe:
 class TestAdaptCsharpSampledProfileDataframe:
     def test_renames_processid_to_pid(self):
         df = _make_sampled_profile(rows=4)
-        out = adapters.adapt_csharp_sampled_profile_dataframe(df)
+        out = adapters.adapt_dotnet_sampled_profile_dataframe(df)
         assert "PID" in out.columns
         assert "ProcessId" not in out.columns
 
     def test_renames_timestampqpc_to_timestamp(self):
         df = _make_sampled_profile(rows=4)
-        out = adapters.adapt_csharp_sampled_profile_dataframe(df)
+        out = adapters.adapt_dotnet_sampled_profile_dataframe(df)
         assert "TimeStamp" in out.columns
         assert "TimeStampQpc" not in out.columns
 
     def test_preserves_payload_thread_id_and_other_columns(self):
         df = _make_sampled_profile(rows=4)
-        out = adapters.adapt_csharp_sampled_profile_dataframe(df)
+        out = adapters.adapt_dotnet_sampled_profile_dataframe(df)
         # ThreadId / PayloadThreadId must NOT be renamed — the
         # SampledProfile MOF shape uses these exact names natively.
         assert "PayloadThreadId" in out.columns
@@ -633,9 +633,9 @@ class TestAdaptCsharpSampledProfileDataframe:
         assert "ProfileWeight" in out.columns
 
     def test_handles_none_and_empty(self):
-        assert adapters.adapt_csharp_sampled_profile_dataframe(None) is None
+        assert adapters.adapt_dotnet_sampled_profile_dataframe(None) is None
         empty = pd.DataFrame()
-        out = adapters.adapt_csharp_sampled_profile_dataframe(empty)
+        out = adapters.adapt_dotnet_sampled_profile_dataframe(empty)
         assert out is empty
 
     def test_idempotent_when_already_native_shape(self):
@@ -649,7 +649,7 @@ class TestAdaptCsharpSampledProfileDataframe:
             "ProfileWeight": [1, 1, 1],
             "Stack": [[], [], []],
         })
-        out = adapters.adapt_csharp_sampled_profile_dataframe(df)
+        out = adapters.adapt_dotnet_sampled_profile_dataframe(df)
         # Already-native shape: PID preserved (no double-rename).
         assert "PID" in out.columns
         assert out["PID"].iloc[0] == 1234
@@ -709,7 +709,7 @@ class TestPhaseBThreadLoader:
 class TestPhaseBSampledProfileAttribution:
     """Regression test for the column rename that drives Process Name lookup.
 
-    Without ``adapt_csharp_sampled_profile_dataframe`` running on the
+    Without ``adapt_dotnet_sampled_profile_dataframe`` running on the
     SampledProfile DataFrame, every cpu_sampling row collapses into
     ``Process Name='unknown', PID=0`` on multi-process traces. See
     ``manager-log/sampledprofile-attribution-finding.md``.
@@ -846,16 +846,16 @@ class TestAdaptCsharpDiskioDataframe:
             "DiskNumber": [0, 0],
             "TransferSize": [4096, 8192],
         })
-        out = adapters.adapt_csharp_diskio_dataframe(df)
+        out = adapters.adapt_dotnet_diskio_dataframe(df)
         assert "TimeStamp" in out.columns
         assert "TimeStampQpc" not in out.columns
 
     def test_handles_none(self):
-        assert adapters.adapt_csharp_diskio_dataframe(None) is None
+        assert adapters.adapt_dotnet_diskio_dataframe(None) is None
 
     def test_handles_empty(self):
         empty = pd.DataFrame()
-        assert adapters.adapt_csharp_diskio_dataframe(empty) is empty
+        assert adapters.adapt_dotnet_diskio_dataframe(empty) is empty
 
     def test_preserves_disknumber_and_transfersize(self):
         df = pd.DataFrame({
@@ -863,7 +863,7 @@ class TestAdaptCsharpDiskioDataframe:
             "DiskNumber": [0, 1, 0],
             "TransferSize": [4096, 8192, 0],
         })
-        out = adapters.adapt_csharp_diskio_dataframe(df)
+        out = adapters.adapt_dotnet_diskio_dataframe(df)
         assert list(out["DiskNumber"]) == [0, 1, 0]
         assert list(out["TransferSize"]) == [4096, 8192, 0]
 
@@ -935,21 +935,21 @@ class TestPhaseBDiskio:
 class TestAdaptCsharpImageDataframe:
     def test_renames_timestampqpc_to_timestamp(self):
         df = _make_image_dcstart(rows=2)
-        out = adapters.adapt_csharp_image_dataframe(df)
+        out = adapters.adapt_dotnet_image_dataframe(df)
         assert "TimeStamp" in out.columns
         assert "TimeStampQpc" not in out.columns
 
     def test_preserves_imagebase_imagesize_filename(self):
         df = _make_image_dcstart(rows=2)
-        out = adapters.adapt_csharp_image_dataframe(df)
+        out = adapters.adapt_dotnet_image_dataframe(df)
         assert out["ImageBase"].iloc[0] == 0xFFFFF800_AABB0000
         assert int(out["ImageSize"].iloc[0]) == 0x80_000
         assert "mod_0.sys" in out["FileName"].iloc[0]
 
     def test_handles_none_and_empty(self):
-        assert adapters.adapt_csharp_image_dataframe(None) is None
+        assert adapters.adapt_dotnet_image_dataframe(None) is None
         empty = pd.DataFrame()
-        assert adapters.adapt_csharp_image_dataframe(empty) is empty
+        assert adapters.adapt_dotnet_image_dataframe(empty) is empty
 
 
 # ---- Adapter: symbolizer construction ----------------------------------
@@ -1002,7 +1002,7 @@ class TestBuildSymbolizerFromCsharpImages:
             export_dir=tmp_path, raw_csv={},
         )
         trace.raw_csv["Image/DCStart"] = _make_image_dcstart(rows=3)
-        ok = ad.build_symbolizer_from_csharp_images(trace)
+        ok = ad.build_symbolizer_from_dotnet_images(trace)
         assert ok is True
         assert trace.symbolizer is not None
         assert len(trace.symbolizer.modules) == 3
@@ -1027,7 +1027,7 @@ class TestBuildSymbolizerFromCsharpImages:
         )
         trace.raw_csv["Image/DCStart"] = same
         trace.raw_csv["Image/Load"] = same.copy()
-        ad.build_symbolizer_from_csharp_images(trace)
+        ad.build_symbolizer_from_dotnet_images(trace)
         assert len(trace.symbolizer.modules) == 2  # 2 unique, not 4
 
     def test_returns_false_when_no_image_rows(self, tmp_path: Path, monkeypatch):
@@ -1041,7 +1041,7 @@ class TestBuildSymbolizerFromCsharpImages:
             trace_id="t", etl_path=tmp_path / "x.etl",
             export_dir=tmp_path, raw_csv={},
         )
-        ok = ad.build_symbolizer_from_csharp_images(trace)
+        ok = ad.build_symbolizer_from_dotnet_images(trace)
         assert ok is False
         assert trace.symbolizer is None
 
@@ -1067,7 +1067,7 @@ class TestBuildSymbolizerFromCsharpImages:
             "TimeDateStamp": 0,
             "FileName": "\\SystemRoot\\drivers\\hotmod.sys",
         }])
-        ad.build_symbolizer_from_csharp_images(trace)
+        ad.build_symbolizer_from_dotnet_images(trace)
         # Address inside the module's range.
         addr = 0xFFFFF800_AABB1234
         labels = trace.symbolizer.bulk_resolve([addr])
@@ -1223,7 +1223,7 @@ class TestEventtraceHeaderToMetadata:
 
 class TestBuildTraceMetadataDataframeWithHeader:
     def test_header_extras_propagate(self):
-        meta = adapters.CsharpMetadata(
+        meta = adapters.DotnetMetadata(
             cpu_count=80, duration_seconds=1.0, timestamp_frequency=10_000_000.0,
         )
         manifest = native_cache.CacheManifest(
@@ -1248,7 +1248,7 @@ class TestBuildTraceMetadataDataframeWithHeader:
         assert int(df.iloc[0]["BuffersWritten"]) == 100
 
     def test_zero_defaults_when_no_header(self):
-        meta = adapters.CsharpMetadata(
+        meta = adapters.DotnetMetadata(
             cpu_count=4, duration_seconds=0.5, timestamp_frequency=10_000_000.0,
         )
         manifest = native_cache.CacheManifest(

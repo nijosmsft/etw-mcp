@@ -19,9 +19,9 @@ from typing import Any, Callable, Iterable
 from . import cache as native_cache
 from . import telemetry as _telemetry
 from .config import (
-    CSHARP_SIDECAR_ENV,
-    CSHARP_SIDECAR_EXE,
-    find_csharp_sidecar,
+    DOTNET_SIDECAR_ENV,
+    DOTNET_SIDECAR_EXE,
+    find_dotnet_sidecar,
 )
 
 
@@ -775,15 +775,15 @@ def _remove_dir(path: Path) -> None:
 
 
 __all__ = [
-    "CSHARP_REQUEST_VERSION",
+    "DOTNET_REQUEST_VERSION",
     "NATIVE_WORKER_ENV",
     "NATIVE_WORKER_SYMBOL_ENV",
     "NativeWorkerResult",
-    "build_csharp_request",
+    "build_dotnet_request",
     "build_worker_command",
     "build_worker_request",
     "native_worker_enabled",
-    "run_csharp_worker_extraction",
+    "run_dotnet_worker_extraction",
     "run_native_worker_extraction",
     "run_worker_process",
 ]
@@ -798,12 +798,12 @@ __all__ = [
 # the protocol implementation lives in one place.
 # ---------------------------------------------------------------------------
 
-CSHARP_REQUEST_VERSION = 1
-DEFAULT_CSHARP_HEARTBEAT_INTERVAL_MS = 1000
-DEFAULT_CSHARP_MAX_ETL_MB = 8192  # generous default; agent overrides per-call.
+DOTNET_REQUEST_VERSION = 1
+DEFAULT_DOTNET_HEARTBEAT_INTERVAL_MS = 1000
+DEFAULT_DOTNET_MAX_ETL_MB = 8192  # generous default; agent overrides per-call.
 
 
-def build_csharp_request(
+def build_dotnet_request(
     *,
     trace_id: str,
     etl_path: Path,
@@ -811,8 +811,8 @@ def build_csharp_request(
     requested_event_classes: Iterable[str],
     strategy: str = native_cache.MATERIALIZED_SMALL_STRATEGY,
     symbol_path: str | None = None,
-    max_etl_mb: int = DEFAULT_CSHARP_MAX_ETL_MB,
-    heartbeat_interval_ms: int = DEFAULT_CSHARP_HEARTBEAT_INTERVAL_MS,
+    max_etl_mb: int = DEFAULT_DOTNET_MAX_ETL_MB,
+    heartbeat_interval_ms: int = DEFAULT_DOTNET_HEARTBEAT_INTERVAL_MS,
     log_level: str = "info",
     include_tracelogging: bool = True,
 ) -> dict[str, Any]:
@@ -823,7 +823,7 @@ def build_csharp_request(
     """
 
     payload: dict[str, Any] = {
-        "version": CSHARP_REQUEST_VERSION,
+        "version": DOTNET_REQUEST_VERSION,
         "trace_id": trace_id,
         "etl_path": str(etl_path.resolve()),
         "staging_dir": str(staging_dir.resolve()),
@@ -838,13 +838,13 @@ def build_csharp_request(
     return payload
 
 
-def build_csharp_command(sidecar_path: Path, request_path: Path) -> list[str]:
+def build_dotnet_command(sidecar_path: Path, request_path: Path) -> list[str]:
     """Build the sidecar command line. Only ``--request <path>`` is required."""
 
     return [str(sidecar_path), "--request", str(request_path)]
 
 
-def run_csharp_worker_extraction(
+def run_dotnet_worker_extraction(
     *,
     etl_path: Path,
     export_dir: Path,
@@ -862,7 +862,7 @@ def run_csharp_worker_extraction(
 
     Pipeline:
 
-    1. Locate the sidecar binary via :func:`find_csharp_sidecar` (or use
+    1. Locate the sidecar binary via :func:`find_dotnet_sidecar` (or use
        the caller-supplied ``sidecar_path``).
     2. Write a ``request.json`` matching the spike-contract schema.
     3. Spawn ``wpr-mcp-extract.exe --request <path>``; stream stdout
@@ -877,18 +877,18 @@ def run_csharp_worker_extraction(
     return ``ok=False`` with a structured ``failure_kind``.
     """
 
-    resolved_sidecar = sidecar_path or find_csharp_sidecar()
+    resolved_sidecar = sidecar_path or find_dotnet_sidecar()
     if resolved_sidecar is None:
         raise ValueError(
-            f".NET sidecar binary {CSHARP_SIDECAR_EXE} could not be located. "
-            f"Set {CSHARP_SIDECAR_ENV} to the absolute path of the built "
+            f".NET sidecar binary {DOTNET_SIDECAR_EXE} could not be located. "
+            f"Set {DOTNET_SIDECAR_ENV} to the absolute path of the built "
             "binary, publish it under dotnet/publish/win-x64/, or add it "
             "to PATH."
         )
     if not resolved_sidecar.is_file():
         raise ValueError(
             f".NET sidecar path {resolved_sidecar} is not a file. "
-            f"Check {CSHARP_SIDECAR_ENV}."
+            f"Check {DOTNET_SIDECAR_ENV}."
         )
 
     etl_path = etl_path.resolve()
@@ -897,13 +897,13 @@ def run_csharp_worker_extraction(
         f"{export_dir.name}.dotnet-{trace_id}-{uuid.uuid4().hex}"
     )
     request_path = staging_dir / "request.json"
-    runner = process_runner or run_csharp_process
+    runner = process_runner or run_dotnet_process
 
     try:
         if staging_dir.exists():
             shutil.rmtree(staging_dir)
         staging_dir.mkdir(parents=True)
-        request = build_csharp_request(
+        request = build_dotnet_request(
             trace_id=trace_id,
             etl_path=etl_path,
             staging_dir=staging_dir,
@@ -917,7 +917,7 @@ def run_csharp_worker_extraction(
         )
 
         _telemetry.emit_with(
-            _telemetry.EVENT_CSHARP_SPAWN,
+            _telemetry.EVENT_DOTNET_SPAWN,
             mode="dotnet",
             trace_id=trace_id,
             sidecar_path=resolved_sidecar,
@@ -925,7 +925,7 @@ def run_csharp_worker_extraction(
             strategy=strategy,
             event_classes=len(request.get("requested_event_classes", [])),
         )
-        _csharp_spawn_monotonic = time.monotonic()
+        _dotnet_spawn_monotonic = time.monotonic()
 
         sidecar_result = runner(
             resolved_sidecar,
@@ -936,21 +936,21 @@ def run_csharp_worker_extraction(
         sidecar_result.request_path = request_path
         sidecar_result.staging_dir = staging_dir
 
-        _csharp_wall_s = time.monotonic() - _csharp_spawn_monotonic
+        _dotnet_wall_s = time.monotonic() - _dotnet_spawn_monotonic
         _result_payload = sidecar_result.result or {}
         _perf = _result_payload.get("performance") or {}
         _telemetry.emit_with(
-            _telemetry.EVENT_CSHARP_CHILD_EXIT,
+            _telemetry.EVENT_DOTNET_CHILD_EXIT,
             mode="dotnet",
             trace_id=trace_id,
             ok=sidecar_result.ok,
             returncode=sidecar_result.returncode,
             failure_kind=sidecar_result.failure_kind,
-            wall_seconds=_csharp_wall_s,
+            wall_seconds=_dotnet_wall_s,
         )
         if sidecar_result.ok and _perf:
             _telemetry.emit_with(
-                _telemetry.EVENT_CSHARP_RESULT,
+                _telemetry.EVENT_DOTNET_RESULT,
                 mode="dotnet",
                 trace_id=trace_id,
                 sidecar_wall_seconds=_perf.get("wall_seconds"),
@@ -978,7 +978,7 @@ def run_csharp_worker_extraction(
             )
         except Exception as exc:
             _telemetry.emit_with(
-                _telemetry.EVENT_CSHARP_CACHE_VALIDATE,
+                _telemetry.EVENT_DOTNET_CACHE_VALIDATE,
                 mode="dotnet",
                 trace_id=trace_id,
                 ok=False,
@@ -997,7 +997,7 @@ def run_csharp_worker_extraction(
                 result=sidecar_result.result,
             )
         _telemetry.emit_with(
-            _telemetry.EVENT_CSHARP_CACHE_VALIDATE,
+            _telemetry.EVENT_DOTNET_CACHE_VALIDATE,
             mode="dotnet",
             trace_id=trace_id,
             ok=True,
@@ -1009,7 +1009,7 @@ def run_csharp_worker_extraction(
         # Run the Python-side aggregators against the sidecar's outputs.
         agg_run = aggregation_runner or _default_aggregation_runner
         _telemetry.emit_with(
-            _telemetry.EVENT_CSHARP_AGGREGATION_START,
+            _telemetry.EVENT_DOTNET_AGGREGATION_START,
             mode="dotnet",
             trace_id=trace_id,
             staging_dir=staging_dir,
@@ -1019,7 +1019,7 @@ def run_csharp_worker_extraction(
             agg_result = agg_run(staging_dir, etl_path, trace_id)
         except Exception as exc:
             _telemetry.emit_with(
-                _telemetry.EVENT_CSHARP_AGGREGATION_DONE,
+                _telemetry.EVENT_DOTNET_AGGREGATION_DONE,
                 mode="dotnet",
                 trace_id=trace_id,
                 ok=False,
@@ -1040,7 +1040,7 @@ def run_csharp_worker_extraction(
             )
         if not agg_result.ok:
             _telemetry.emit_with(
-                _telemetry.EVENT_CSHARP_AGGREGATION_DONE,
+                _telemetry.EVENT_DOTNET_AGGREGATION_DONE,
                 mode="dotnet",
                 trace_id=trace_id,
                 ok=False,
@@ -1060,7 +1060,7 @@ def run_csharp_worker_extraction(
                 result=sidecar_result.result,
             )
         _telemetry.emit_with(
-            _telemetry.EVENT_CSHARP_AGGREGATION_DONE,
+            _telemetry.EVENT_DOTNET_AGGREGATION_DONE,
             mode="dotnet",
             trace_id=trace_id,
             ok=True,
@@ -1073,7 +1073,7 @@ def run_csharp_worker_extraction(
             _promote_staging_cache(staging_dir, export_dir)
         except Exception as exc:
             _telemetry.emit_with(
-                _telemetry.EVENT_CSHARP_CACHE_PROMOTE,
+                _telemetry.EVENT_DOTNET_CACHE_PROMOTE,
                 mode="dotnet",
                 trace_id=trace_id,
                 ok=False,
@@ -1099,7 +1099,7 @@ def run_csharp_worker_extraction(
         if agg_result.warnings:
             sidecar_result.aggregation_warnings = list(agg_result.warnings)
         _telemetry.emit_with(
-            _telemetry.EVENT_CSHARP_CACHE_PROMOTE,
+            _telemetry.EVENT_DOTNET_CACHE_PROMOTE,
             mode="dotnet",
             trace_id=trace_id,
             ok=True,
@@ -1139,7 +1139,7 @@ def _default_aggregation_runner(
     )
 
 
-def run_csharp_process(
+def run_dotnet_process(
     sidecar_path: Path,
     request_path: Path,
     *,
@@ -1166,7 +1166,7 @@ def run_csharp_process(
         stale_heartbeat_seconds,
         DEFAULT_STALE_SECONDS,
     )
-    command = build_csharp_command(sidecar_path, request_path)
+    command = build_dotnet_command(sidecar_path, request_path)
     env = os.environ.copy()
     # The sidecar reads its own env for log routing; nothing else needed.
 

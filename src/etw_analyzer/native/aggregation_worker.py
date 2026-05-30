@@ -40,7 +40,7 @@ from typing import Any
 import pandas as pd
 
 from etw_analyzer.native import cache as native_cache
-from etw_analyzer.native import aggregation_worker_adapters as csharp_adapters
+from etw_analyzer.native import aggregation_worker_adapters as dotnet_adapters
 from etw_analyzer.native import telemetry as _telemetry
 from etw_analyzer.trace_state import TraceData
 
@@ -227,19 +227,19 @@ def run_aggregation_worker(
         # when the parquet is absent or missing required columns,
         # which falls through to the heuristic path below.
         header_df = trace.raw_csv.get("EventTrace/Header")
-        derived = csharp_adapters.eventtrace_header_to_metadata(header_df)
+        derived = dotnet_adapters.eventtrace_header_to_metadata(header_df)
         if derived is None:
-            derived = csharp_adapters.derive_metadata_from_sidecar(
+            derived = dotnet_adapters.derive_metadata_from_sidecar(
                 trace, sidecar_manifest
             )
-        csharp_adapters.apply_metadata_to_trace(trace, derived)
+        dotnet_adapters.apply_metadata_to_trace(trace, derived)
         # Pre-populate the trace_metadata DataFrame so the existing
         # ``_native_metadata_dataframe`` path (which only kicks in when
         # ``_native_extract_stats`` is populated) can be skipped — the
         # sidecar produces neither logfile_metadata nor extract_stats.
         if "trace_metadata" not in trace.raw_csv:
             trace.raw_csv["trace_metadata"] = (
-                csharp_adapters.build_trace_metadata_dataframe(
+                dotnet_adapters.build_trace_metadata_dataframe(
                     derived, sidecar_manifest,
                     eventtrace_header_df=header_df,
                 )
@@ -247,7 +247,7 @@ def run_aggregation_worker(
         # Seed event_counts from the manifest so build_tracestats_text
         # has provider-equivalent rows to render even though we have no
         # ExtractStats under dotnet mode.
-        csharp_adapters.populate_event_counts_from_manifest(
+        dotnet_adapters.populate_event_counts_from_manifest(
             trace, sidecar_manifest
         )
     except Exception as exc:
@@ -383,11 +383,11 @@ def _load_phase_b_dpc_isr(
             except (TypeError, ValueError):
                 pass
 
-    for stem, canonical in csharp_adapters.PHASE_B_DPC_STEMS.items():
+    for stem, canonical in dotnet_adapters.PHASE_B_DPC_STEMS.items():
         df = _read_phase_b_parquet(staging_dir, stem, warnings)
         if df is None or df.empty:
             continue
-        df = csharp_adapters.adapt_csharp_dpc_dataframe(df, perf_freq_hz=perf_freq)
+        df = dotnet_adapters.adapt_dotnet_dpc_dataframe(df, perf_freq_hz=perf_freq)
         if df is not None and not df.empty:
             trace.raw_csv[canonical] = df
 
@@ -415,7 +415,7 @@ def _load_phase_b_process(
         df = _read_phase_b_parquet(staging_dir, stem, warnings)
         if df is None or df.empty:
             continue
-        df = adapters.adapt_csharp_process_dataframe(df)
+        df = adapters.adapt_dotnet_process_dataframe(df)
         if df is not None and not df.empty:
             trace.raw_csv[canonical] = df
 
@@ -444,7 +444,7 @@ def _load_phase_b_thread(
         df = _read_phase_b_parquet(staging_dir, stem, warnings)
         if df is None or df.empty:
             continue
-        df = adapters.adapt_csharp_thread_dataframe(df)
+        df = adapters.adapt_dotnet_thread_dataframe(df)
         if df is not None and not df.empty:
             trace.raw_csv[canonical] = df
 
@@ -473,7 +473,7 @@ def _load_phase_b_diskio(
         df = _read_phase_b_parquet(staging_dir, stem, warnings)
         if df is None or df.empty:
             continue
-        df = adapters.adapt_csharp_diskio_dataframe(df)
+        df = adapters.adapt_dotnet_diskio_dataframe(df)
         if df is not None and not df.empty:
             trace.raw_csv[canonical] = df
 
@@ -487,7 +487,7 @@ def _load_phase_b_images(
 
     Reads image_load.parquet and image_dcstart.parquet, lands them in
     raw_csv under Image/Load and Image/DCStart, then calls
-    ``build_symbolizer_from_csharp_images`` so the stacks aggregators
+    ``build_symbolizer_from_dotnet_images`` so the stacks aggregators
     can resolve addresses. Missing parquets are silent no-ops; a
     failed symbolizer build (no native bindings, no rows) is also
     silent — the existing dotnet test path already gracefully falls
@@ -500,12 +500,12 @@ def _load_phase_b_images(
         df = _read_phase_b_parquet(staging_dir, stem, warnings)
         if df is None or df.empty:
             continue
-        df = adapters.adapt_csharp_image_dataframe(df)
+        df = adapters.adapt_dotnet_image_dataframe(df)
         if df is not None and not df.empty:
             trace.raw_csv[canonical] = df
 
     try:
-        adapters.build_symbolizer_from_csharp_images(trace)
+        adapters.build_symbolizer_from_dotnet_images(trace)
     except Exception as exc:
         warnings.append(f"dotnet symbolizer build failed: {exc}")
 
@@ -571,7 +571,7 @@ def _build_trace_from_staging(
         # ``trace.dumper_df`` and ``trace.raw_csv['SampledProfile']``
         # point at the same already-adapted DataFrame.
         if stem == "sampled_profile":
-            df = csharp_adapters.adapt_csharp_sampled_profile_dataframe(df)
+            df = dotnet_adapters.adapt_dotnet_sampled_profile_dataframe(df)
         setattr(trace, attr, df)
         # Also expose under the canonical event-class name so aggregators
         # that look in raw_csv find the rows.
@@ -621,7 +621,7 @@ def _build_trace_from_staging(
     # (which were written against the in-process worker's ``TimeStamp``
     # column) see the layout they expect. No-op for non-dotnet inputs.
     try:
-        csharp_adapters.normalize_csharp_trace(trace)
+        dotnet_adapters.normalize_dotnet_trace(trace)
     except Exception as exc:
         warnings.append(f"dotnet column normalization failed: {exc}")
 

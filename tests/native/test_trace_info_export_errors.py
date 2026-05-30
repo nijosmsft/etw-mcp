@@ -134,7 +134,7 @@ def test_csharp_dispatch_merges_aggregation_warnings_into_export_errors(tmp_path
     clear_traces()
     try:
         with patch("etw_analyzer.native.config.resolve_mode", return_value="dotnet"), \
-             patch.object(trace_mgmt, "_load_csharp_with_worker", return_value=worker_result), \
+             patch.object(trace_mgmt, "_load_dotnet_with_worker", return_value=worker_result), \
              patch.object(trace_mgmt, "_load_from_cache", side_effect=[None, cached]), \
              patch.object(trace_mgmt, "_open_native_event_store_from_cache", return_value=None), \
              patch.object(trace_mgmt, "_start_background_dumper", return_value=None), \
@@ -179,7 +179,7 @@ def test_csharp_dispatch_no_aggregation_warnings_no_section(tmp_path: Path):
     clear_traces()
     try:
         with patch("etw_analyzer.native.config.resolve_mode", return_value="dotnet"), \
-             patch.object(trace_mgmt, "_load_csharp_with_worker", return_value=worker_result), \
+             patch.object(trace_mgmt, "_load_dotnet_with_worker", return_value=worker_result), \
              patch.object(trace_mgmt, "_load_from_cache", side_effect=[None, cached]), \
              patch.object(trace_mgmt, "_open_native_event_store_from_cache", return_value=None), \
              patch.object(trace_mgmt, "_start_background_dumper", return_value=None), \

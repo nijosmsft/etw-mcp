@@ -13,7 +13,7 @@ called from :mod:`etw_analyzer.native.aggregation_worker` immediately
 after the sidecar parquets are loaded and before the aggregators run.
 
 Per the Phase A plan
-(``manager-log/csharp-parity-exploration.md`` §5):
+(``manager-log/dotnet-parity-exploration.md`` §5):
 
 * **DO NOT** modify the native aggregator functions themselves — they
   continue to run unmodified under ``mode="native"``.
@@ -51,7 +51,7 @@ _TIMESTAMP_TARGET = "TimeStamp"
 
 
 @dataclass
-class CsharpMetadata:
+class DotnetMetadata:
     """Header-equivalent metadata derived from the sidecar manifest."""
 
     cpu_count: int | None = None
@@ -59,7 +59,7 @@ class CsharpMetadata:
     timestamp_frequency: float | None = None
 
 
-def normalize_csharp_dataframe(df: pd.DataFrame | None) -> pd.DataFrame | None:
+def normalize_dotnet_dataframe(df: pd.DataFrame | None) -> pd.DataFrame | None:
     """Rename ``TimeStampQpc`` → ``TimeStamp`` if needed, in place.
 
     Returns the same DataFrame for chaining. ``None`` propagates.
@@ -76,23 +76,23 @@ def normalize_csharp_dataframe(df: pd.DataFrame | None) -> pd.DataFrame | None:
     return df
 
 
-def normalize_csharp_trace(trace: TraceData) -> None:
+def normalize_dotnet_trace(trace: TraceData) -> None:
     """Apply the column rename to every sidecar-loaded DataFrame on ``trace``.
 
     Mutates ``trace.dumper_df`` / ``trace.cswitch_events_df`` /
     ``trace.raw_csv`` in place. Safe to call multiple times.
     """
-    normalize_csharp_dataframe(trace.dumper_df)
-    normalize_csharp_dataframe(trace.cswitch_events_df)
+    normalize_dotnet_dataframe(trace.dumper_df)
+    normalize_dotnet_dataframe(trace.cswitch_events_df)
     for key, df in list(trace.raw_csv.items()):
         if isinstance(df, pd.DataFrame):
-            normalize_csharp_dataframe(df)
+            normalize_dotnet_dataframe(df)
 
 
 def derive_metadata_from_sidecar(
     trace: TraceData,
     sidecar_manifest: native_cache.CacheManifest,
-) -> CsharpMetadata:
+) -> DotnetMetadata:
     """Derive header-equivalent metadata from sidecar parquets + manifest.
 
     The sidecar doesn't yet emit ``EventTrace/Header`` so the trace's
@@ -130,7 +130,7 @@ def derive_metadata_from_sidecar(
     if qpc_min is not None and qpc_max is not None and qpc_max > qpc_min:
         duration_seconds = (qpc_max - qpc_min) / timestamp_frequency
 
-    return CsharpMetadata(
+    return DotnetMetadata(
         cpu_count=cpu_count,
         duration_seconds=duration_seconds,
         timestamp_frequency=timestamp_frequency,
@@ -138,7 +138,7 @@ def derive_metadata_from_sidecar(
 
 
 def apply_metadata_to_trace(
-    trace: TraceData, metadata: CsharpMetadata
+    trace: TraceData, metadata: DotnetMetadata
 ) -> None:
     """Populate the metadata fields the aggregators read off ``TraceData``.
 
@@ -157,7 +157,7 @@ def apply_metadata_to_trace(
 
 
 def build_trace_metadata_dataframe(
-    metadata: CsharpMetadata,
+    metadata: DotnetMetadata,
     sidecar_manifest: native_cache.CacheManifest,
     *,
     eventtrace_header_df: pd.DataFrame | None = None,
@@ -318,26 +318,26 @@ def _candidate_dataframes(trace: TraceData) -> Iterable[pd.DataFrame | None]:
 
 
 __all__ = [
-    "CsharpMetadata",
-    "normalize_csharp_dataframe",
-    "normalize_csharp_trace",
+    "DotnetMetadata",
+    "normalize_dotnet_dataframe",
+    "normalize_dotnet_trace",
     "derive_metadata_from_sidecar",
     "apply_metadata_to_trace",
     "build_trace_metadata_dataframe",
     "populate_event_counts_from_manifest",
     # Phase B per-opcode adapters.
-    "adapt_csharp_dpc_dataframe",
+    "adapt_dotnet_dpc_dataframe",
     "PHASE_B_DPC_STEMS",
-    "adapt_csharp_process_dataframe",
+    "adapt_dotnet_process_dataframe",
     "PHASE_B_PROCESS_STEMS",
-    "adapt_csharp_thread_dataframe",
+    "adapt_dotnet_thread_dataframe",
     "PHASE_B_THREAD_STEMS",
-    "adapt_csharp_sampled_profile_dataframe",
-    "adapt_csharp_diskio_dataframe",
+    "adapt_dotnet_sampled_profile_dataframe",
+    "adapt_dotnet_diskio_dataframe",
     "PHASE_B_DISKIO_STEMS",
-    "adapt_csharp_image_dataframe",
+    "adapt_dotnet_image_dataframe",
     "PHASE_B_IMAGE_STEMS",
-    "build_symbolizer_from_csharp_images",
+    "build_symbolizer_from_dotnet_images",
     "eventtrace_header_to_metadata",
 ]
 
@@ -376,7 +376,7 @@ PHASE_B_DPC_STEMS: dict[str, str] = {
 }
 
 
-def adapt_csharp_dpc_dataframe(
+def adapt_dotnet_dpc_dataframe(
     df: pd.DataFrame | None,
     *,
     perf_freq_hz: float = 10_000_000.0,
@@ -431,7 +431,7 @@ PHASE_B_PROCESS_STEMS: dict[str, str] = {
 }
 
 
-def adapt_csharp_process_dataframe(df: pd.DataFrame | None) -> pd.DataFrame | None:
+def adapt_dotnet_process_dataframe(df: pd.DataFrame | None) -> pd.DataFrame | None:
     """Adapt a Phase B process_* parquet to the process_info schema.
 
     Phase B columns: ``EventSequence, TimeStampQpc, CPU, PID, ParentPID,
@@ -442,7 +442,7 @@ def adapt_csharp_process_dataframe(df: pd.DataFrame | None) -> pd.DataFrame | No
     ``TimeStamp``. Map PID -> ProcessId, ParentPID -> ParentId, and
     synthesise SessionId=0 (the sidecar does not decode session IDs —
     documented in dotnet/docs/event-class-mapping.md). TimeStampQpc ->
-    TimeStamp is the same rename ``normalize_csharp_dataframe`` does.
+    TimeStamp is the same rename ``normalize_dotnet_dataframe`` does.
 
     Returns the same DataFrame (mutated) for chaining; ``None`` /
     empty inputs are returned unchanged.
@@ -482,7 +482,7 @@ PHASE_B_THREAD_STEMS: dict[str, str] = {
 }
 
 
-def adapt_csharp_thread_dataframe(df: pd.DataFrame | None) -> pd.DataFrame | None:
+def adapt_dotnet_thread_dataframe(df: pd.DataFrame | None) -> pd.DataFrame | None:
     """Adapt a Phase B thread_* parquet to the TID→PID-map schema.
 
     Phase B columns: ``EventSequence, TimeStampQpc, CPU, PID, TID,
@@ -510,7 +510,7 @@ def adapt_csharp_thread_dataframe(df: pd.DataFrame | None) -> pd.DataFrame | Non
     return df
 
 
-def adapt_csharp_sampled_profile_dataframe(
+def adapt_dotnet_sampled_profile_dataframe(
     df: pd.DataFrame | None,
 ) -> pd.DataFrame | None:
     """Adapt a Phase B sampled_profile parquet to the cpu_sampling schema.
@@ -561,7 +561,7 @@ PHASE_B_DISKIO_STEMS: dict[str, str] = {
 }
 
 
-def adapt_csharp_diskio_dataframe(df: pd.DataFrame | None) -> pd.DataFrame | None:
+def adapt_dotnet_diskio_dataframe(df: pd.DataFrame | None) -> pd.DataFrame | None:
     """Adapt a Phase B diskio_* parquet to the diskio aggregator schema.
 
     Phase B columns vary by opcode but generally include ``DiskNumber``
@@ -591,7 +591,7 @@ PHASE_B_IMAGE_STEMS: dict[str, str] = {
 }
 
 
-def adapt_csharp_image_dataframe(df: pd.DataFrame | None) -> pd.DataFrame | None:
+def adapt_dotnet_image_dataframe(df: pd.DataFrame | None) -> pd.DataFrame | None:
     """Adapt a Phase B image_* parquet to the symbolizer-input schema.
 
     Phase B columns: ``EventSequence, TimeStampQpc, CPU, PID, ImageBase,
@@ -611,7 +611,7 @@ def adapt_csharp_image_dataframe(df: pd.DataFrame | None) -> pd.DataFrame | None
     return df
 
 
-def build_symbolizer_from_csharp_images(trace) -> bool:
+def build_symbolizer_from_dotnet_images(trace) -> bool:
     """Build a dbghelp-backed Symbolizer from Phase B image parquets.
 
     Reads ``trace.raw_csv['Image/Load']`` and ``trace.raw_csv['Image/DCStart']``
@@ -682,8 +682,8 @@ def build_symbolizer_from_csharp_images(trace) -> bool:
 
 def eventtrace_header_to_metadata(
     df: pd.DataFrame | None,
-) -> CsharpMetadata | None:
-    """Build a CsharpMetadata from a Phase B eventtrace_header parquet.
+) -> DotnetMetadata | None:
+    """Build a DotnetMetadata from a Phase B eventtrace_header parquet.
 
     The sidecar's eventtrace_header parquet is a single-row table with
     the authoritative ETL kernel-header fields:
@@ -732,7 +732,7 @@ def eventtrace_header_to_metadata(
         # Nothing usable — let the heuristic path try.
         return None
 
-    return CsharpMetadata(
+    return DotnetMetadata(
         cpu_count=cpu_count or None,
         duration_seconds=duration,
         timestamp_frequency=perf_freq or None,

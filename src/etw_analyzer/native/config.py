@@ -10,7 +10,7 @@ The resolution order is documented in the design doc §8.1:
 
 When ``"auto"`` is requested, the resolved mode is computed by probing
 each backend in preference order: ``"dotnet"`` wins when the .NET sidecar
-binary is locatable (see :func:`find_csharp_sidecar`), then ``"native"``
+binary is locatable (see :func:`find_dotnet_sidecar`), then ``"native"``
 when the in-process ETW consumer loads, and finally ``"xperf"`` as the
 universally-available fallback. The auto-detect result is cached for the
 lifetime of the process so we don't re-probe on every load. None of the
@@ -22,7 +22,7 @@ available (e.g. running on a non-Windows host, or ``tdh.dll`` failed
 to load), :func:`resolve_mode` raises ``RuntimeError``. When
 ``"dotnet"`` is requested explicitly but the sidecar binary is not
 locatable, :func:`resolve_mode` raises ``ValueError`` naming the
-``WPR_MCP_CSHARP_SIDECAR`` override. Auto silently falls back along the
+``WPR_MCP_DOTNET_SIDECAR`` override. Auto silently falls back along the
 chain in the same situation — the contract is "explicit wins over
 graceful degradation".
 """
@@ -38,8 +38,8 @@ VALID_MODES = frozenset({"xperf", "native", "dotnet", "auto"})
 DEFAULT_NATIVE_MAX_ETL_MB = 512.0
 NATIVE_MAX_ETL_MB_ENV = "WPR_MCP_NATIVE_MAX_ETL_MB"
 NATIVE_ALLOW_LARGE_ENV = "WPR_MCP_NATIVE_ALLOW_LARGE"
-CSHARP_SIDECAR_ENV = "WPR_MCP_CSHARP_SIDECAR"
-CSHARP_SIDECAR_EXE = "wpr-mcp-extract.exe"
+DOTNET_SIDECAR_ENV = "WPR_MCP_DOTNET_SIDECAR"
+DOTNET_SIDECAR_EXE = "wpr-mcp-extract.exe"
 
 
 # Cache the auto-detect result so we don't pay the ``OpenTraceW`` probe
@@ -47,29 +47,29 @@ CSHARP_SIDECAR_EXE = "wpr-mcp-extract.exe"
 # ``None`` while undetermined, then ``"dotnet"``, ``"native"`` or
 # ``"xperf"`` once resolved.
 _AUTO_CACHED: Optional[str] = None
-_CSHARP_SIDECAR_CACHED: Optional[Path] = None
-_CSHARP_SIDECAR_PROBED: bool = False
+_DOTNET_SIDECAR_CACHED: Optional[Path] = None
+_DOTNET_SIDECAR_PROBED: bool = False
 
 
-def find_csharp_sidecar(*, auto_detect: bool = False) -> Path | None:
+def find_dotnet_sidecar(*, auto_detect: bool = False) -> Path | None:
     """Locate the C# sidecar binary ``wpr-mcp-extract.exe``.
 
     Search order:
 
-    1. ``WPR_MCP_CSHARP_SIDECAR`` environment variable — when set, the
+    1. ``WPR_MCP_DOTNET_SIDECAR`` environment variable — when set, the
        value MUST point at an existing file or ``None`` is returned.
        This lets a deployment pin the exact build that gets exercised.
-    2. Relative to the installed package — ``../../csharp/publish/win-x64/``
+    2. Relative to the installed package — ``../../dotnet/publish/win-x64/``
        resolved from this module's directory. Convenient for in-tree
        development where ``dotnet publish`` lands the binary next to the
        Python source. **Skipped when ``auto_detect=True``** — auto-mode
        should not silently flip a developer's existing native pipeline
-       to csharp just because they happen to have a publish output
+       to dotnet just because they happen to have a publish output
        lying around.
     3. ``PATH`` lookup — last resort for system-wide installations.
 
     The result is cached for the lifetime of the process; tests can clear
-    the cache via :func:`reset_csharp_cache`. Note that the cache key
+    the cache via :func:`reset_dotnet_cache`. Note that the cache key
     is **independent** of ``auto_detect`` — the first call wins for the
     process; pass ``auto_detect=True`` only for the auto-fallback chain.
 
@@ -79,23 +79,23 @@ def find_csharp_sidecar(*, auto_detect: bool = False) -> Path | None:
         When ``True``, used by :func:`resolve_mode` for the auto chain.
         Skips the in-tree publish probe so a stale dev build doesn't
         change the default pipeline. When ``False`` (the default,
-        e.g. an explicit ``mode="csharp"`` request) all three paths
+        e.g. an explicit ``mode="dotnet"`` request) all three paths
         are checked.
     """
 
-    global _CSHARP_SIDECAR_CACHED, _CSHARP_SIDECAR_PROBED
+    global _DOTNET_SIDECAR_CACHED, _DOTNET_SIDECAR_PROBED
 
     # When auto-detecting, never consult the cache — the cache may have
     # been populated by an explicit lookup that included the in-tree
     # path. Recompute every time with the narrow rules. This is cheap
     # (an env var read and a ``shutil.which`` call).
-    if not auto_detect and _CSHARP_SIDECAR_PROBED:
-        return _CSHARP_SIDECAR_CACHED
+    if not auto_detect and _DOTNET_SIDECAR_PROBED:
+        return _DOTNET_SIDECAR_CACHED
 
     candidates: list[Path] = []
     env_only = False
 
-    env_override = os.environ.get(CSHARP_SIDECAR_ENV)
+    env_override = os.environ.get(DOTNET_SIDECAR_ENV)
     if env_override:
         # When the env var is set, the caller has pinned an exact path.
         # Don't fall through to in-tree / PATH lookup — that masks
@@ -110,7 +110,7 @@ def find_csharp_sidecar(*, auto_detect: bool = False) -> Path | None:
         here = Path(__file__).resolve()
         repo_root_guess = here.parent.parent.parent.parent
         candidates.append(
-            repo_root_guess / "dotnet" / "publish" / "win-x64" / CSHARP_SIDECAR_EXE
+            repo_root_guess / "dotnet" / "publish" / "win-x64" / DOTNET_SIDECAR_EXE
         )
 
     found: Path | None = None
@@ -123,22 +123,22 @@ def find_csharp_sidecar(*, auto_detect: bool = False) -> Path | None:
         # PATH lookup. ``shutil.which`` returns ``None`` when missing.
         import shutil
 
-        which = shutil.which(CSHARP_SIDECAR_EXE)
+        which = shutil.which(DOTNET_SIDECAR_EXE)
         if which:
             found = Path(which).resolve()
 
     if not auto_detect:
-        _CSHARP_SIDECAR_CACHED = found
-        _CSHARP_SIDECAR_PROBED = True
+        _DOTNET_SIDECAR_CACHED = found
+        _DOTNET_SIDECAR_PROBED = True
     return found
 
 
-def reset_csharp_cache() -> None:
+def reset_dotnet_cache() -> None:
     """Clear the cached C# sidecar lookup. Primarily for tests."""
 
-    global _CSHARP_SIDECAR_CACHED, _CSHARP_SIDECAR_PROBED
-    _CSHARP_SIDECAR_CACHED = None
-    _CSHARP_SIDECAR_PROBED = False
+    global _DOTNET_SIDECAR_CACHED, _DOTNET_SIDECAR_PROBED
+    _DOTNET_SIDECAR_CACHED = None
+    _DOTNET_SIDECAR_PROBED = False
 
 
 def normalize_mode(mode: Optional[str]) -> str:
@@ -206,7 +206,7 @@ def resolve_mode(
         # Preferred order: dotnet → native → xperf. Auto-detect uses the
         # conservative .NET sidecar lookup (env var + PATH only), so a
         # stray in-tree publish build does not flip the default pipeline.
-        if find_csharp_sidecar(auto_detect=True) is not None:
+        if find_dotnet_sidecar(auto_detect=True) is not None:
             _AUTO_CACHED = "dotnet"
             return _AUTO_CACHED
         try:
@@ -224,11 +224,11 @@ def resolve_mode(
         # Explicit dotnet request — fail loudly when the binary cannot
         # be located so the caller knows to install/publish the sidecar
         # rather than silently falling through to a different pipeline.
-        if find_csharp_sidecar() is None:
+        if find_dotnet_sidecar() is None:
             raise ValueError(
                 "mode='dotnet' was requested but the .NET sidecar binary "
-                f"({CSHARP_SIDECAR_EXE}) could not be located. Set the "
-                f"{CSHARP_SIDECAR_ENV} environment variable to the absolute "
+                f"({DOTNET_SIDECAR_EXE}) could not be located. Set the "
+                f"{DOTNET_SIDECAR_ENV} environment variable to the absolute "
                 "path of the built binary, publish it under "
                 "dotnet/publish/win-x64/ in the repo, or add it to PATH. "
                 "Use mode='native' or mode='xperf' to bypass the sidecar."
@@ -300,7 +300,7 @@ def _native_was_forced(arg_mode: Optional[str]) -> bool:
     return False
 
 
-def _csharp_was_forced(arg_mode: Optional[str]) -> bool:
+def _dotnet_was_forced(arg_mode: Optional[str]) -> bool:
     if arg_mode:
         normalized_arg = normalize_mode(arg_mode)
         if normalized_arg == "dotnet":
@@ -357,20 +357,20 @@ def reset_auto_cache() -> None:
 
     global _AUTO_CACHED
     _AUTO_CACHED = None
-    reset_csharp_cache()
+    reset_dotnet_cache()
 
 
 __all__ = [
-    "CSHARP_SIDECAR_ENV",
-    "CSHARP_SIDECAR_EXE",
+    "DOTNET_SIDECAR_ENV",
+    "DOTNET_SIDECAR_EXE",
     "VALID_MODES",
     "DEFAULT_NATIVE_MAX_ETL_MB",
     "NATIVE_ALLOW_LARGE_ENV",
     "NATIVE_MAX_ETL_MB_ENV",
     "apply_native_size_guardrail",
-    "find_csharp_sidecar",
+    "find_dotnet_sidecar",
     "normalize_mode",
     "resolve_mode",
     "reset_auto_cache",
-    "reset_csharp_cache",
+    "reset_dotnet_cache",
 ]
