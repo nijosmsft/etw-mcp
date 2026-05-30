@@ -257,12 +257,17 @@ function Compare-Streaming {
         Write-Host "  [OK]   cswitch_events chunked $($cs.row_count) rows into $($cs.parts.Count) parts"
     }
 
-    # 5) Verify RSS budget (≤ 1 GB target per the task budget).
+    # 5) Verify RSS budget. P1b D2 target: ≤ 1.5 GB peak in steady state
+    # (chunked streaming bounds live rows per class).
+    # Hard ceiling: 2.5 GB — the documented baseline (pre-D2) was ~3.9 GB,
+    # so anything above 2.5 GB indicates the bounded-queue regression.
     $rssMb = [math]::Round($Result.result.performance.peak_rss_mb, 1)
-    if ($rssMb -gt 6144) {
-        Write-Host "  [WARN] peak RSS=$rssMb MB exceeds 6 GB streaming budget (expected ≤ 1 GB target, 6 GB sane upper bound)" -ForegroundColor Yellow
+    if ($rssMb -gt 2500) {
+        Fail "streaming peak RSS=$rssMb MB exceeds 2.5 GB hard ceiling (D2 target ≤ 1.5 GB; pre-D2 baseline ~3.9 GB)"
+    } elseif ($rssMb -gt 1500) {
+        Write-Host "  [WARN] peak RSS=$rssMb MB exceeds 1.5 GB D2 target (still under 2.5 GB hard ceiling)" -ForegroundColor Yellow
     } else {
-        Write-Host "  [OK]   peak RSS=$rssMb MB (≤ 6 GB)"
+        Write-Host "  [OK]   peak RSS=$rssMb MB (≤ 1.5 GB D2 target)"
     }
 
     return 0
