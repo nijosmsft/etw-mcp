@@ -1321,13 +1321,21 @@ def _remove_cache_manifest(export_dir: Path) -> None:
 
 
 def _is_native_v2_manifest(manifest: dict) -> bool:
+    """Return True for native cache manifests we know how to read.
+
+    The name predates schema v3 — it now matches any schema version listed
+    in :data:`etw_analyzer.native.cache.SUPPORTED_SCHEMA_VERSIONS`. Both
+    v2 (legacy) and v3 (csharp/native producer split) caches qualify; the
+    cache loader does the producer-specific translation downstream.
+    """
+
     if manifest.get("mode") != "native":
         return False
     try:
-        from etw_analyzer.native.cache import SCHEMA_VERSION as native_schema_version
+        from etw_analyzer.native.cache import SUPPORTED_SCHEMA_VERSIONS
     except Exception:
         return False
-    return manifest.get("schema_version") == native_schema_version
+    return manifest.get("schema_version") in SUPPORTED_SCHEMA_VERSIONS
 
 
 def _required_dumper_stems_for_mode(mode: str) -> frozenset[str]:
