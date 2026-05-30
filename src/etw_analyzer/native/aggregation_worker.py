@@ -420,6 +420,35 @@ def _load_phase_b_process(
             trace.raw_csv[canonical] = df
 
 
+def _load_phase_b_thread(
+    staging_dir: Path,
+    trace: TraceData,
+    warnings: list[str],
+) -> None:
+    """Promote Phase B thread_* parquets into raw_csv[<canonical>].
+
+    The ``cpu_sampling`` / ``stacks`` aggregator chain depends on a
+    TID→PID map built by
+    ``profile_detail._build_tid_to_pid_map_from_raw_csv``, which scans
+    ``Thread/Start`` and ``Thread/DCStart`` rows for ``ProcessId`` and
+    ``ThreadId`` columns. The sidecar emits ``PID``/``TID`` (matching
+    its process schema), so without this loader the map comes out
+    empty and every SampledProfile row collapses into
+    ``Process Name='unknown', PID=0``.
+    See ``manager-log/sampledprofile-attribution-finding.md``.
+    """
+
+    from etw_analyzer.native import aggregation_worker_adapters as adapters
+
+    for stem, canonical in adapters.PHASE_B_THREAD_STEMS.items():
+        df = _read_phase_b_parquet(staging_dir, stem, warnings)
+        if df is None or df.empty:
+            continue
+        df = adapters.adapt_csharp_thread_dataframe(df)
+        if df is not None and not df.empty:
+            trace.raw_csv[canonical] = df
+
+
 def _load_phase_b_diskio(
     staging_dir: Path,
     trace: TraceData,
@@ -536,6 +565,13 @@ def _build_trace_from_staging(
         except Exception as exc:
             warnings.append(f"failed to read {stem}.parquet: {exc}")
             continue
+        # sampled_profile carries Phase B camelCase ``ProcessId`` from
+        # the sidecar, but the cpu_sampling / stacks aggregators read
+        # ``PID``. Apply the adapter before binding to either slot so
+        # ``trace.dumper_df`` and ``trace.raw_csv['SampledProfile']``
+        # point at the same already-adapted DataFrame.
+        if stem == "sampled_profile":
+            df = csharp_adapters.adapt_csharp_sampled_profile_dataframe(df)
         setattr(trace, attr, df)
         # Also expose under the canonical event-class name so aggregators
         # that look in raw_csv find the rows.
@@ -567,6 +603,7 @@ def _build_trace_from_staging(
     _load_phase_b_eventtrace_header(staging_dir, trace, warnings)
     _load_phase_b_dpc_isr(staging_dir, trace, warnings)
     _load_phase_b_process(staging_dir, trace, warnings)
+    _load_phase_b_thread(staging_dir, trace, warnings)
     _load_phase_b_diskio(staging_dir, trace, warnings)
     _load_phase_b_images(staging_dir, trace, warnings)
 

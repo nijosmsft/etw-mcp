@@ -330,6 +330,9 @@ __all__ = [
     "PHASE_B_DPC_STEMS",
     "adapt_csharp_process_dataframe",
     "PHASE_B_PROCESS_STEMS",
+    "adapt_csharp_thread_dataframe",
+    "PHASE_B_THREAD_STEMS",
+    "adapt_csharp_sampled_profile_dataframe",
     "adapt_csharp_diskio_dataframe",
     "PHASE_B_DISKIO_STEMS",
     "adapt_csharp_image_dataframe",
@@ -458,6 +461,95 @@ def adapt_csharp_process_dataframe(df: pd.DataFrame | None) -> pd.DataFrame | No
         df = df.rename(columns=rename_map)
     if "SessionId" not in df.columns:
         df["SessionId"] = 0
+    return df
+
+
+# Phase B per-opcode stems that feed the SampledProfile-aware
+# enrichment used by cpu_sampling / stacks. The sidecar emits
+# ``thread_{start,end,dcstart,dcend}`` with ``PID``/``TID`` (matching
+# the Phase B process schema), but
+# ``profile_detail._build_tid_to_pid_map_from_raw_csv`` and the cswitch
+# enrichment helpers expect ``ProcessId``/``ThreadId`` (matching the
+# native MOF handler shape). Without this adapter the TID→PID map comes
+# out empty and every SampledProfile row collapses into
+# ``Process Name='unknown', PID=0`` — see
+# ``manager-log/sampledprofile-attribution-finding.md``.
+PHASE_B_THREAD_STEMS: dict[str, str] = {
+    "thread_start":   "Thread/Start",
+    "thread_end":     "Thread/End",
+    "thread_dcstart": "Thread/DCStart",
+    "thread_dcend":   "Thread/DCEnd",
+}
+
+
+def adapt_csharp_thread_dataframe(df: pd.DataFrame | None) -> pd.DataFrame | None:
+    """Adapt a Phase B thread_* parquet to the TID→PID-map schema.
+
+    Phase B columns: ``EventSequence, TimeStampQpc, CPU, PID, TID,
+    ImageFileName?, ...``. The aggregator helpers that consume
+    Thread/Start / Thread/DCStart rows
+    (``profile_detail._build_tid_to_pid_map_from_raw_csv``,
+    cswitch readythread joins) require ``ProcessId`` and ``ThreadId``.
+
+    Returns the same DataFrame (mutated) for chaining; ``None`` /
+    empty inputs are returned unchanged. Idempotent when applied to an
+    already-native-shape DataFrame.
+    """
+
+    if df is None or df.empty:
+        return df
+    rename_map: dict[str, str] = {}
+    if "TimeStampQpc" in df.columns and "TimeStamp" not in df.columns:
+        rename_map["TimeStampQpc"] = "TimeStamp"
+    if "PID" in df.columns and "ProcessId" not in df.columns:
+        rename_map["PID"] = "ProcessId"
+    if "TID" in df.columns and "ThreadId" not in df.columns:
+        rename_map["TID"] = "ThreadId"
+    if rename_map:
+        df = df.rename(columns=rename_map)
+    return df
+
+
+def adapt_csharp_sampled_profile_dataframe(
+    df: pd.DataFrame | None,
+) -> pd.DataFrame | None:
+    """Adapt a Phase B sampled_profile parquet to the cpu_sampling schema.
+
+    Phase B columns: ``EventSequence, TimeStampQpc, CPU, ProcessId,
+    ThreadId, PayloadThreadId, InstructionPointer, Weight, ProfileWeight,
+    Stack``.
+
+    The native cpu_sampling / stacks aggregators read ``PID`` (not
+    ``ProcessId``) — the in-tree MOF handlers emit ``PID`` on
+    SampledProfile rows even though they emit ``ProcessId`` on Process
+    rows. The sidecar is consistently camelCase (``ProcessId``), so we
+    rename to bridge to the aggregator's expectation. Without this
+    rename, the process-name lookup in
+    ``profile_detail.enrich_sampled_profile_attribution`` (gated on
+    ``if "PID" in df.columns``) silently falls through and every row
+    collapses into ``Process Name='unknown'``. See
+    ``manager-log/sampledprofile-attribution-finding.md`` for the full
+    chain of failure.
+
+    ``ThreadId`` and ``PayloadThreadId`` are intentionally left alone:
+    the aggregator reads ``PayloadThreadId`` directly, and the native
+    MOF shape carries both columns under the same names.
+
+    Returns the same DataFrame (mutated) for chaining; ``None`` /
+    empty inputs are returned unchanged. Idempotent when applied to an
+    already-native-shape DataFrame (already-PID DataFrames pass
+    through).
+    """
+
+    if df is None or df.empty:
+        return df
+    rename_map: dict[str, str] = {}
+    if "TimeStampQpc" in df.columns and "TimeStamp" not in df.columns:
+        rename_map["TimeStampQpc"] = "TimeStamp"
+    if "ProcessId" in df.columns and "PID" not in df.columns:
+        rename_map["ProcessId"] = "PID"
+    if rename_map:
+        df = df.rename(columns=rename_map)
     return df
 
 
