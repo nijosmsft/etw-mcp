@@ -42,7 +42,7 @@ Every analysis tool's signature starts with `trace_id: str` and calls `require_t
 
 ## Trace lifecycle
 
-Phase N5 flipped the default extraction mode from `"xperf"` to `"auto"`. `resolve_mode()` in `src/etw_analyzer/native/config.py` now walks a three-step fallback chain: `csharp → native → xperf`. `"csharp"` wins when the C# sidecar binary is locatable via the `WPR_MCP_CSHARP_SIDECAR` env var or `wpr-mcp-extract.exe` on PATH (the in-tree `csharp/publish/win-x64/` path is intentionally skipped during auto-detect so a stray dev build does not silently change the default pipeline — explicit `mode="csharp"` does use it). `"native"` wins next when the in-process bindings load. `"xperf"` is the universal last resort. Resolution precedence: explicit `mode=` arg > `WPR_MCP_MODE` env var > the `"auto"` default. Explicit `mode="native"` raises `RuntimeError` if the consumer is unavailable; explicit `mode="csharp"` raises `ValueError` (naming the env var override) if the binary is unfindable; explicit `mode="xperf"` always works as the opt-out.
+Phase N5 flipped the default extraction mode from `"xperf"` to `"auto"`. `resolve_mode()` in `src/etw_analyzer/native/config.py` now walks a three-step fallback chain: `dotnet → native → xperf`. `"dotnet"` wins when the .NET sidecar binary is locatable via the `WPR_MCP_DOTNET_SIDECAR` env var or `wpr-mcp-extract.exe` on PATH (the in-tree `dotnet/publish/win-x64/` path is intentionally skipped during auto-detect so a stray dev build does not silently change the default pipeline — explicit `mode="dotnet"` does use it). `"native"` wins next when the in-process bindings load. `"xperf"` is the universal last resort. Resolution precedence: explicit `mode=` arg > `WPR_MCP_MODE` env var > the `"auto"` default. Explicit `mode="native"` raises `RuntimeError` if the consumer is unavailable; explicit `mode="dotnet"` raises `ValueError` (naming the env var override) if the binary is unfindable; explicit `mode="xperf"` always works as the opt-out.
 
 ### Native path (default when no sidecar is configured)
 ```
@@ -63,15 +63,15 @@ load_trace(etl_path)               # mode defaults to "auto"
   → returns markdown summary including the trace_id
 ```
 
-### C# sidecar path (`mode="csharp"` or auto with sidecar configured)
+### .NET sidecar path (`mode="dotnet"` or auto with sidecar configured)
 ```
 load_trace(etl_path)               # mode defaults to "auto"
-  → resolve_mode() → "csharp" when WPR_MCP_CSHARP_SIDECAR is set
-  → worker_supervisor.run_csharp_worker_extraction:
+  → resolve_mode() → "dotnet" when WPR_MCP_DOTNET_SIDECAR is set
+  → worker_supervisor.run_dotnet_worker_extraction:
        1. build request.json (spike-contract.md §3 schema)
        2. spawn wpr-mcp-extract.exe --request <path>
        3. stream stdout JSONL: heartbeat / progress / result
-       4. validate sidecar's v3 manifest (producer="csharp")
+       4. validate sidecar's v3 manifest (producer="dotnet")
        5. aggregation_worker.run_aggregation_worker(staging_dir, …):
             hydrate TraceData from sidecar parquets
             _run_native_aggregators(trace) ← Layer-3 outputs
@@ -98,7 +98,7 @@ load_trace(etl_path, mode="xperf")
   → _start_background_dumper() kicks off xperf -a dumper in a thread for per-CPU events
 ```
 
-trace_id format: `"trace_<sha256[:12]>"` of (lowercase path | size | mtime_ns) — stable per ETL version. All three pipelines produce the same trace_id and parquet schema, so a trace loaded in one mode can rehydrate from cache in any other (subject to the schema-v3 manifest's `producer` field being preserved across reloads). The cache manifest is schema v3 with a `producer ∈ {csharp, native, xperf}` field; v2 manifests still load and are back-filled to `producer="native"`.
+trace_id format: `"trace_<sha256[:12]>"` of (lowercase path | size | mtime_ns) — stable per ETL version. All three pipelines produce the same trace_id and parquet schema, so a trace loaded in one mode can rehydrate from cache in any other (subject to the schema-v3 manifest's `producer` field being preserved across reloads). The cache manifest is schema v3 with a `producer ∈ {dotnet, native, xperf}` field; v2 manifests still load and are back-filled to `producer="native"`.
 
 require_trace(trace_id) raises ValueError listing loaded IDs when the ID is unknown — propagate that message, don't swallow it.
 

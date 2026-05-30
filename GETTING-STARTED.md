@@ -1,6 +1,6 @@
 # Getting Started
 
-Clone-to-first-query walkthrough for `wpr-mcp-server-csharp-sidecar`. Budget
+Clone-to-first-query walkthrough for `wpr-mcp-server-dotnet-sidecar`. Budget
 ~30 minutes the first time. By the end you will have an MCP server running,
 an `.etl` loaded, and answers to the four questions every triage starts with:
 *Where did the CPU go? Which DPCs were slow? Which connections were busy? Why
@@ -21,7 +21,7 @@ full tool catalog, [`README.md`](README.md) is the canonical reference.
 | `uv` | Project + environment manager. The repo is a `pyproject.toml` workspace. | `winget install astral-sh.uv` |
 | Windows Performance Toolkit (`xperf.exe`, `wpr.exe`) | Captures ETL files and serves as the fallback extraction backend. Strongly recommended. | `winget install Microsoft.WindowsSDK` — selects the Windows Performance Toolkit feature |
 | Symbol cache writable directory | `dbghelp.dll` writes downloaded PDBs here. Pick anywhere with ~5 GB free. | `mkdir C:\symbols` |
-| .NET 8 SDK | *Only* needed if you build the C# sidecar yourself. The native + xperf paths work without it. | `winget install Microsoft.DotNet.SDK.8` |
+| .NET 8 SDK | *Only* needed if you build the .NET sidecar yourself. The native + xperf paths work without it. | `winget install Microsoft.DotNet.SDK.8` |
 
 Verify the toolchain:
 
@@ -42,8 +42,8 @@ fail with actionable errors.
 ## 2. Clone and install
 
 ```powershell
-git clone https://github.com/nijosmsft/wpr-mcp-server-csharp-sidecar.git
-cd wpr-mcp-server-csharp-sidecar
+git clone https://github.com/nijosmsft/wpr-mcp-server-dotnet-sidecar.git
+cd wpr-mcp-server-dotnet-sidecar
 
 # Base install — everything needed to run the MCP server.
 uv sync --group dev
@@ -67,23 +67,23 @@ uv run --group dev pytest tests/ -q -k "test_smoke or test_app_instructions" -x
 A passing run takes <10 seconds. If imports fail, re-run
 `uv sync --group dev --reinstall`.
 
-### Optional: build the C# sidecar
+### Optional: build the .NET sidecar
 
 The sidecar is the preferred extraction backend when available (see
 [`ARCHITECTURE.md`](ARCHITECTURE.md) §3 and §5). Build once:
 
 ```powershell
-cd csharp
+cd dotnet
 dotnet publish -c Release -r win-x64 --self-contained -o publish\win-x64
 cd ..
 
 # Point the server at the binary you just built. Persist this in your shell
 # profile or your MCP client config; the example uses the current session.
-$env:WPR_MCP_CSHARP_SIDECAR = "$PWD\csharp\publish\win-x64\wpr-mcp-extract.exe"
+$env:WPR_MCP_DOTNET_SIDECAR = "$PWD\dotnet\publish\win-x64\wpr-mcp-extract.exe"
 ```
 
-The server will now use `csharp → native → xperf` as its extraction fallback
-chain. Leaving `WPR_MCP_CSHARP_SIDECAR` unset is fine — the chain collapses to
+The server will now use `dotnet → native → xperf` as its extraction fallback
+chain. Leaving `WPR_MCP_DOTNET_SIDECAR` unset is fine — the chain collapses to
 `native → xperf`.
 
 ---
@@ -130,17 +130,17 @@ Edit `claude_desktop_config.json` (Windows path:
     "etw-trace-analyzer": {
       "type": "stdio",
       "command": "uv",
-      "args": ["run", "--project", "C:\\git\\wpr-mcp-server-csharp-sidecar", "python", "-m", "etw_analyzer.server"],
+      "args": ["run", "--project", "C:\\git\\wpr-mcp-server-dotnet-sidecar", "python", "-m", "etw_analyzer.server"],
       "env": {
         "_NT_SYMBOL_PATH": "srv*C:\\symbols*https://msdl.microsoft.com/download/symbols",
-        "WPR_MCP_CSHARP_SIDECAR": "C:\\git\\wpr-mcp-server-csharp-sidecar\\csharp\\publish\\win-x64\\wpr-mcp-extract.exe"
+        "WPR_MCP_DOTNET_SIDECAR": "C:\\git\\wpr-mcp-server-dotnet-sidecar\\dotnet\\publish\\win-x64\\wpr-mcp-extract.exe"
       }
     }
   }
 }
 ```
 
-`WPR_MCP_CSHARP_SIDECAR` is optional. Omit it and the server falls back to
+`WPR_MCP_DOTNET_SIDECAR` is optional. Omit it and the server falls back to
 the native consumer (then xperf).
 
 ### VS Code GitHub Copilot
@@ -153,7 +153,7 @@ Add to your MCP config (typically `.vscode/mcp.json` or user settings):
     "etw-trace-analyzer": {
       "type": "stdio",
       "command": "uv",
-      "args": ["run", "--project", "C:\\git\\wpr-mcp-server-csharp-sidecar", "python", "-m", "etw_analyzer.server"]
+      "args": ["run", "--project", "C:\\git\\wpr-mcp-server-dotnet-sidecar", "python", "-m", "etw_analyzer.server"]
     }
   }
 }
@@ -182,8 +182,8 @@ These five tool calls answer the four headline triage questions on any ETL.
 Substitute your own path for the fixture.
 
 ```
-list_traces directory="C:\\git\\wpr-mcp-server-csharp-sidecar\\tests\\fixtures\\cpu-only-trace"
-load_trace etl_path="C:\\git\\wpr-mcp-server-csharp-sidecar\\tests\\fixtures\\cpu-only-trace\\cpu-only-trace.etl"
+list_traces directory="C:\\git\\wpr-mcp-server-dotnet-sidecar\\tests\\fixtures\\cpu-only-trace"
+load_trace etl_path="C:\\git\\wpr-mcp-server-dotnet-sidecar\\tests\\fixtures\\cpu-only-trace\\cpu-only-trace.etl"
 trace_info trace_id="trace_<...>"
 get_sysconfig trace_id="trace_<...>"
 analyze trace_id="trace_<...>"
@@ -193,7 +193,7 @@ Expected timing on a 50 MB fixture:
 
 * `load_trace`: 10-30 s first time (decode + parquet write), <1 s on subsequent
   calls (cache hit). The summary it returns names the producer that won
-  (`csharp`, `native`, or `xperf`) and the size of every parquet dataset.
+  (`dotnet`, `native`, or `xperf`) and the size of every parquet dataset.
 * `trace_info`: instant. Reports duration, CPU count, event counts per dataset.
 * `get_sysconfig`: instant. CPU model, NIC, memory, OS build — context for
   every subsequent reading.
@@ -261,7 +261,7 @@ $env:_NT_SYMBOL_PATH = "srv*C:\symbols*https://msdl.microsoft.com/download/symbo
 ```
 
 Symbolization is Python-side (`etw_analyzer.native.symbolizer`) regardless of
-which extraction producer ran. Both the csharp sidecar and the native consumer
+which extraction producer ran. Both the dotnet sidecar and the native consumer
 hand event records to the same symbolizer — there is no per-producer symbol
 configuration.
 
@@ -273,7 +273,7 @@ The first `load_trace` decodes the ETL into
 `<etl-parent>\.etw-export-<etl-stem>\` (parquet datasets + a JSON manifest at
 schema v3). Every subsequent `load_trace` against the same ETL rehydrates
 from the cache in <1 second. The cache is shared across the three extraction
-backends — a trace decoded with the C# sidecar can be reloaded under `mode="xperf"`
+backends — a trace decoded with the .NET sidecar can be reloaded under `mode="xperf"`
 without re-decoding, because the on-disk shape is identical (see
 [`ARCHITECTURE.md`](ARCHITECTURE.md) §5).
 
@@ -294,7 +294,7 @@ To invalidate manually, delete `<etl-parent>\.etw-export-<etl-stem>\`.
   [`ARCHITECTURE.md`](ARCHITECTURE.md).
 * **AI-assistant operating notes (canonical trace lifecycle narrative)** —
   [`CLAUDE.md`](CLAUDE.md).
-* **C# sidecar build/run/troubleshoot** — [`csharp/README.md`](csharp/README.md)
+* **.NET sidecar build/run/troubleshoot** — [`dotnet/README.md`](dotnet/README.md)
   and [`src/etw_analyzer/native/SIDECAR.md`](src/etw_analyzer/native/SIDECAR.md).
 * **Evidence federation** — install with `uv sync --extra evidence`, set
   `WPR_MCP_EVIDENCE_PATH=C:\evidence`, then load any trace; rows appear at
@@ -311,8 +311,8 @@ To invalidate manually, delete `<etl-parent>\.etw-export-<etl-stem>\`.
 
 | Symptom | Likely fix |
 |---|---|
-| `xperf.exe not found` | Install Windows Performance Toolkit (Windows SDK), or set `mode="native"` if your build supports the in-process consumer, or build the sidecar and set `WPR_MCP_CSHARP_SIDECAR`. |
-| `mode='csharp' requested but wpr-mcp-extract.exe was not found` | Build the sidecar (`cd csharp; dotnet publish -c Release -r win-x64 --self-contained`) and set `WPR_MCP_CSHARP_SIDECAR` to the published exe path. |
+| `xperf.exe not found` | Install Windows Performance Toolkit (Windows SDK), or set `mode="native"` if your build supports the in-process consumer, or build the sidecar and set `WPR_MCP_DOTNET_SIDECAR`. |
+| `mode='dotnet' requested but wpr-mcp-extract.exe was not found` | Build the sidecar (`cd dotnet; dotnet publish -c Release -r win-x64 --self-contained`) and set `WPR_MCP_DOTNET_SIDECAR` to the published exe path. |
 | Functions show up as `module+0x...` | `_NT_SYMBOL_PATH` is unset or the symbol cache is unwritable. Set the env var, call `resolve_symbols`. |
 | `Trace ... not found. Call load_trace first.` | The trace was unloaded or the client lost state. Call `list_loaded_traces`, then `load_trace` again. The cache should make this fast. |
 | `another process is writing to .etw-export-...` | A prior load was killed. Delete the `.etw-export-<stem>\` directory next to the ETL and retry. |

@@ -1,14 +1,14 @@
 # Architecture
 
 Single source of truth for how the WPR trace analyzer fits together with the
-C# sidecar, the optional evidence federation, and its peer MCPs. Replaces the
+.NET sidecar, the optional evidence federation, and its peer MCPs. Replaces the
 ad-hoc status notes in `manager-log/`. Pair with
 [`GETTING-STARTED.md`](GETTING-STARTED.md) for a clone-to-first-query walkthrough
 and [`CLAUDE.md`](CLAUDE.md) for AI-assistant operating notes.
 
 ## 1. Purpose
 
-`wpr-mcp-server-csharp-sidecar` is the production tree for an MCP server that
+`wpr-mcp-server-dotnet-sidecar` is the production tree for an MCP server that
 loads Windows ETW/WPR `.etl` traces, decodes them into a structured parquet
 cache, and exposes pandas-backed analysis tools (CPU sampling, DPC/ISR, hot
 stacks, network flows, HTTP/QUIC events) over the [Model Context
@@ -26,15 +26,15 @@ or libraries, two are MCP servers.
 
 | Repo | Role | Key entry points |
 |---|---|---|
-| `wpr-mcp-server` (master / production) | Stable production tree of this server (no C# sidecar, no evidence wiring). | `src/etw_analyzer/server.py`, `README.md` |
-| `wpr-mcp-server-csharp-sidecar` (this worktree, `feature/csharp-sidecar`) | Production tree extended with the C# sidecar (csharp mode) and evidence-wiring extras. | `src/etw_analyzer/server.py`, `csharp/`, this `ARCHITECTURE.md` |
+| `wpr-mcp-server` (master / production) | Stable production tree of this server (no .NET sidecar, no evidence wiring). | `src/etw_analyzer/server.py`, `README.md` |
+| `wpr-mcp-server-dotnet-sidecar` (this worktree, `feature/dotnet-sidecar`) | Production tree extended with the .NET sidecar (dotnet mode) and evidence-wiring extras. | `src/etw_analyzer/server.py`, `dotnet/`, this `ARCHITECTURE.md` |
 | `wpr-mcp-evidence-store` (library) | Per-machine DuckDB schema + identity helpers (`module_id`, `nic_id`, `machine_id`). No MCP surface; producers and the query MCP both depend on it. | `docs/IDENTITY-SPEC.md`, `docs/PRODUCER-CONTRACT.md` |
 | `wpr-mcp-evidence-query` (MCP, reader) | MCP server that federates across per-machine DuckDB files written by the producers. Headline tool: `correlate_trace_and_dump`. | `src/evidence_query/server.py`, `README.md` |
-| `crash-dump-mcp-server` (MCP, producer-in-design) | Loads `.dmp` files, runs `!analyze`-style workflows. Designed to write the same `module_id`/`nic_id` keys but the wiring branch was rolled back; see `manager-log/VERDICT-csharp-wiring.md` "Removed scope". | `crash_dump_mcp/server.py`, `README.md` |
+| `crash-dump-mcp-server` (MCP, producer-in-design) | Loads `.dmp` files, runs `!analyze`-style workflows. Designed to write the same `module_id`/`nic_id` keys but the wiring branch was rolled back; see `manager-log/VERDICT-dotnet-wiring.md` "Removed scope". | `crash_dump_mcp/server.py`, `README.md` |
 
 ```
             ┌──────────────────────────────┐
-   .etl ─►  │ wpr-mcp-server-csharp-sidecar│  ──parquet cache──► (instant reload)
+   .etl ─►  │ wpr-mcp-server-dotnet-sidecar│  ──parquet cache──► (instant reload)
             │  (ETW writer MCP)            │
             └─────────────┬────────────────┘
                           │ (optional, WPR_MCP_EVIDENCE_PATH)
@@ -60,7 +60,7 @@ result in a shared parquet cache, then registers a `TraceData` in process. The
 optional evidence hook fires once at the end and is a no-op when not configured.
 
 ```
-            ┌─ csharp → wpr-mcp-extract.exe (self-contained .NET) ─┐
+            ┌─ dotnet → wpr-mcp-extract.exe (self-contained .NET) ─┐
 .etl ──►    ├─ native → OpenTraceW + tdh.dll (in-process)         ─┼─► per-event parquets
             └─ xperf  → xperf.exe -a dumper (subprocess pool)     ─┘
                                   │
@@ -89,13 +89,13 @@ optional evidence hook fires once at the end and is a no-op when not configured.
 ```
 
 The pipelines are interchangeable on disk — the manifest schema is identical
-across `producer ∈ {csharp, native, xperf}`, so a trace decoded under one mode
+across `producer ∈ {dotnet, native, xperf}`, so a trace decoded under one mode
 rehydrates from cache under any other.
 
 ## 4. Producer-consumer model
 
 The evidence federation is strictly **multi-producer, single-reader**. The
-producers (this server's csharp/native/xperf load paths, and eventually
+producers (this server's dotnet/native/xperf load paths, and eventually
 `crash-dump-mcp-server`) only write rows into a per-machine DuckDB; the reader
 (`wpr-mcp-evidence-query`) only reads them.
 
@@ -146,12 +146,12 @@ Manifest schema v3 (the current shape):
 ```json
 {
   "schema_version": 3,
-  "producer": "csharp",                    // {csharp, native, xperf}
-  "mode": "native",                        // on-disk pipeline name (csharp = "native"-shaped + producer)
+  "producer": "dotnet",                    // {dotnet, native, xperf}
+  "mode": "native",                        // on-disk pipeline name (dotnet = "native"-shaped + producer)
   "etl_identity": {
     "path": "C:\\traces\\spike-fixture.etl",
     "size": 1149620224,
-    "mtime_ns": 1730000000000000000        // see "C# mtime_ns" in §8
+    "mtime_ns": 1730000000000000000        // see ".NET Ticks mtime_ns" in §5
   },
   "datasets": { "sampled_profile": "sampled_profile.parquet", ... },
   "created_at": "2026-05-30T17:42:00Z"
@@ -159,20 +159,20 @@ Manifest schema v3 (the current shape):
 ```
 
 **Producer field semantics.** `producer` records *who decoded the events into
-parquet*; `mode` records the on-disk shape. csharp writes
-`mode="native" producer="csharp"` so the in-process consumer's loader can
+parquet*; `mode` records the on-disk shape. dotnet writes
+`mode="native" producer="dotnet"` so the in-process consumer's loader can
 rehydrate the cache without changes.
 
 **Cross-producer compatibility.** v2 manifests still load and back-fill to
-`producer="native"`. A csharp-produced cache rehydrates under `mode="native"`
+`producer="native"`. A dotnet-produced cache rehydrates under `mode="native"`
 or `mode="xperf"` on the next load — verified by
 `tests/test_trace_mgmt_cache.py`.
 
 **Invalidation.** The loader compares ETL `(size, mtime_ns)` to the manifest
-and re-decodes from scratch on mismatch. The csharp sidecar has a known
+and re-decodes from scratch on mismatch. The dotnet sidecar has a known
 `mtime_ns` quirk (.NET Ticks vs Unix epoch) — the Python `EtlIdentity` falls
-back to "loose" matching (`size` + `name` only) when `producer="csharp"` until
-the C# fix lands. Both behaviors are pinned by tests in
+back to "loose" matching (`size` + `name` only) when `producer="dotnet"` until
+the .NET sidecar fix lands. Both behaviors are pinned by tests in
 `tests/test_trace_mgmt_cache.py`.
 
 ## 6. Tool registration and trace lifecycle
@@ -229,22 +229,22 @@ This server's integration module is `src/etw_analyzer/evidence_integration.py`
 Concrete error text → actionable fix. The error rewrites in `tools/trace_mgmt.py`
 follow this same "what next" pattern.
 
-### 8.1 C# sidecar binary not found
+### 8.1 .NET sidecar binary not found
 
 ```
-load_trace(..., mode="csharp")
-→ ValueError: mode='csharp' requested but wpr-mcp-extract.exe was not found.
-  Set WPR_MCP_CSHARP_SIDECAR to the published binary path
+load_trace(..., mode="dotnet")
+→ ValueError: mode='dotnet' requested but wpr-mcp-extract.exe was not found.
+  Set WPR_MCP_DOTNET_SIDECAR to the published binary path
   (e.g. C:\\install\\wpr-mcp-extract.exe), or build it once with
-  `cd csharp; dotnet publish -c Release -r win-x64 --self-contained`,
+  `cd dotnet; dotnet publish -c Release -r win-x64 --self-contained`,
   or use mode='native'/'xperf' instead.
 ```
 
-Fix: build the sidecar (`cd csharp; dotnet publish -c Release -r win-x64
+Fix: build the sidecar (`cd dotnet; dotnet publish -c Release -r win-x64
 --self-contained -o publish\win-x64`) and set
-`WPR_MCP_CSHARP_SIDECAR=...\wpr-mcp-extract.exe`. The auto-detect *intentionally*
-skips the in-tree `csharp/publish/win-x64/` path so a stray dev build doesn't
-silently change the default pipeline. Explicit `mode="csharp"` does check that
+`WPR_MCP_DOTNET_SIDECAR=...\wpr-mcp-extract.exe`. The auto-detect *intentionally*
+skips the in-tree `dotnet/publish/win-x64/` path so a stray dev build doesn't
+silently change the default pipeline. Explicit `mode="dotnet"` does check that
 path.
 
 ### 8.2 Cache schema mismatch
@@ -286,7 +286,7 @@ get_hot_functions(trace_id)
 Fix: set `_NT_SYMBOL_PATH` in the MCP env (typically
 `srv*C:\\symbols*https://msdl.microsoft.com/download/symbols`) and call
 `resolve_symbols(trace_id)` to force a re-download + reload. `check_symbols`
-reports which modules failed to resolve and why. The csharp sidecar does
+reports which modules failed to resolve and why. The dotnet sidecar does
 **not** symbolize — symbolization is Python-side in
 `etw_analyzer.native.symbolizer` regardless of producer.
 
@@ -297,22 +297,22 @@ load_trace(...)
 → xperf.exe not found. Install Windows Performance Toolkit (part of Windows
   SDK/ADK) or add it to PATH. Expected at: C:\\Program Files (x86)\\Windows
   Kits\\10\\Windows Performance Toolkit\\xperf.exe — OR set WPR_MCP_MODE=native
-  / mode=native if the in-process consumer is available, OR build the C#
-  sidecar and set WPR_MCP_CSHARP_SIDECAR.
+  / mode=native if the in-process consumer is available, OR build the .NET
+  sidecar and set WPR_MCP_DOTNET_SIDECAR.
 ```
 
 Fix: install the Windows SDK (`winget install Microsoft.WindowsSDK`), or
-install the C# sidecar, or run on a Windows build that has the native
+install the .NET sidecar, or run on a Windows build that has the native
 consumer. `mode="auto"` will pick whichever is available without further
 intervention.
 
 ### 8.6 Sidecar JSONL parse failure
 
 ```
-load_trace(..., mode="csharp")
+load_trace(..., mode="dotnet")
 → Native ETW worker extraction failed: invalid-stdout: sidecar emitted
   malformed JSONL. The sidecar may be a stale build — rebuild with
-  `cd csharp; dotnet publish -c Release -r win-x64 --self-contained` and
+  `cd dotnet; dotnet publish -c Release -r win-x64 --self-contained` and
   retry, or fall back to mode='native'/'xperf'.
 ```
 
@@ -328,7 +328,7 @@ shapes. Rebuild the sidecar against the current source tree.
 * [`GETTING-STARTED.md`](GETTING-STARTED.md) — 30-minute onboarding
 * [`CLAUDE.md`](CLAUDE.md) — AI-assistant operating notes (canonical trace
   lifecycle narrative)
-* [`csharp/README.md`](csharp/README.md) — sidecar build/run/smoke-test
+* [`dotnet/README.md`](dotnet/README.md) — sidecar build/run/smoke-test
 * [`src/etw_analyzer/native/SIDECAR.md`](src/etw_analyzer/native/SIDECAR.md) —
   supervisor + debugging notes for the sidecar
 
@@ -345,9 +345,9 @@ shapes. Rebuild the sidecar against the current source tree.
 * [`evidence-mcp-poc-plan.md`](evidence-mcp-poc-plan.md) — §1.1 documents the
   G1-G4 isolation guarantees called out above.
 * [`rust-hybrid-migration-plan.md`](rust-hybrid-migration-plan.md) — the
-  language-choice plan the C# sidecar implements.
+  language-choice plan the .NET sidecar implements.
 * [`docs/decisions/`](docs/decisions/) — promoted review docs that shape the
-  architecture (`rust-vs-csharp-spike-review.md`,
+  architecture (`rust-vs-dotnet-spike-review.md`,
   `native-vs-xperf-parity-review.md`, `evidence-language-review.md`). See
   [`docs/decisions/README.md`](docs/decisions/README.md) for what each one
   decides.
@@ -356,4 +356,4 @@ shapes. Rebuild the sidecar against the current source tree.
 
 * `manager-log/improve-docs-dx-exploration.md` and
   `improve-llm-mcp-exploration.md` — the audits that drove this doc.
-* `manager-log/VERDICT-csharp-wiring.md` — canonical state of the POC.
+* `manager-log/VERDICT-dotnet-wiring.md` — canonical state of the POC.

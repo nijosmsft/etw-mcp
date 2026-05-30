@@ -1,15 +1,15 @@
-# `wpr-mcp-extract.exe` — C# sidecar (production)
+# `wpr-mcp-extract.exe` — .NET sidecar (production)
 
 Sidecar binary that decodes Windows ETL traces into Layer-1 parquets per
 [spike-contract.md](../../wpr-mcp-poc-staging/docs/spike-contract.md).
 Closes the 5 documented parity gaps in
 [../native-vs-xperf-parity-review.md](../native-vs-xperf-parity-review.md)
-and bumps the spike to production quality on `feature/csharp-sidecar`.
+and bumps the spike to production quality on `feature/dotnet-sidecar`.
 
 ## Build
 
 ```powershell
-cd csharp
+cd dotnet
 dotnet publish -c Release -r win-x64 --self-contained -o publish\win-x64
 # → publish\win-x64\wpr-mcp-extract.exe  (self-contained single-file, ~38 MB)
 ```
@@ -85,7 +85,7 @@ full request-name → TraceEvent handler → parquet stem table and the
 
 ```
 <staging>/
-├── wpr-mcp-cache-manifest.json     (schema_version=3, producer="csharp")
+├── wpr-mcp-cache-manifest.json     (schema_version=3, producer="dotnet")
 ├── sampled_profile.parquet
 ├── cswitch_events.parquet
 ├── readythread.parquet
@@ -160,7 +160,7 @@ ParquetEmitter.cs     ── lower-level Parquet.Net writer with list-inner fiel
 EventStoreEmitter.cs  ── chunked per-class parquets + native-event-store-manifest.json
                          (event-store-streaming only)
 ManifestEmitter.cs    ── wpr-mcp-cache-manifest.json (schema_version=3,
-                         producer="csharp", timebase {qpc_origin, perf_freq})
+                         producer="dotnet", timebase {qpc_origin, perf_freq})
 SysconfigCollector.cs ── sysconfig.txt (CPU / NIC / Disk / OS lines)
 ```
 
@@ -241,7 +241,7 @@ or prod deployment, sign with the engineering Authenticode cert.
 ## Files
 
 ```
-csharp/
+dotnet/
 ├── README.md                   (this file)
 ├── wpr-mcp-extract.csproj      (.NET 8 single-file self-contained)
 ├── docs/

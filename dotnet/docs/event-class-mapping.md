@@ -1,6 +1,6 @@
 # Event-class name mapping
 
-Authoritative source for the canonical event-class strings the C# sidecar
+Authoritative source for the canonical event-class strings the .NET sidecar
 recognizes in `request.requested_event_classes`, the TraceEvent typed-handler
 they bind to, the destination row buffer, the parquet filename, and how the
 mapping correlates with Python's

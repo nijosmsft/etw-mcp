@@ -20,7 +20,7 @@ before publishing.
 
 ```powershell
 # After dotnet publish, before copying anywhere.
-$exe = "C:\git\wpr-mcp-server-csharp-sidecar\csharp\publish\win-x64\wpr-mcp-extract.exe"
+$exe = "C:\git\wpr-mcp-server-dotnet-sidecar\dotnet\publish\win-x64\wpr-mcp-extract.exe"
 
 # Cert file:
 signtool sign /f $env:SIGNING_PFX /p $env:SIGNING_PFX_PW `
