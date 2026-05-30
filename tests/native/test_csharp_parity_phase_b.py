@@ -954,3 +954,214 @@ class TestPhaseBStacks:
         df = pd.read_parquet(parquet)
         assert "Direction" in df.columns
         assert "self" in set(df["Direction"])
+
+
+# ---- Adapter unit tests: EventTrace/Header -----------------------------
+
+
+class TestEventtraceHeaderToMetadata:
+    def test_extracts_perf_freq_and_cpu_count(self):
+        df = _make_eventtrace_header(perf_freq=10_000_000, cpu_count=80)
+        meta = adapters.eventtrace_header_to_metadata(df)
+        assert meta is not None
+        assert meta.cpu_count == 80
+        assert meta.timestamp_frequency == 10_000_000.0
+
+    def test_computes_duration_from_filetime(self):
+        # 1 second = 1e7 FILETIME ticks.
+        df = _make_eventtrace_header(
+            start_100ns=132_000_000_000_000_000,
+            end_100ns=132_000_000_010_000_000,  # +1 second
+        )
+        meta = adapters.eventtrace_header_to_metadata(df)
+        assert meta.duration_seconds == pytest.approx(1.0)
+
+    def test_returns_none_for_empty(self):
+        assert adapters.eventtrace_header_to_metadata(None) is None
+        assert adapters.eventtrace_header_to_metadata(pd.DataFrame()) is None
+
+    def test_returns_none_when_all_fields_zero(self):
+        df = pd.DataFrame([{
+            "PerfFreq": 0,
+            "NumberOfProcessors": 0,
+            "StartTime100Ns": 0,
+            "EndTime100Ns": 0,
+        }])
+        assert adapters.eventtrace_header_to_metadata(df) is None
+
+    def test_handles_invalid_perf_freq(self):
+        df = pd.DataFrame([{
+            "PerfFreq": "not-a-number",
+            "NumberOfProcessors": 8,
+            "StartTime100Ns": 0,
+            "EndTime100Ns": 0,
+        }])
+        meta = adapters.eventtrace_header_to_metadata(df)
+        assert meta is not None
+        assert meta.cpu_count == 8
+        assert meta.timestamp_frequency is None
+
+
+class TestBuildTraceMetadataDataframeWithHeader:
+    def test_header_extras_propagate(self):
+        meta = adapters.CsharpMetadata(
+            cpu_count=80, duration_seconds=1.0, timestamp_frequency=10_000_000.0,
+        )
+        manifest = native_cache.CacheManifest(
+            schema_version=3, mode="native", strategy="materialized-small",
+            complete=True,
+            etl=native_cache.EtlIdentity(path="x", name="x", size=1, mtime_ns=0),
+            datasets=[], producer="csharp",
+        )
+        header = _make_eventtrace_header(
+            perf_freq=10_000_000, cpu_count=80,
+            start_100ns=132_000_000_000_000_000,
+            end_100ns=132_000_000_010_000_000,
+        )
+        df = adapters.build_trace_metadata_dataframe(
+            meta, manifest, eventtrace_header_df=header,
+        )
+        # Authoritative values land in the trace_metadata row.
+        assert int(df.iloc[0]["StartTime"]) == 132_000_000_000_000_000
+        assert int(df.iloc[0]["EndTime"]) == 132_000_000_010_000_000
+        assert int(df.iloc[0]["TimerResolution"]) == 156250
+        assert int(df.iloc[0]["CpuSpeedInMHz"]) == 2300
+        assert int(df.iloc[0]["BuffersWritten"]) == 100
+
+    def test_zero_defaults_when_no_header(self):
+        meta = adapters.CsharpMetadata(
+            cpu_count=4, duration_seconds=0.5, timestamp_frequency=10_000_000.0,
+        )
+        manifest = native_cache.CacheManifest(
+            schema_version=3, mode="native", strategy="materialized-small",
+            complete=True,
+            etl=native_cache.EtlIdentity(path="x", name="x", size=1, mtime_ns=0),
+            datasets=[], producer="csharp",
+        )
+        df = adapters.build_trace_metadata_dataframe(meta, manifest)
+        assert int(df.iloc[0]["StartTime"]) == 0
+        assert int(df.iloc[0]["EndTime"]) == 0
+
+
+# ---- Integration: trace_metadata upgrade -------------------------------
+
+
+class TestPhaseBTraceMetadataUpgrade:
+    def test_authoritative_perf_freq_from_header(self, tmp_path: Path):
+        """trace_metadata PerfFreq comes from eventtrace_header parquet,
+        not the heuristic 10 MHz default."""
+        etl = _make_etl(tmp_path)
+        staging = tmp_path / "staging"
+        # Use a non-default PerfFreq to prove the header wins.
+        _seed_phase_b_staging(staging, etl, include_eventtrace_header=False)
+        df = _make_eventtrace_header(perf_freq=3_579_545, cpu_count=80)
+        df.to_parquet(staging / "eventtrace_header.parquet", index=False)
+        manifest = native_cache.read_manifest(staging)
+        datasets = list(manifest.datasets)
+        datasets.append(native_cache.CacheDataset(
+            name="eventtrace_header", kind="parquet",
+            path="eventtrace_header.parquet", row_count=1,
+            materialize_on_load=True,
+        ))
+        native_cache.write_manifest(
+            staging,
+            native_cache.CacheManifest.materialized_small(
+                etl, datasets, producer="csharp",
+            ),
+        )
+        result = aggregation_worker.run_aggregation_worker(
+            staging, etl, trace_id="trace_header_perffreq",
+        )
+        assert result.ok is True
+        meta_parquet = staging / "trace_metadata.parquet"
+        assert meta_parquet.exists()
+        meta_df = pd.read_parquet(meta_parquet)
+        assert int(meta_df.iloc[0]["PerfFreq"]) == 3_579_545
+        assert int(meta_df.iloc[0]["NumberOfProcessors"]) == 80
+
+    def test_start_and_end_time_from_header(self, tmp_path: Path):
+        etl = _make_etl(tmp_path)
+        staging = tmp_path / "staging"
+        _seed_phase_b_staging(
+            staging, etl, include_eventtrace_header=True,
+        )
+        result = aggregation_worker.run_aggregation_worker(
+            staging, etl, trace_id="trace_header_st_et",
+        )
+        assert result.ok is True
+        meta_df = pd.read_parquet(staging / "trace_metadata.parquet")
+        # Defaults from _make_eventtrace_header.
+        assert int(meta_df.iloc[0]["StartTime"]) == 132_000_000_000_000_000
+        assert int(meta_df.iloc[0]["EndTime"]) == 132_000_000_100_000_000
+        # 100M ticks @ 10 MHz FILETIME = 10 seconds duration.
+        assert float(meta_df.iloc[0]["DurationSeconds"]) == pytest.approx(10.0)
+
+    def test_falls_back_to_heuristic_when_no_header(self, tmp_path: Path):
+        """No eventtrace_header → heuristic max(CPU)+1 + QPC-range derivation."""
+        etl = _make_etl(tmp_path)
+        staging = tmp_path / "staging"
+        _seed_phase_b_staging(
+            staging, etl, sampled_rows=200, cpu_count=4,
+            include_eventtrace_header=False,
+        )
+        result = aggregation_worker.run_aggregation_worker(
+            staging, etl, trace_id="trace_header_fallback",
+        )
+        assert result.ok is True
+        meta_df = pd.read_parquet(staging / "trace_metadata.parquet")
+        # cpu_count from max(CPU)+1=4; StartTime / EndTime stay 0 because
+        # no header was present.
+        assert int(meta_df.iloc[0]["NumberOfProcessors"]) == 4
+        assert int(meta_df.iloc[0]["StartTime"]) == 0
+        assert int(meta_df.iloc[0]["EndTime"]) == 0
+        assert int(meta_df.iloc[0]["PerfFreq"]) == 10_000_000
+
+    def test_dpc_initial_time_uses_header_perf_freq(self, tmp_path: Path):
+        """The Phase B perf_freq from the header drives DPC InitialTime synthesis."""
+        etl = _make_etl(tmp_path)
+        staging = tmp_path / "staging"
+        _seed_phase_b_staging(
+            staging, etl, include_perfinfo=True, include_eventtrace_header=False,
+        )
+        # Use a non-default perf_freq.
+        hdr = _make_eventtrace_header(perf_freq=2_000_000)  # 2 MHz
+        hdr.to_parquet(staging / "eventtrace_header.parquet", index=False)
+        manifest = native_cache.read_manifest(staging)
+        datasets = list(manifest.datasets)
+        datasets.append(native_cache.CacheDataset(
+            name="eventtrace_header", kind="parquet",
+            path="eventtrace_header.parquet", row_count=1,
+            materialize_on_load=True,
+        ))
+        native_cache.write_manifest(
+            staging,
+            native_cache.CacheManifest.materialized_small(
+                etl, datasets, producer="csharp",
+            ),
+        )
+
+        # Capture the DataFrame the loader leaves under PerfInfo/DPC.
+        from etw_analyzer.native import aggregation_worker as aw
+        captured: dict[str, pd.DataFrame] = {}
+        real_persist = aw._persist_aggregator_outputs
+
+        def cap(staging_dir, trace, warnings):
+            df = trace.raw_csv.get("PerfInfo/DPC")
+            if df is not None:
+                captured["dpc"] = df.copy()
+            return real_persist(staging_dir, trace, warnings)
+
+        aw._persist_aggregator_outputs = cap
+        try:
+            aw.run_aggregation_worker(staging, etl, trace_id="trace_dpc_freq")
+        finally:
+            aw._persist_aggregator_outputs = real_persist
+
+        dpc = captured["dpc"]
+        assert "InitialTime" in dpc.columns
+        # ticks_per_us = 2 (2 MHz / 1 MHz). InitialTime = TimeStamp -
+        # ElapsedMicros * 2.
+        row = dpc.iloc[0]
+        ts = int(row["TimeStamp"])
+        elapsed_us = int(row["ElapsedMicros"])
+        assert int(row["InitialTime"]) == ts - elapsed_us * 2

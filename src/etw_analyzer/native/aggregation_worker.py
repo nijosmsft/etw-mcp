@@ -220,9 +220,17 @@ def run_aggregation_worker(
     # manifest BEFORE the aggregators run, so cpu_timeline /
     # trace_metadata / tracestats have what they need.
     try:
-        derived = csharp_adapters.derive_metadata_from_sidecar(
-            trace, sidecar_manifest
-        )
+        # Phase B: when the sidecar emitted EventTrace/Header, that
+        # row is authoritative — use it instead of the QPC-range
+        # heuristic. ``eventtrace_header_to_metadata`` returns None
+        # when the parquet is absent or missing required columns,
+        # which falls through to the heuristic path below.
+        header_df = trace.raw_csv.get("EventTrace/Header")
+        derived = csharp_adapters.eventtrace_header_to_metadata(header_df)
+        if derived is None:
+            derived = csharp_adapters.derive_metadata_from_sidecar(
+                trace, sidecar_manifest
+            )
         csharp_adapters.apply_metadata_to_trace(trace, derived)
         # Pre-populate the trace_metadata DataFrame so the existing
         # ``_native_metadata_dataframe`` path (which only kicks in when
@@ -231,7 +239,8 @@ def run_aggregation_worker(
         if "trace_metadata" not in trace.raw_csv:
             trace.raw_csv["trace_metadata"] = (
                 csharp_adapters.build_trace_metadata_dataframe(
-                    derived, sidecar_manifest
+                    derived, sidecar_manifest,
+                    eventtrace_header_df=header_df,
                 )
             )
         # Seed event_counts from the manifest so build_tracestats_text
@@ -348,18 +357,30 @@ def _load_phase_b_dpc_isr(
     ``ElapsedMicros`` so the aggregator's standard duration-from-QPC
     code path works unchanged.
     """
-    # Use perf_freq from trace_metadata when available so the
-    # InitialTime synthesis aligns with the aggregator's perf_freq
-    # lookup. Falls back to 10 MHz (the QPC default) when missing.
+    # Use perf_freq from EventTrace/Header (Phase B authoritative) or
+    # trace_metadata (set if a prior aggregation populated it), in that
+    # order. Falls back to 10 MHz (QPC default) when neither is
+    # available. The eventtrace_header loader runs before this one in
+    # _build_trace_from_staging, so the header path is the common case
+    # when the sidecar emitted EventTrace/Header.
     perf_freq = 10_000_000.0
-    metadata_df = trace.raw_csv.get("trace_metadata")
-    if metadata_df is not None and not metadata_df.empty and "PerfFreq" in metadata_df.columns:
+    header_df = trace.raw_csv.get("EventTrace/Header")
+    if header_df is not None and not header_df.empty and "PerfFreq" in header_df.columns:
         try:
-            freq = float(metadata_df["PerfFreq"].iloc[0])
+            freq = float(header_df["PerfFreq"].iloc[0])
             if freq > 0:
                 perf_freq = freq
         except (TypeError, ValueError):
             pass
+    if perf_freq == 10_000_000.0:
+        metadata_df = trace.raw_csv.get("trace_metadata")
+        if metadata_df is not None and not metadata_df.empty and "PerfFreq" in metadata_df.columns:
+            try:
+                freq = float(metadata_df["PerfFreq"].iloc[0])
+                if freq > 0:
+                    perf_freq = freq
+            except (TypeError, ValueError):
+                pass
 
     for stem, canonical in csharp_adapters.PHASE_B_DPC_STEMS.items():
         df = _read_phase_b_parquet(staging_dir, stem, warnings)
@@ -459,6 +480,26 @@ def _load_phase_b_images(
         warnings.append(f"csharp symbolizer build failed: {exc}")
 
 
+def _load_phase_b_eventtrace_header(
+    staging_dir: Path,
+    trace: TraceData,
+    warnings: list[str],
+) -> None:
+    """Load the eventtrace_header parquet into raw_csv['EventTrace/Header'].
+
+    Single-row parquet from the sidecar carrying the authoritative
+    ETL kernel header (PerfFreq, NumberOfProcessors, StartTime100Ns,
+    EndTime100Ns, ...). The metadata derivation in
+    ``run_aggregation_worker`` reads this BEFORE the heuristic-based
+    derive_metadata_from_sidecar and uses it to drive the trace_metadata
+    DataFrame.
+    """
+    df = _read_phase_b_parquet(staging_dir, "eventtrace_header", warnings)
+    if df is None or df.empty:
+        return
+    trace.raw_csv["EventTrace/Header"] = df
+
+
 def _build_trace_from_staging(
     *,
     staging_dir: Path,
@@ -517,6 +558,12 @@ def _build_trace_from_staging(
     # _PROCESS_CLASSES / _DISKIO_CLASSES looking for canonical keys, so
     # we just need to land them there. Adapters do the column-rename /
     # column-synthesis work first.
+    #
+    # Order matters: eventtrace_header populates trace_metadata's
+    # PerfFreq, which _load_phase_b_dpc_isr reads when synthesising
+    # InitialTime. Load the header first so the DPC loader sees the
+    # authoritative perf frequency rather than the 10 MHz default.
+    _load_phase_b_eventtrace_header(staging_dir, trace, warnings)
     _load_phase_b_dpc_isr(staging_dir, trace, warnings)
     _load_phase_b_process(staging_dir, trace, warnings)
     _load_phase_b_diskio(staging_dir, trace, warnings)

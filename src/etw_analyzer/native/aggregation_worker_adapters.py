@@ -159,6 +159,8 @@ def apply_metadata_to_trace(
 def build_trace_metadata_dataframe(
     metadata: CsharpMetadata,
     sidecar_manifest: native_cache.CacheManifest,
+    *,
+    eventtrace_header_df: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """Build a one-row ``trace_metadata`` DataFrame matching native schema.
 
@@ -170,26 +172,62 @@ def build_trace_metadata_dataframe(
     expose is emitted as 0 / None so downstream consumers (e.g.
     ``tracestats._metadata_lines``, ``profile_util._timeline_metadata``)
     can still distinguish "known zero" from "missing".
+
+    Phase B: when ``eventtrace_header_df`` is provided (single-row
+    parquet from the sidecar) the StartTime / EndTime / TimerResolution
+    / CpuSpeedInMHz / EventsLost / BuffersWritten / PointerSize columns
+    are filled from the authoritative kernel header instead of being
+    emitted as zero.
     """
+    extra = _extract_eventtrace_header_extras(eventtrace_header_df)
     return pd.DataFrame([
         {
             "NumberOfProcessors": int(metadata.cpu_count or 0),
-            "StartTime": 0,
-            "EndTime": 0,
+            "StartTime": int(extra.get("StartTime", 0)),
+            "EndTime": int(extra.get("EndTime", 0)),
             "DurationSeconds": (
                 float(metadata.duration_seconds)
                 if metadata.duration_seconds
                 else None
             ),
             "PerfFreq": int(metadata.timestamp_frequency or 0),
-            "TimerResolution": 0,
-            "CpuSpeedInMHz": 0,
-            "EventsLost": 0,
+            "TimerResolution": int(extra.get("TimerResolution", 0)),
+            "CpuSpeedInMHz": int(extra.get("CpuSpeedInMHz", 0)),
+            "EventsLost": int(extra.get("EventsLost", 0)),
             "BuffersLost": 0,
-            "BuffersWritten": 0,
-            "PointerSize": 8,
+            "BuffersWritten": int(extra.get("BuffersWritten", 0)),
+            "PointerSize": int(extra.get("PointerSize", 8)),
         }
     ])
+
+
+def _extract_eventtrace_header_extras(
+    df: pd.DataFrame | None,
+) -> dict[str, int]:
+    """Pull non-metadata fields from the eventtrace_header parquet.
+
+    Returns 0/8 defaults when ``df`` is None / empty / missing columns
+    so the caller can splat the dict into the trace_metadata row.
+    """
+    if df is None or df.empty:
+        return {}
+    row = df.iloc[0]
+    out: dict[str, int] = {}
+    for src, dst in (
+        ("StartTime100Ns", "StartTime"),
+        ("EndTime100Ns", "EndTime"),
+        ("TimerResolution", "TimerResolution"),
+        ("CpuSpeedMHz", "CpuSpeedInMHz"),
+        ("EventsLost", "EventsLost"),
+        ("BuffersWritten", "BuffersWritten"),
+        ("PointerSize", "PointerSize"),
+    ):
+        if src in df.columns:
+            try:
+                out[dst] = int(row[src] or 0)
+            except (TypeError, ValueError):
+                out[dst] = 0
+    return out
 
 
 def populate_event_counts_from_manifest(
@@ -297,6 +335,7 @@ __all__ = [
     "adapt_csharp_image_dataframe",
     "PHASE_B_IMAGE_STEMS",
     "build_symbolizer_from_csharp_images",
+    "eventtrace_header_to_metadata",
 ]
 
 
@@ -547,3 +586,62 @@ def build_symbolizer_from_csharp_images(trace) -> bool:
 
     trace.symbolizer = symbolizer
     return True
+
+
+def eventtrace_header_to_metadata(
+    df: pd.DataFrame | None,
+) -> CsharpMetadata | None:
+    """Build a CsharpMetadata from a Phase B eventtrace_header parquet.
+
+    The sidecar's eventtrace_header parquet is a single-row table with
+    the authoritative ETL kernel-header fields:
+
+      ``PerfFreq, NumberOfProcessors, TimerResolution, StartTime100Ns,
+       EndTime100Ns, BootTime100Ns, CpuSpeedMHz, PointerSize,
+       LogFileMode, BuffersWritten, EventsLost, SessionName,
+       LogFileName``
+
+    When present, these REPLACE the heuristic derivation
+    (max(CPU)+1 + QPC-range / 10 MHz) that ``derive_metadata_from_sidecar``
+    fell back to in Phase A. Per P1's handoff the
+    StartTime100Ns / EndTime100Ns are FILETIME 100ns units since
+    1601 UTC; duration is ``(End - Start) / 1e7`` seconds.
+
+    Returns ``None`` when the parquet is None / empty / missing required
+    columns, so callers can fall through to the heuristic path.
+    """
+
+    if df is None or df.empty:
+        return None
+    row = df.iloc[0]
+    try:
+        perf_freq = float(row.get("PerfFreq", 0) or 0)
+    except (TypeError, ValueError):
+        perf_freq = 0.0
+    try:
+        cpu_count = int(row.get("NumberOfProcessors", 0) or 0)
+    except (TypeError, ValueError):
+        cpu_count = 0
+    try:
+        start_100ns = int(row.get("StartTime100Ns", 0) or 0)
+    except (TypeError, ValueError):
+        start_100ns = 0
+    try:
+        end_100ns = int(row.get("EndTime100Ns", 0) or 0)
+    except (TypeError, ValueError):
+        end_100ns = 0
+
+    duration: float | None = None
+    if end_100ns > start_100ns > 0:
+        # FILETIME 100ns ticks since 1601 UTC; (delta) / 10^7 == seconds.
+        duration = (end_100ns - start_100ns) / 10_000_000.0
+
+    if not (perf_freq or cpu_count or duration):
+        # Nothing usable — let the heuristic path try.
+        return None
+
+    return CsharpMetadata(
+        cpu_count=cpu_count or None,
+        duration_seconds=duration,
+        timestamp_frequency=perf_freq or None,
+    )
