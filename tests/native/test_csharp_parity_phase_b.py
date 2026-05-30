@@ -533,6 +533,225 @@ class TestAdaptCsharpProcessDataframe:
         assert out["SessionId"].iloc[0] == 1
 
 
+# ---- Adapter unit tests: thread (TID->ProcessId/ThreadId rename) -------
+
+
+def _make_thread_dcstart(rows: int = 5) -> pd.DataFrame:
+    """Phase B thread_dcstart schema: PID/TID (NOT ProcessId/ThreadId)."""
+    return pd.DataFrame({
+        "EventSequence": list(range(rows)),
+        "TimeStampQpc": [1_000_000 + i * 1000 for i in range(rows)],
+        "CPU": [0] * rows,
+        "PID": [1000 + i for i in range(rows)],
+        "TID": [4000 + i for i in range(rows)],
+        "ImageFileName": [f"proc_{i}.exe" for i in range(rows)],
+    })
+
+
+class TestAdaptCsharpThreadDataframe:
+    def test_renames_pid_to_processid(self):
+        df = _make_thread_dcstart(rows=3)
+        out = adapters.adapt_csharp_thread_dataframe(df)
+        assert "ProcessId" in out.columns
+        assert "PID" not in out.columns
+
+    def test_renames_tid_to_threadid(self):
+        df = _make_thread_dcstart(rows=3)
+        out = adapters.adapt_csharp_thread_dataframe(df)
+        assert "ThreadId" in out.columns
+        assert "TID" not in out.columns
+
+    def test_renames_timestampqpc_to_timestamp(self):
+        df = _make_thread_dcstart(rows=3)
+        out = adapters.adapt_csharp_thread_dataframe(df)
+        assert "TimeStamp" in out.columns
+        assert "TimeStampQpc" not in out.columns
+
+    def test_preserves_thread_metadata(self):
+        df = _make_thread_dcstart(rows=3)
+        out = adapters.adapt_csharp_thread_dataframe(df)
+        assert out["ProcessId"].tolist() == [1000, 1001, 1002]
+        assert out["ThreadId"].tolist() == [4000, 4001, 4002]
+        assert out["ImageFileName"].iloc[0] == "proc_0.exe"
+
+    def test_handles_none_and_empty(self):
+        assert adapters.adapt_csharp_thread_dataframe(None) is None
+        empty = pd.DataFrame()
+        out = adapters.adapt_csharp_thread_dataframe(empty)
+        assert out is empty
+
+    def test_idempotent_when_already_native_shape(self):
+        df = pd.DataFrame({
+            "TimeStamp": [1],
+            "ProcessId": [42],
+            "ThreadId": [200],
+        })
+        out = adapters.adapt_csharp_thread_dataframe(df)
+        assert "ProcessId" in out.columns
+        assert "ThreadId" in out.columns
+        assert "TimeStamp" in out.columns
+        assert out["ProcessId"].iloc[0] == 42
+        assert out["ThreadId"].iloc[0] == 200
+
+    def test_phase_b_thread_stems_cover_start_end_dcstart_dcend(self):
+        assert set(adapters.PHASE_B_THREAD_STEMS.keys()) == {
+            "thread_start", "thread_end", "thread_dcstart", "thread_dcend",
+        }
+        # Canonical event-class names must match what the in-tree
+        # aggregator helpers look up (Thread/Start, etc.).
+        assert adapters.PHASE_B_THREAD_STEMS["thread_start"] == "Thread/Start"
+        assert adapters.PHASE_B_THREAD_STEMS["thread_dcstart"] == "Thread/DCStart"
+
+
+# ---- Adapter unit tests: sampled_profile (ProcessId->PID rename) -------
+
+
+class TestAdaptCsharpSampledProfileDataframe:
+    def test_renames_processid_to_pid(self):
+        df = _make_sampled_profile(rows=4)
+        out = adapters.adapt_csharp_sampled_profile_dataframe(df)
+        assert "PID" in out.columns
+        assert "ProcessId" not in out.columns
+
+    def test_renames_timestampqpc_to_timestamp(self):
+        df = _make_sampled_profile(rows=4)
+        out = adapters.adapt_csharp_sampled_profile_dataframe(df)
+        assert "TimeStamp" in out.columns
+        assert "TimeStampQpc" not in out.columns
+
+    def test_preserves_payload_thread_id_and_other_columns(self):
+        df = _make_sampled_profile(rows=4)
+        out = adapters.adapt_csharp_sampled_profile_dataframe(df)
+        # ThreadId / PayloadThreadId must NOT be renamed — the
+        # SampledProfile MOF shape uses these exact names natively.
+        assert "PayloadThreadId" in out.columns
+        assert "ThreadId" in out.columns
+        # Identifying fields preserved.
+        assert "InstructionPointer" in out.columns
+        assert "Stack" in out.columns
+        assert "Weight" in out.columns
+        assert "ProfileWeight" in out.columns
+
+    def test_handles_none_and_empty(self):
+        assert adapters.adapt_csharp_sampled_profile_dataframe(None) is None
+        empty = pd.DataFrame()
+        out = adapters.adapt_csharp_sampled_profile_dataframe(empty)
+        assert out is empty
+
+    def test_idempotent_when_already_native_shape(self):
+        df = pd.DataFrame({
+            "TimeStamp": [1, 2, 3],
+            "PID": [1234, 1234, 1234],
+            "ThreadId": [11, 11, 11],
+            "PayloadThreadId": [11, 11, 11],
+            "InstructionPointer": [0xFF000000, 0xFF000010, 0xFF000020],
+            "Weight": [1, 1, 1],
+            "ProfileWeight": [1, 1, 1],
+            "Stack": [[], [], []],
+        })
+        out = adapters.adapt_csharp_sampled_profile_dataframe(df)
+        # Already-native shape: PID preserved (no double-rename).
+        assert "PID" in out.columns
+        assert out["PID"].iloc[0] == 1234
+
+
+# ---- Integration: thread loader wires PID/TID->ProcessId/ThreadId ------
+
+
+class TestPhaseBThreadLoader:
+    """Regression test for ``manager-log/sampledprofile-attribution-finding.md``.
+
+    Asserts that ``_load_phase_b_thread`` lands ``Thread/Start`` /
+    ``Thread/DCStart`` in ``raw_csv`` with the renamed columns the
+    cpu_sampling aggregator needs.
+    """
+
+    def test_thread_dcstart_lands_with_renamed_columns(self, tmp_path: Path):
+        etl = _make_etl(tmp_path)
+        staging = tmp_path / "staging"
+        _seed_phase_b_staging(staging, etl, include_process=True)
+        # Seed Phase B thread_dcstart with sidecar-shape PID/TID columns.
+        thread_df = _make_thread_dcstart(rows=5)
+        thread_df.to_parquet(staging / "thread_dcstart.parquet", index=False)
+        # The aggregation worker's loader will discover the parquet by
+        # filename even if the manifest doesn't list it.
+        from etw_analyzer.native import aggregation_worker as aw
+
+        captured: dict[str, set[str] | pd.DataFrame] = {}
+        real_persist = aw._persist_aggregator_outputs
+
+        def cap(staging_dir, trace, warnings):
+            captured["keys"] = set(trace.raw_csv.keys())
+            tdf = trace.raw_csv.get("Thread/DCStart")
+            if tdf is not None:
+                captured["thread_dcstart"] = tdf.copy()
+            return real_persist(staging_dir, trace, warnings)
+
+        aw._persist_aggregator_outputs = cap
+        try:
+            aw.run_aggregation_worker(staging, etl, trace_id="trace_thread")
+        finally:
+            aw._persist_aggregator_outputs = real_persist
+
+        assert "Thread/DCStart" in captured["keys"]
+        thread = captured["thread_dcstart"]
+        assert "ProcessId" in thread.columns
+        assert "ThreadId" in thread.columns
+        # The sidecar-shape names must be gone (no double-write).
+        assert "PID" not in thread.columns
+        assert "TID" not in thread.columns
+        assert len(thread) == 5
+
+
+# ---- Integration: sampled_profile rename feeds cpu_sampling ------------
+
+
+class TestPhaseBSampledProfileAttribution:
+    """Regression test for the column rename that drives Process Name lookup.
+
+    Without ``adapt_csharp_sampled_profile_dataframe`` running on the
+    SampledProfile DataFrame, every cpu_sampling row collapses into
+    ``Process Name='unknown', PID=0`` on multi-process traces. See
+    ``manager-log/sampledprofile-attribution-finding.md``.
+    """
+
+    def test_sampled_profile_dumper_df_uses_pid_column_after_load(
+        self, tmp_path: Path,
+    ):
+        etl = _make_etl(tmp_path)
+        staging = tmp_path / "staging"
+        # The synthetic SampledProfile fixture in
+        # _seed_phase_b_staging uses sidecar-shape ProcessId.
+        _seed_phase_b_staging(staging, etl)
+        from etw_analyzer.native import aggregation_worker as aw
+
+        captured: dict[str, pd.DataFrame] = {}
+        real_persist = aw._persist_aggregator_outputs
+
+        def cap(staging_dir, trace, warnings):
+            if trace.dumper_df is not None:
+                captured["dumper"] = trace.dumper_df.copy()
+            sp = trace.raw_csv.get("SampledProfile")
+            if sp is not None:
+                captured["raw_csv"] = sp.copy()
+            return real_persist(staging_dir, trace, warnings)
+
+        aw._persist_aggregator_outputs = cap
+        try:
+            aw.run_aggregation_worker(staging, etl, trace_id="trace_sp")
+        finally:
+            aw._persist_aggregator_outputs = real_persist
+
+        # Both slots must carry PID (not ProcessId) so the cpu_sampling
+        # aggregator's Process Name lookup fires.
+        assert "dumper" in captured and "raw_csv" in captured
+        for label, df in captured.items():
+            assert "PID" in df.columns, f"{label}: PID missing after adapter"
+            assert "ProcessId" not in df.columns, (
+                f"{label}: ProcessId still present (double-rename risk)"
+            )
+
+
 # ---- Integration: process_info -----------------------------------------
 
 
