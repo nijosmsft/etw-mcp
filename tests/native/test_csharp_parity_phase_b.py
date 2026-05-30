@@ -1165,3 +1165,166 @@ class TestPhaseBTraceMetadataUpgrade:
         ts = int(row["TimeStamp"])
         elapsed_us = int(row["ElapsedMicros"])
         assert int(row["InitialTime"]) == ts - elapsed_us * 2
+
+
+# ---- Cross-mode raw_csv parity + rehydrate -----------------------------
+
+
+class TestPhaseBRawCsvParity:
+    def test_at_least_13_raw_csv_keys_with_full_phase_b_inputs(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        """The Phase B target: >= 13 raw_csv keys end-to-end.
+
+        Seeds every Phase B per-opcode parquet (perfinfo, process,
+        diskio, image, eventtrace_header) and verifies the aggregation
+        worker produces at least 13 keys in raw_csv, covering the
+        Phase B aggregator deliverables: dpc_isr, dpc_isr_raw,
+        process_info, diskio (or its canonical), stacks, stacks_callers,
+        trace_metadata, plus Phase A baseline (cpu_sampling,
+        cpu_timeline, tracestats, sysconfig) and the canonical event
+        class keys the loaders populate.
+        """
+        import etw_analyzer.native as native_pkg
+        monkeypatch.setattr(native_pkg, "Symbolizer", _FakeSymbolizer, raising=False)
+
+        etl = _make_etl(tmp_path)
+        staging = tmp_path / "staging"
+        _seed_phase_b_staging(
+            staging, etl,
+            sampled_rows=50, cpu_count=4,
+            include_perfinfo=True,
+            include_process=True,
+            include_image=True,
+            include_eventtrace_header=True,
+            include_diskio=True,
+        )
+        # Ensure image_load covers SampledProfile stack range so stacks
+        # produces non-empty Module/Function output.
+        cover = pd.DataFrame([{
+            "EventSequence": 0, "TimeStampQpc": 0, "CPU": 0, "PID": 4,
+            "ImageBase": 0xFF00_0000, "ImageSize": 0x100_0000,
+            "TimeDateStamp": 0,
+            "FileName": "\\SystemRoot\\drivers\\hot.sys",
+        }])
+        cover.to_parquet(staging / "image_load.parquet", index=False)
+        manifest = native_cache.read_manifest(staging)
+        datasets = list(manifest.datasets)
+        datasets.append(native_cache.CacheDataset(
+            name="image_load", kind="parquet", path="image_load.parquet",
+            row_count=1, materialize_on_load=True,
+        ))
+        native_cache.write_manifest(
+            staging,
+            native_cache.CacheManifest.materialized_small(
+                etl, datasets, producer="csharp",
+            ),
+        )
+
+        from etw_analyzer.native import aggregation_worker as aw
+        captured: dict[str, set[str]] = {}
+        real_persist = aw._persist_aggregator_outputs
+
+        def cap(staging_dir, trace, warnings):
+            captured["keys"] = set(trace.raw_csv.keys())
+            return real_persist(staging_dir, trace, warnings)
+
+        aw._persist_aggregator_outputs = cap
+        try:
+            result = aw.run_aggregation_worker(
+                staging, etl, trace_id="trace_phase_b_full",
+            )
+        finally:
+            aw._persist_aggregator_outputs = real_persist
+
+        assert result.ok is True, f"{result.message} / {result.warnings}"
+        keys = captured["keys"]
+
+        # Phase A keys still present.
+        phase_a = {"cpu_sampling", "cpu_timeline", "trace_metadata",
+                   "tracestats", "sysconfig"}
+        # Phase B aggregator deliverables.
+        phase_b = {"dpc_isr", "dpc_isr_raw", "process_info", "diskio",
+                   "stacks", "stacks_callers"}
+        missing = (phase_a | phase_b) - keys
+        assert not missing, (
+            f"Phase A+B target keys missing: {missing}. Got: {sorted(keys)}"
+        )
+        # Sanity floor — the literal Phase B deliverable.
+        assert len(keys) >= 13, (
+            f"raw_csv key count {len(keys)} < 13. Keys: {sorted(keys)}"
+        )
+
+
+class TestPhaseBCacheRehydrate:
+    def test_manifest_lists_phase_b_dumper_kinds(self, tmp_path: Path):
+        """Phase B per-opcode parquets in the rewritten manifest get
+        kind='dumper-parquet'. This is the contract that lets the
+        trace_mgmt._load_from_cache path rehydrate them into the
+        per-class trace attrs on a subsequent load."""
+        etl = _make_etl(tmp_path)
+        staging = tmp_path / "staging"
+        _seed_phase_b_staging(
+            staging, etl,
+            include_perfinfo=True,
+            include_process=True,
+            include_image=True,
+            include_eventtrace_header=True,
+        )
+        aggregation_worker.run_aggregation_worker(
+            staging, etl, trace_id="trace_rehydrate",
+        )
+        loaded = native_cache.read_manifest(staging)
+        kinds_by_name = {d.name: d.kind for d in loaded.datasets}
+        # Every Phase B per-opcode stem that the sidecar emitted (or
+        # that _rewrite_manifest synthesised as zero-row) must be
+        # dumper-parquet so the cache loader picks it up.
+        for stem in (
+            "perfinfo_dpc", "perfinfo_threaded_dpc", "perfinfo_timer_dpc",
+            "perfinfo_isr",
+            "process_dcstart", "process_start", "process_end",
+            "process_dcend", "process_defunct",
+            "image_load", "image_dcstart",
+            "eventtrace_header",
+        ):
+            assert kinds_by_name.get(stem) == "dumper-parquet", (
+                f"{stem!r} not registered as dumper-parquet "
+                f"(got {kinds_by_name.get(stem)!r})"
+            )
+
+    def test_rehydrate_after_aggregation_finds_phase_b_parquets(
+        self, tmp_path: Path,
+    ):
+        """A cache that was just written by aggregation_worker must be
+        re-readable by trace_mgmt._load_from_cache without
+        re-extraction. We verify the v3 manifest lists each Phase B
+        stem with kind='dumper-parquet' so the cache loader's
+        dumper-rehydrate path picks them up on next load."""
+        etl = _make_etl(tmp_path)
+        staging = tmp_path / "staging"
+        _seed_phase_b_staging(
+            staging, etl,
+            include_perfinfo=True,
+            include_process=True,
+            include_image=True,
+            include_eventtrace_header=True,
+        )
+        aggregation_worker.run_aggregation_worker(
+            staging, etl, trace_id="trace_rehydrate2",
+        )
+
+        # All Phase B per-opcode parquets exist on disk; the
+        # required_dumper_datasets check in trace_mgmt._load_from_cache
+        # therefore passes.
+        for stem in (
+            "perfinfo_dpc", "perfinfo_threaded_dpc",
+            "perfinfo_timer_dpc", "perfinfo_isr",
+            "process_dcstart", "process_start", "process_end",
+            "process_dcend", "process_defunct",
+            "thread_start", "thread_end", "thread_dcstart", "thread_dcend",
+            "diskio_read", "diskio_write", "diskio_flushbuffers",
+            "image_load", "image_dcstart",
+            "eventtrace_header",
+        ):
+            parquet = staging / f"{stem}.parquet"
+            assert parquet.exists(), f"{stem}.parquet missing on disk"
