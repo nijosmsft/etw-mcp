@@ -6,6 +6,13 @@ namespace WprMcpExtract;
 internal static class ManifestEmitter
 {
     /// <summary>
+    /// Reference instant for the manifest's <c>mtime_ns</c> field. Kept here
+    /// (rather than via <c>DateTime.UnixEpoch</c>) so the intent is obvious
+    /// at the call site and so the arithmetic stays in <c>DateTimeKind.Utc</c>.
+    /// </summary>
+    private static readonly DateTime UnixEpochUtc = new(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+
+    /// <summary>
     /// Write the top-level cache manifest at <paramref name="stagingDir"/>/wpr-mcp-cache-manifest.json.
     /// Schema version 3 — adds the <c>producer</c> field per spike-contract §7.
     /// </summary>
@@ -44,7 +51,19 @@ internal static class ManifestEmitter
                 path = Path.GetFullPath(etlPath),
                 name = etlInfo.Name,
                 size = etlInfo.Length,
-                mtime_ns = etlInfo.LastWriteTimeUtc.Ticks * 100,  // ticks → ns (100ns/tick)
+                // Must match Python's `int(Path(etl).stat().st_mtime_ns)` exactly
+                // (nanoseconds since the Unix epoch, 1970-01-01T00:00:00Z).
+                //
+                // .NET DateTime.Ticks counts 100-ns intervals from 0001-01-01.
+                // Subtracting the Unix-epoch reference gives ticks since 1970,
+                // and multiplying by 100 converts to nanoseconds. The arithmetic
+                // is integer-exact (no rounding) for any datetime FileInfo can
+                // produce, and matches Python's BCL stat() output bit-for-bit.
+                //
+                // The Python side currently carries an `EtlIdentity.matches_loose()`
+                // workaround for the prior (year-0001) encoding; that shim will be
+                // removed in a follow-up Python-side change (P2 scope).
+                mtime_ns = (etlInfo.LastWriteTimeUtc - UnixEpochUtc).Ticks * 100,
             },
             datasets = datasets.Select(d => new
             {

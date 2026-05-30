@@ -218,6 +218,17 @@ From `../native-vs-xperf-parity-review.md`:
    session open. If TraceEvent 4.x makes it public, drop the reflection
    call in `ExtractRunner.Run()`.
 
+## Compatibility notes
+
+- **`mtime_ns` encoding.** As of this branch, `wpr-mcp-cache-manifest.json`
+  encodes the ETL's `mtime_ns` as Unix-epoch nanoseconds (matching
+  Python's `int(Path(etl).stat().st_mtime_ns)`). The Python supervisor
+  still carries an `EtlIdentity.matches_loose()` fall-back for
+  manifests written by prior builds that used the year-0001 reference
+  (.NET `Ticks * 100`). That shim will be removed on the Python side in
+  a follow-up commit (P2 scope); both encodings are accepted in the
+  interim so cache rehydration of older runs keeps working.
+
 ## Adding a new event class
 
 See [docs/event-class-mapping.md](docs/event-class-mapping.md#adding-a-new-event-class) — 8 steps with concrete file pointers.
