@@ -346,9 +346,11 @@ shapes. Rebuild the sidecar against the current source tree.
   G1-G4 isolation guarantees called out above.
 * [`rust-hybrid-migration-plan.md`](rust-hybrid-migration-plan.md) — the
   language-choice plan the C# sidecar implements.
-* [`docs/decisions/`](docs/decisions/) — promoted review docs:
-  `rust-vs-csharp-spike-review.md`, `native-vs-xperf-parity-review.md`,
-  `evidence-language-review.md`.
+* [`docs/decisions/`](docs/decisions/) — promoted review docs that shape the
+  architecture (`rust-vs-csharp-spike-review.md`,
+  `native-vs-xperf-parity-review.md`, `evidence-language-review.md`). See
+  [`docs/decisions/README.md`](docs/decisions/README.md) for what each one
+  decides.
 
 ### Staging (transient — promoted as decisions stabilize)
 
