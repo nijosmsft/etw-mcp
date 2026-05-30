@@ -41,6 +41,7 @@ import pandas as pd
 
 from etw_analyzer.native import cache as native_cache
 from etw_analyzer.native import aggregation_worker_adapters as csharp_adapters
+from etw_analyzer.native import telemetry as _telemetry
 from etw_analyzer.trace_state import TraceData
 
 

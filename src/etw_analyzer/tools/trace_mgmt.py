@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import os
 import json
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 from etw_analyzer.app import mcp
+from etw_analyzer.native import telemetry as _telemetry
 from etw_analyzer.trace_state import (
     TraceData,
     list_loaded_traces as get_loaded_traces,
@@ -108,6 +110,20 @@ def load_trace(
     if not path.suffix.lower() == ".etl":
         return f"Expected .etl file, got: {path.suffix}"
 
+    _load_start_monotonic = time.monotonic()
+    try:
+        etl_size_mb = path.stat().st_size / (1024 * 1024)
+    except OSError:
+        etl_size_mb = None
+    _telemetry.emit_with(
+        _telemetry.EVENT_LOAD_START,
+        mode=mode,
+        trace_id=make_trace_id(path),
+        etl_path=path,
+        etl_size_mb=etl_size_mb,
+        force=force,
+    )
+
     # Resolve the load pipeline. Environment variable overrides the arg
     # when the arg is left at its default. An explicit ``mode="native"``
     # request can raise ``RuntimeError`` when the consumer isn't
@@ -170,7 +186,15 @@ def load_trace(
     # Check if we can skip re-export (cached parquet/csv files exist and are newer than ETL)
     cached = _load_from_cache(export_dir, path, mode=resolved_mode)
     if cached is not None:
-        return _register_cached_trace(
+        trace_id = make_trace_id(path)
+        _telemetry.emit_with(
+            _telemetry.EVENT_LOAD_CACHE_HIT,
+            mode=resolved_mode,
+            trace_id=trace_id,
+            export_dir=export_dir,
+            datasets=len(cached),
+        )
+        result = _register_cached_trace(
             path,
             export_dir,
             sym_path,
@@ -179,8 +203,29 @@ def load_trace(
             load_notices,
             from_cache=True,
         )
+        _telemetry.emit_with(
+            _telemetry.EVENT_LOAD_COMPLETE,
+            mode=resolved_mode,
+            trace_id=trace_id,
+            wall_seconds=time.monotonic() - _load_start_monotonic,
+            from_cache=True,
+        )
+        return result
+
+    _telemetry.emit_with(
+        _telemetry.EVENT_LOAD_CACHE_MISS,
+        mode=resolved_mode,
+        trace_id=make_trace_id(path),
+        export_dir=export_dir,
+    )
 
     if resolved_mode == "csharp":
+        _telemetry.emit_with(
+            _telemetry.EVENT_LOAD_DISPATCH,
+            mode=resolved_mode,
+            trace_id=make_trace_id(path),
+            dispatch="csharp_worker",
+        )
         worker_result = _load_csharp_with_worker(
             path,
             export_dir,
@@ -189,7 +234,7 @@ def load_trace(
         if worker_result.ok:
             cached = _load_from_cache(export_dir, path, mode="csharp")
             if cached is not None:
-                return _register_cached_trace(
+                result = _register_cached_trace(
                     path,
                     export_dir,
                     sym_path,
@@ -198,6 +243,14 @@ def load_trace(
                     load_notices,
                     from_cache=False,
                 )
+                _telemetry.emit_with(
+                    _telemetry.EVENT_LOAD_COMPLETE,
+                    mode="csharp",
+                    trace_id=make_trace_id(path),
+                    wall_seconds=time.monotonic() - _load_start_monotonic,
+                    from_cache=False,
+                )
+                return result
             worker_result.message = (
                 "csharp sidecar completed but the promoted cache could not be loaded"
             )
@@ -251,6 +304,12 @@ def load_trace(
             return _native_worker_load_failed(worker_result)
 
     if resolved_mode == "native" and _native_worker_enabled():
+        _telemetry.emit_with(
+            _telemetry.EVENT_LOAD_DISPATCH,
+            mode=resolved_mode,
+            trace_id=make_trace_id(path),
+            dispatch="native_worker",
+        )
         worker_result = _load_native_with_worker(
             path,
             export_dir,
@@ -259,7 +318,7 @@ def load_trace(
         if worker_result.ok:
             cached = _load_from_cache(export_dir, path, mode="native")
             if cached is not None:
-                return _register_cached_trace(
+                result = _register_cached_trace(
                     path,
                     export_dir,
                     sym_path,
@@ -268,6 +327,14 @@ def load_trace(
                     load_notices,
                     from_cache=False,
                 )
+                _telemetry.emit_with(
+                    _telemetry.EVENT_LOAD_COMPLETE,
+                    mode="native",
+                    trace_id=make_trace_id(path),
+                    wall_seconds=time.monotonic() - _load_start_monotonic,
+                    from_cache=False,
+                )
+                return result
             worker_result.message = (
                 "native worker completed but the promoted cache could not be loaded"
             )
@@ -340,6 +407,13 @@ def load_trace(
         _populate_metadata(trace)
         _write_cache_manifest(trace.export_dir, trace.etl_path, trace.mode, trace.raw_csv)
 
+        _telemetry.emit_with(
+            _telemetry.EVENT_LOAD_COMPLETE,
+            mode="native",
+            trace_id=trace.trace_id,
+            wall_seconds=time.monotonic() - _load_start_monotonic,
+            from_cache=False,
+        )
         return _format_load_summary(trace)
 
     # Build symcache — idempotent, fast when symbols already cached
@@ -396,6 +470,13 @@ def load_trace(
     )
     _start_background_dumper(trace)
 
+    _telemetry.emit_with(
+        _telemetry.EVENT_LOAD_COMPLETE,
+        mode=resolved_mode,
+        trace_id=trace.trace_id,
+        wall_seconds=time.monotonic() - _load_start_monotonic,
+        from_cache=False,
+    )
     return _format_load_summary(trace)
 
 

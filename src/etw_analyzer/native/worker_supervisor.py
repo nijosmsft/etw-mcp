@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 
 from . import cache as native_cache
+from . import telemetry as _telemetry
 from .config import (
     CSHARP_SIDECAR_ENV,
     CSHARP_SIDECAR_EXE,
@@ -914,6 +915,17 @@ def run_csharp_worker_extraction(
             encoding="utf-8",
         )
 
+        _telemetry.emit_with(
+            _telemetry.EVENT_CSHARP_SPAWN,
+            mode="csharp",
+            trace_id=trace_id,
+            sidecar_path=resolved_sidecar,
+            staging_dir=staging_dir,
+            strategy=strategy,
+            event_classes=len(request.get("requested_event_classes", [])),
+        )
+        _csharp_spawn_monotonic = time.monotonic()
+
         sidecar_result = runner(
             resolved_sidecar,
             request_path,
@@ -922,6 +934,29 @@ def run_csharp_worker_extraction(
         )
         sidecar_result.request_path = request_path
         sidecar_result.staging_dir = staging_dir
+
+        _csharp_wall_s = time.monotonic() - _csharp_spawn_monotonic
+        _result_payload = sidecar_result.result or {}
+        _perf = _result_payload.get("performance") or {}
+        _telemetry.emit_with(
+            _telemetry.EVENT_CSHARP_CHILD_EXIT,
+            mode="csharp",
+            trace_id=trace_id,
+            ok=sidecar_result.ok,
+            returncode=sidecar_result.returncode,
+            failure_kind=sidecar_result.failure_kind,
+            wall_seconds=_csharp_wall_s,
+        )
+        if sidecar_result.ok and _perf:
+            _telemetry.emit_with(
+                _telemetry.EVENT_CSHARP_RESULT,
+                mode="csharp",
+                trace_id=trace_id,
+                sidecar_wall_seconds=_perf.get("wall_seconds"),
+                events_per_second=_perf.get("events_per_second"),
+                peak_rss_mb=_perf.get("peak_rss_mb"),
+                event_classes=len((_result_payload.get("event_counts") or {})),
+            )
         if not sidecar_result.ok:
             # Leave staging intact for debugging — same contract as
             # rust-hybrid-migration-plan v3 §11 phase 0.
@@ -941,6 +976,13 @@ def run_csharp_worker_extraction(
                 mode="native",
             )
         except Exception as exc:
+            _telemetry.emit_with(
+                _telemetry.EVENT_CSHARP_CACHE_VALIDATE,
+                mode="csharp",
+                trace_id=trace_id,
+                ok=False,
+                error=str(exc),
+            )
             return NativeWorkerResult(
                 ok=False,
                 message=f"csharp sidecar produced an invalid cache: {exc}",
@@ -953,12 +995,36 @@ def run_csharp_worker_extraction(
                 progress=sidecar_result.progress,
                 result=sidecar_result.result,
             )
+        _telemetry.emit_with(
+            _telemetry.EVENT_CSHARP_CACHE_VALIDATE,
+            mode="csharp",
+            trace_id=trace_id,
+            ok=True,
+            datasets=len(manifest.datasets),
+            schema_version=manifest.schema_version,
+            producer=manifest.producer,
+        )
 
         # Run the Python-side aggregators against the sidecar's outputs.
         agg_run = aggregation_runner or _default_aggregation_runner
+        _telemetry.emit_with(
+            _telemetry.EVENT_CSHARP_AGGREGATION_START,
+            mode="csharp",
+            trace_id=trace_id,
+            staging_dir=staging_dir,
+        )
+        _agg_start_monotonic = time.monotonic()
         try:
             agg_result = agg_run(staging_dir, etl_path, trace_id)
         except Exception as exc:
+            _telemetry.emit_with(
+                _telemetry.EVENT_CSHARP_AGGREGATION_DONE,
+                mode="csharp",
+                trace_id=trace_id,
+                ok=False,
+                error=str(exc),
+                wall_seconds=time.monotonic() - _agg_start_monotonic,
+            )
             return NativeWorkerResult(
                 ok=False,
                 message=f"aggregation worker raised: {exc}",
@@ -972,6 +1038,14 @@ def run_csharp_worker_extraction(
                 result=sidecar_result.result,
             )
         if not agg_result.ok:
+            _telemetry.emit_with(
+                _telemetry.EVENT_CSHARP_AGGREGATION_DONE,
+                mode="csharp",
+                trace_id=trace_id,
+                ok=False,
+                error=agg_result.message,
+                wall_seconds=time.monotonic() - _agg_start_monotonic,
+            )
             return NativeWorkerResult(
                 ok=False,
                 message=f"aggregation worker failed: {agg_result.message}",
@@ -984,10 +1058,26 @@ def run_csharp_worker_extraction(
                 progress=sidecar_result.progress,
                 result=sidecar_result.result,
             )
+        _telemetry.emit_with(
+            _telemetry.EVENT_CSHARP_AGGREGATION_DONE,
+            mode="csharp",
+            trace_id=trace_id,
+            ok=True,
+            datasets_written=len(agg_result.datasets_written),
+            warnings=len(agg_result.warnings),
+            wall_seconds=time.monotonic() - _agg_start_monotonic,
+        )
 
         try:
             _promote_staging_cache(staging_dir, export_dir)
         except Exception as exc:
+            _telemetry.emit_with(
+                _telemetry.EVENT_CSHARP_CACHE_PROMOTE,
+                mode="csharp",
+                trace_id=trace_id,
+                ok=False,
+                error=str(exc),
+            )
             return NativeWorkerResult(
                 ok=False,
                 message=f"csharp cache promotion failed: {exc}",
@@ -1004,6 +1094,13 @@ def run_csharp_worker_extraction(
         sidecar_result.export_dir = export_dir
         sidecar_result.message = (
             f"csharp sidecar completed: {agg_result.message}"
+        )
+        _telemetry.emit_with(
+            _telemetry.EVENT_CSHARP_CACHE_PROMOTE,
+            mode="csharp",
+            trace_id=trace_id,
+            ok=True,
+            export_dir=export_dir,
         )
         return sidecar_result
     except KeyboardInterrupt:
