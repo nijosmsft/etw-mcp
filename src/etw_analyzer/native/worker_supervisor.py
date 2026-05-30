@@ -17,6 +17,11 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 
 from . import cache as native_cache
+from .config import (
+    CSHARP_SIDECAR_ENV,
+    CSHARP_SIDECAR_EXE,
+    find_csharp_sidecar,
+)
 
 
 NATIVE_WORKER_ENV = "WPR_MCP_NATIVE_WORKER"
@@ -768,12 +773,455 @@ def _remove_dir(path: Path) -> None:
 
 
 __all__ = [
+    "CSHARP_REQUEST_VERSION",
     "NATIVE_WORKER_ENV",
     "NATIVE_WORKER_SYMBOL_ENV",
     "NativeWorkerResult",
+    "build_csharp_request",
     "build_worker_command",
     "build_worker_request",
     "native_worker_enabled",
+    "run_csharp_worker_extraction",
     "run_native_worker_extraction",
     "run_worker_process",
 ]
+
+
+# ---------------------------------------------------------------------------
+# C# sidecar invocation — Track B of the hybrid migration. The protocol is
+# spike-contract.md v1: one --request <path> argument, stdout reserved for
+# JSONL ({heartbeat,progress,result}), exit code 0 for success / 1 for
+# structured failure / 2 for crash. We REUSE the existing _reader_thread,
+# _handle_stdout_line, _BoundedTextTail, and _terminate_process helpers so
+# the protocol implementation lives in one place.
+# ---------------------------------------------------------------------------
+
+CSHARP_REQUEST_VERSION = 1
+DEFAULT_CSHARP_HEARTBEAT_INTERVAL_MS = 1000
+DEFAULT_CSHARP_MAX_ETL_MB = 8192  # generous default; agent overrides per-call.
+
+
+def build_csharp_request(
+    *,
+    trace_id: str,
+    etl_path: Path,
+    staging_dir: Path,
+    requested_event_classes: Iterable[str],
+    strategy: str = native_cache.MATERIALIZED_SMALL_STRATEGY,
+    symbol_path: str | None = None,
+    max_etl_mb: int = DEFAULT_CSHARP_MAX_ETL_MB,
+    heartbeat_interval_ms: int = DEFAULT_CSHARP_HEARTBEAT_INTERVAL_MS,
+    log_level: str = "info",
+    include_tracelogging: bool = True,
+) -> dict[str, Any]:
+    """Build the request JSON consumed by ``wpr-mcp-extract.exe``.
+
+    Matches the schema in ``csharp/src/Request.cs`` exactly. The version
+    field is locked to 1 per ``spike-contract.md`` §3.1.
+    """
+
+    payload: dict[str, Any] = {
+        "version": CSHARP_REQUEST_VERSION,
+        "trace_id": trace_id,
+        "etl_path": str(etl_path.resolve()),
+        "staging_dir": str(staging_dir.resolve()),
+        "strategy": strategy,
+        "requested_event_classes": list(dict.fromkeys(requested_event_classes)),
+        "symbol_path": symbol_path,
+        "max_etl_mb": int(max_etl_mb),
+        "heartbeat_interval_ms": int(heartbeat_interval_ms),
+        "log_level": log_level,
+        "include_tracelogging": bool(include_tracelogging),
+    }
+    return payload
+
+
+def build_csharp_command(sidecar_path: Path, request_path: Path) -> list[str]:
+    """Build the sidecar command line. Only ``--request <path>`` is required."""
+
+    return [str(sidecar_path), "--request", str(request_path)]
+
+
+def run_csharp_worker_extraction(
+    *,
+    etl_path: Path,
+    export_dir: Path,
+    trace_id: str,
+    symbol_path: str | None,
+    requested_event_classes: Iterable[str],
+    strategy: str = native_cache.MATERIALIZED_SMALL_STRATEGY,
+    sidecar_path: Path | None = None,
+    timeout_seconds: float | None = None,
+    stale_heartbeat_seconds: float | None = None,
+    process_runner: Callable[..., NativeWorkerResult] | None = None,
+    aggregation_runner: Callable[..., Any] | None = None,
+) -> NativeWorkerResult:
+    """Run the C# sidecar into staging, run aggregators, then promote.
+
+    Pipeline:
+
+    1. Locate the sidecar binary via :func:`find_csharp_sidecar` (or use
+       the caller-supplied ``sidecar_path``).
+    2. Write a ``request.json`` matching the spike-contract schema.
+    3. Spawn ``wpr-mcp-extract.exe --request <path>``; stream stdout
+       line-by-line through the same JSONL handler used for the native
+       worker (heartbeat/progress/result).
+    4. Validate the sidecar's manifest in staging.
+    5. Run :func:`aggregation_worker.run_aggregation_worker` to produce
+       the Python-side aggregates.
+    6. Atomic promote ``staging_dir`` → ``export_dir``.
+
+    On any failure: log to stderr, leave staging intact for debugging,
+    return ``ok=False`` with a structured ``failure_kind``.
+    """
+
+    resolved_sidecar = sidecar_path or find_csharp_sidecar()
+    if resolved_sidecar is None:
+        raise ValueError(
+            f"C# sidecar binary {CSHARP_SIDECAR_EXE} could not be located. "
+            f"Set {CSHARP_SIDECAR_ENV} to the absolute path of the built "
+            "binary, publish it under csharp/publish/win-x64/, or add it "
+            "to PATH."
+        )
+    if not resolved_sidecar.is_file():
+        raise ValueError(
+            f"C# sidecar path {resolved_sidecar} is not a file. "
+            f"Check {CSHARP_SIDECAR_ENV}."
+        )
+
+    etl_path = etl_path.resolve()
+    export_dir = export_dir.resolve()
+    staging_dir = export_dir.parent / (
+        f"{export_dir.name}.csharp-{trace_id}-{uuid.uuid4().hex}"
+    )
+    request_path = staging_dir / "request.json"
+    runner = process_runner or run_csharp_process
+
+    try:
+        if staging_dir.exists():
+            shutil.rmtree(staging_dir)
+        staging_dir.mkdir(parents=True)
+        request = build_csharp_request(
+            trace_id=trace_id,
+            etl_path=etl_path,
+            staging_dir=staging_dir,
+            requested_event_classes=requested_event_classes,
+            strategy=strategy,
+            symbol_path=symbol_path,
+        )
+        request_path.write_text(
+            json.dumps(request, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+
+        sidecar_result = runner(
+            resolved_sidecar,
+            request_path,
+            timeout_seconds=timeout_seconds,
+            stale_heartbeat_seconds=stale_heartbeat_seconds,
+        )
+        sidecar_result.request_path = request_path
+        sidecar_result.staging_dir = staging_dir
+        if not sidecar_result.ok:
+            # Leave staging intact for debugging — same contract as
+            # rust-hybrid-migration-plan v3 §11 phase 0.
+            return sidecar_result
+
+        # Validate the sidecar manifest before running aggregators.
+        try:
+            manifest = native_cache.read_manifest(staging_dir)
+            if manifest is None:
+                raise native_cache.NativeCacheError(
+                    "csharp sidecar did not write a cache manifest"
+                )
+            native_cache.validate_manifest(
+                manifest,
+                staging_dir,
+                etl_path,
+                mode="native",
+            )
+        except Exception as exc:
+            return NativeWorkerResult(
+                ok=False,
+                message=f"csharp sidecar produced an invalid cache: {exc}",
+                failure_kind="invalid-cache",
+                request_path=request_path,
+                staging_dir=staging_dir,
+                stdout_tail=sidecar_result.stdout_tail,
+                stderr_tail=sidecar_result.stderr_tail,
+                invalid_stdout_tail=sidecar_result.invalid_stdout_tail,
+                progress=sidecar_result.progress,
+                result=sidecar_result.result,
+            )
+
+        # Run the Python-side aggregators against the sidecar's outputs.
+        agg_run = aggregation_runner or _default_aggregation_runner
+        try:
+            agg_result = agg_run(staging_dir, etl_path, trace_id)
+        except Exception as exc:
+            return NativeWorkerResult(
+                ok=False,
+                message=f"aggregation worker raised: {exc}",
+                failure_kind="aggregation",
+                request_path=request_path,
+                staging_dir=staging_dir,
+                stdout_tail=sidecar_result.stdout_tail,
+                stderr_tail=sidecar_result.stderr_tail,
+                invalid_stdout_tail=sidecar_result.invalid_stdout_tail,
+                progress=sidecar_result.progress,
+                result=sidecar_result.result,
+            )
+        if not agg_result.ok:
+            return NativeWorkerResult(
+                ok=False,
+                message=f"aggregation worker failed: {agg_result.message}",
+                failure_kind="aggregation",
+                request_path=request_path,
+                staging_dir=staging_dir,
+                stdout_tail=sidecar_result.stdout_tail,
+                stderr_tail=sidecar_result.stderr_tail,
+                invalid_stdout_tail=sidecar_result.invalid_stdout_tail,
+                progress=sidecar_result.progress,
+                result=sidecar_result.result,
+            )
+
+        try:
+            _promote_staging_cache(staging_dir, export_dir)
+        except Exception as exc:
+            return NativeWorkerResult(
+                ok=False,
+                message=f"csharp cache promotion failed: {exc}",
+                failure_kind="promotion",
+                request_path=request_path,
+                staging_dir=staging_dir,
+                stdout_tail=sidecar_result.stdout_tail,
+                stderr_tail=sidecar_result.stderr_tail,
+                invalid_stdout_tail=sidecar_result.invalid_stdout_tail,
+                progress=sidecar_result.progress,
+                result=sidecar_result.result,
+            )
+
+        sidecar_result.export_dir = export_dir
+        sidecar_result.message = (
+            f"csharp sidecar completed: {agg_result.message}"
+        )
+        return sidecar_result
+    except KeyboardInterrupt:
+        # The sidecar may still be running; terminate it before propagating.
+        # The reader threads are daemons so they will be torn down with the
+        # interpreter.
+        # Staging dir is preserved for forensic inspection.
+        raise
+    except Exception as exc:
+        return NativeWorkerResult(
+            ok=False,
+            message=str(exc),
+            failure_kind="supervisor",
+            request_path=request_path,
+            staging_dir=staging_dir,
+        )
+
+
+def _default_aggregation_runner(
+    staging_dir: Path,
+    etl_path: Path,
+    trace_id: str,
+):
+    """Lazy import wrapper — avoid pulling in aggregation_worker at import time."""
+
+    from . import aggregation_worker
+
+    return aggregation_worker.run_aggregation_worker(
+        staging_dir,
+        etl_path,
+        trace_id,
+        producer="csharp",
+    )
+
+
+def run_csharp_process(
+    sidecar_path: Path,
+    request_path: Path,
+    *,
+    timeout_seconds: float | None = None,
+    stale_heartbeat_seconds: float | None = None,
+    popen_factory: Callable[..., subprocess.Popen] = subprocess.Popen,
+) -> NativeWorkerResult:
+    """Launch and supervise the C# sidecar subprocess.
+
+    Reuses the same heartbeat-watchdog + bounded-tail logic as
+    :func:`run_worker_process`. The C# protocol is byte-compatible: each
+    stdout line is a JSON object with ``type`` in
+    ``{heartbeat, progress, result}``; the ``result`` line is the source
+    of truth for ok/failure.
+    """
+
+    timeout = _float_env(
+        NATIVE_WORKER_TIMEOUT_ENV,
+        timeout_seconds,
+        DEFAULT_TIMEOUT_SECONDS,
+    )
+    stale = _float_env(
+        NATIVE_WORKER_STALE_ENV,
+        stale_heartbeat_seconds,
+        DEFAULT_STALE_SECONDS,
+    )
+    command = build_csharp_command(sidecar_path, request_path)
+    env = os.environ.copy()
+    # The sidecar reads its own env for log routing; nothing else needed.
+
+    stdout_tail = _BoundedTextTail(STDOUT_TAIL_BYTES)
+    stderr_tail = _BoundedTextTail(STDERR_TAIL_BYTES)
+    invalid_tail = _BoundedTextTail(INVALID_STDOUT_TAIL_BYTES)
+    progress: deque[dict[str, Any]] = deque(maxlen=MAX_PROGRESS_EVENTS)
+    events: "queue.Queue[tuple[str, str]]" = queue.Queue()
+    result_payload: dict[str, Any] | None = None
+    last_heartbeat = time.monotonic()
+
+    try:
+        proc = popen_factory(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=env,
+            shell=False,
+        )
+    except Exception as exc:
+        return NativeWorkerResult(
+            ok=False,
+            message=f"failed to launch csharp sidecar: {exc}",
+            failure_kind="launch",
+            request_path=request_path,
+        )
+
+    stdout_thread = threading.Thread(
+        target=_reader_thread,
+        args=("stdout", proc.stdout, events),
+        daemon=True,
+        name="csharp-sidecar-stdout",
+    )
+    stderr_thread = threading.Thread(
+        target=_reader_thread,
+        args=("stderr", proc.stderr, events),
+        daemon=True,
+        name="csharp-sidecar-stderr",
+    )
+    stdout_thread.start()
+    stderr_thread.start()
+
+    start = time.monotonic()
+    failure_kind: str | None = None
+    failure_message: str | None = None
+
+    try:
+        while True:
+            while True:
+                try:
+                    stream_name, line = events.get_nowait()
+                except queue.Empty:
+                    break
+                if stream_name == "stdout":
+                    parsed, heartbeat = _handle_stdout_line(
+                        line,
+                        stdout_tail,
+                        invalid_tail,
+                        progress,
+                    )
+                    if parsed is not None and parsed.get("type") == "result":
+                        result_payload = parsed
+                    if heartbeat:
+                        last_heartbeat = time.monotonic()
+                elif stream_name == "stderr":
+                    stderr_tail.append(line)
+
+            returncode = proc.poll()
+            now = time.monotonic()
+            if returncode is not None:
+                break
+            if now - start > timeout:
+                failure_kind = "timeout"
+                failure_message = (
+                    f"csharp sidecar exceeded wall-clock timeout of {timeout:.1f}s"
+                )
+                _terminate_process(proc)
+                break
+            if now - last_heartbeat > stale:
+                failure_kind = "stale-heartbeat"
+                failure_message = (
+                    f"csharp sidecar produced no heartbeat for {stale:.1f}s"
+                )
+                _terminate_process(proc)
+                break
+            time.sleep(0.05)
+    except KeyboardInterrupt:
+        _terminate_process(proc)
+        raise
+
+    stdout_thread.join(timeout=1.0)
+    stderr_thread.join(timeout=1.0)
+    while True:
+        try:
+            stream_name, line = events.get_nowait()
+        except queue.Empty:
+            break
+        if stream_name == "stdout":
+            parsed, heartbeat = _handle_stdout_line(
+                line,
+                stdout_tail,
+                invalid_tail,
+                progress,
+            )
+            if parsed is not None and parsed.get("type") == "result":
+                result_payload = parsed
+            if heartbeat:
+                last_heartbeat = time.monotonic()
+        elif stream_name == "stderr":
+            stderr_tail.append(line)
+
+    returncode = _safe_returncode(proc)
+    common = {
+        "returncode": returncode,
+        "request_path": request_path,
+        "stdout_tail": stdout_tail.get(),
+        "stderr_tail": stderr_tail.get(),
+        "invalid_stdout_tail": invalid_tail.get(),
+        "progress": list(progress),
+        "result": result_payload,
+    }
+    if failure_kind is not None:
+        return NativeWorkerResult(
+            ok=False,
+            message=failure_message or failure_kind,
+            failure_kind=failure_kind,
+            **common,
+        )
+    # spike-contract §2.3: the JSONL result line is authoritative, not the
+    # exit code. exit 2 (crash) should still surface a structured result
+    # via the trap; treat absence of result as a hard crash.
+    if result_payload and result_payload.get("ok") is True:
+        return NativeWorkerResult(
+            ok=True,
+            message="csharp sidecar completed",
+            **common,
+        )
+    if result_payload and result_payload.get("ok") is False:
+        kind = str(result_payload.get("failure_kind") or "worker-error")
+        return NativeWorkerResult(
+            ok=False,
+            message=str(result_payload.get("error") or "csharp sidecar failed"),
+            failure_kind=kind,
+            **common,
+        )
+    return NativeWorkerResult(
+        ok=False,
+        message=(
+            f"csharp sidecar exited with code {returncode} without emitting "
+            "a result record"
+        ),
+        failure_kind="no-result",
+        **common,
+    )
