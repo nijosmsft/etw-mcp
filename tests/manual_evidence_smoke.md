@@ -6,7 +6,7 @@ AND the env var.
 
 ## Prereqs
 - Real ETL file on disk (any trace works; networking.wprp output is fine).
-- Co-located `wpr-mcp-evidence-store` repo at `..\wpr-mcp-evidence-store`.
+- Co-located `evidence-store` repo at `..\evidence-store`.
 
 ## Steps
 

@@ -37,7 +37,7 @@ evidence = ["evidence-store"]
 
 [tool.uv.sources]
 # Local path for the POC; replace with PyPI / git URL once published.
-evidence-store = { path = "../wpr-mcp-evidence-store", editable = true }
+evidence-store = { path = "../evidence-store", editable = true }
 
 [project.urls]
 Homepage = "https://github.com/nijosmsft/wpr-mcp-server"
