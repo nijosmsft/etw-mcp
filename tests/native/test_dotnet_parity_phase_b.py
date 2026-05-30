@@ -1,6 +1,6 @@
-"""Phase B csharp parity tests.
+"""Phase B dotnet parity tests.
 
-Extends the Phase A parity coverage (``test_csharp_parity.py``) with
+Extends the Phase A parity coverage (``test_dotnet_parity.py``) with
 the per-opcode kernel-meta event classes the sidecar started emitting
 in Phase B:
 
@@ -278,7 +278,7 @@ def _seed_phase_b_staging(
 # ---- Adapter unit tests: DPC ---------------------------------------------
 
 
-class TestAdaptCsharpDpcDataframe:
+class TestAdaptDotnetDpcDataframe:
     def test_renames_timestampqpc_to_timestamp(self):
         df = _make_perfinfo_dpc(rows=3)
         result = adapters.adapt_dotnet_dpc_dataframe(df)
@@ -361,7 +361,7 @@ class TestPhaseBDpcIsr:
         # build_dpc_isr_raw_text only includes modules whose name ends
         # in .sys/.exe/.dll — without a symbolizer everything resolves
         # to "unknown" and gets filtered out. Inject a stub so the text
-        # path runs end-to-end. (Real csharp mode builds a symbolizer
+        # path runs end-to-end. (Real dotnet mode builds a symbolizer
         # from image_load/image_dcstart parquets, exercised separately
         # in TestPhaseBStacks.)
         from etw_analyzer.native import aggregation_worker as aw
@@ -482,7 +482,7 @@ class _DpcStubSymbolizer:
 # ---- Adapter unit tests: process ---------------------------------------
 
 
-class TestAdaptCsharpProcessDataframe:
+class TestAdaptDotnetProcessDataframe:
     def test_renames_pid_to_processid(self):
         df = _make_process_dcstart(rows=3)
         out = adapters.adapt_dotnet_process_dataframe(df)
@@ -548,7 +548,7 @@ def _make_thread_dcstart(rows: int = 5) -> pd.DataFrame:
     })
 
 
-class TestAdaptCsharpThreadDataframe:
+class TestAdaptDotnetThreadDataframe:
     def test_renames_pid_to_processid(self):
         df = _make_thread_dcstart(rows=3)
         out = adapters.adapt_dotnet_thread_dataframe(df)
@@ -606,7 +606,7 @@ class TestAdaptCsharpThreadDataframe:
 # ---- Adapter unit tests: sampled_profile (ProcessId->PID rename) -------
 
 
-class TestAdaptCsharpSampledProfileDataframe:
+class TestAdaptDotnetSampledProfileDataframe:
     def test_renames_processid_to_pid(self):
         df = _make_sampled_profile(rows=4)
         out = adapters.adapt_dotnet_sampled_profile_dataframe(df)
@@ -838,7 +838,7 @@ class TestPhaseBProcessInfo:
 # ---- Adapter unit tests: diskio ----------------------------------------
 
 
-class TestAdaptCsharpDiskioDataframe:
+class TestAdaptDotnetDiskioDataframe:
     def test_renames_timestampqpc_to_timestamp(self):
         df = pd.DataFrame({
             "TimeStampQpc": [1, 2],
@@ -932,7 +932,7 @@ class TestPhaseBDiskio:
 # ---- Adapter unit tests: image -----------------------------------------
 
 
-class TestAdaptCsharpImageDataframe:
+class TestAdaptDotnetImageDataframe:
     def test_renames_timestampqpc_to_timestamp(self):
         df = _make_image_dcstart(rows=2)
         out = adapters.adapt_dotnet_image_dataframe(df)
@@ -988,7 +988,7 @@ class _FakeSymbolizer:
         pass
 
 
-class TestBuildSymbolizerFromCsharpImages:
+class TestBuildSymbolizerFromDotnetImages:
     def test_registers_modules_from_image_dcstart(self, tmp_path: Path, monkeypatch):
         from etw_analyzer.trace_state import TraceData
         from etw_analyzer.native import aggregation_worker_adapters as ad
@@ -1078,7 +1078,7 @@ class TestBuildSymbolizerFromCsharpImages:
 
 
 class TestPhaseBStacks:
-    def test_stacks_produced_with_csharp_image_symbolizer(
+    def test_stacks_produced_with_dotnet_image_symbolizer(
         self, tmp_path: Path, monkeypatch,
     ):
         """Real path: image_dcstart present → symbolizer built → stacks produced."""
@@ -1135,7 +1135,7 @@ class TestPhaseBStacks:
         modules = set(df["Module"].astype(str).str.lower())
         assert "stacks_mod.sys" in modules
 
-    def test_stacks_callers_produced_with_csharp_image_symbolizer(
+    def test_stacks_callers_produced_with_dotnet_image_symbolizer(
         self, tmp_path: Path, monkeypatch,
     ):
         import etw_analyzer.native as native_pkg

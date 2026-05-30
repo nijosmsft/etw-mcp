@@ -1,14 +1,14 @@
-"""Tests for Phase A csharp parity in the post-sidecar aggregation worker.
+"""Tests for Phase A dotnet parity in the post-sidecar aggregation worker.
 
 These tests assert that running ``aggregation_worker.run_aggregation_worker``
-against a staging directory populated with csharp-sidecar-shaped parquets
+against a staging directory populated with dotnet-sidecar-shaped parquets
 produces the Phase A target raw_csv keys: ``cpu_timeline``,
 ``trace_metadata``, ``tracestats``, plus ``sysconfig`` from the sidecar
 text passthrough. ``stacks`` / ``stacks_callers`` parity is exercised
 with a stub symbolizer because the sidecar does not yet emit Image/Load
 events (Phase B follow-up).
 
-See ``manager-log/csharp-parity-exploration.md`` §4 for the Phase A
+See ``manager-log/dotnet-parity-exploration.md`` §4 for the Phase A
 scope and §6 for what is intentionally deferred.
 """
 
@@ -31,7 +31,7 @@ from etw_analyzer.native import cache as native_cache
 
 def _make_etl(tmp_path: Path) -> Path:
     etl = tmp_path / "dotnet_parity.etl"
-    etl.write_bytes(b"synthetic csharp parity etl")
+    etl.write_bytes(b"synthetic dotnet parity etl")
     return etl
 
 
@@ -87,7 +87,7 @@ def _make_empty_readythread() -> pd.DataFrame:
     })
 
 
-def _seed_csharp_staging(
+def _seed_dotnet_staging(
     staging_dir: Path,
     etl: Path,
     *,
@@ -152,7 +152,7 @@ def _seed_csharp_staging(
 # ---- adapter unit tests -------------------------------------------------
 
 
-class TestNormalizeCsharpDataframe:
+class TestNormalizeDotnetDataframe:
     def test_renames_timestampqpc_to_timestamp(self):
         df = pd.DataFrame({"TimeStampQpc": [1, 2], "CPU": [0, 1]})
         result = adapters.normalize_dotnet_dataframe(df)
@@ -341,10 +341,10 @@ class TestPopulateEventCountsFromManifest:
 
 
 class TestCpuTimelineParity:
-    def test_csharp_staging_produces_cpu_timeline(self, tmp_path: Path):
+    def test_dotnet_staging_produces_cpu_timeline(self, tmp_path: Path):
         etl = _make_etl(tmp_path)
         staging = tmp_path / "staging"
-        _seed_csharp_staging(staging, etl, sampled_rows=200, cpu_count=4)
+        _seed_dotnet_staging(staging, etl, sampled_rows=200, cpu_count=4)
 
         result = aggregation_worker.run_aggregation_worker(
             staging, etl, trace_id="trace_cpu_timeline",
@@ -363,7 +363,7 @@ class TestCpuTimelineParity:
     def test_cpu_timeline_registered_in_manifest(self, tmp_path: Path):
         etl = _make_etl(tmp_path)
         staging = tmp_path / "staging"
-        _seed_csharp_staging(staging, etl, sampled_rows=200, cpu_count=4)
+        _seed_dotnet_staging(staging, etl, sampled_rows=200, cpu_count=4)
         aggregation_worker.run_aggregation_worker(
             staging, etl, trace_id="trace_cpu_timeline_m",
         )
@@ -377,7 +377,7 @@ class TestTraceMetadataParity:
     def test_trace_metadata_synthesized(self, tmp_path: Path):
         etl = _make_etl(tmp_path)
         staging = tmp_path / "staging"
-        _seed_csharp_staging(staging, etl)
+        _seed_dotnet_staging(staging, etl)
         result = aggregation_worker.run_aggregation_worker(
             staging, etl, trace_id="trace_meta",
         )
@@ -393,7 +393,7 @@ class TestTraceMetadataParity:
     def test_trace_metadata_registered_in_manifest(self, tmp_path: Path):
         etl = _make_etl(tmp_path)
         staging = tmp_path / "staging"
-        _seed_csharp_staging(staging, etl)
+        _seed_dotnet_staging(staging, etl)
         aggregation_worker.run_aggregation_worker(
             staging, etl, trace_id="trace_meta_m",
         )
@@ -407,7 +407,7 @@ class TestTracestatsParity:
     def test_tracestats_text_written(self, tmp_path: Path):
         etl = _make_etl(tmp_path)
         staging = tmp_path / "staging"
-        _seed_csharp_staging(staging, etl, sampled_rows=200, cswitch_rows=300)
+        _seed_dotnet_staging(staging, etl, sampled_rows=200, cswitch_rows=300)
         result = aggregation_worker.run_aggregation_worker(
             staging, etl, trace_id="trace_tracestats",
         )
@@ -423,7 +423,7 @@ class TestTracestatsParity:
     def test_tracestats_registered_in_manifest(self, tmp_path: Path):
         etl = _make_etl(tmp_path)
         staging = tmp_path / "staging"
-        _seed_csharp_staging(staging, etl)
+        _seed_dotnet_staging(staging, etl)
         aggregation_worker.run_aggregation_worker(
             staging, etl, trace_id="trace_tracestats_m",
         )
@@ -444,7 +444,7 @@ class TestSysconfigParity:
         """
         etl = _make_etl(tmp_path)
         staging = tmp_path / "staging"
-        _seed_csharp_staging(staging, etl, cpu_count=4)
+        _seed_dotnet_staging(staging, etl, cpu_count=4)
         result = aggregation_worker.run_aggregation_worker(
             staging, etl, trace_id="trace_sysconfig",
         )
@@ -458,7 +458,7 @@ class TestSysconfigParity:
     def test_sysconfig_raw_csv_key_present(self, tmp_path: Path):
         etl = _make_etl(tmp_path)
         staging = tmp_path / "staging"
-        _seed_csharp_staging(staging, etl)
+        _seed_dotnet_staging(staging, etl)
         from etw_analyzer.native import aggregation_worker as aw
         captured: dict[str, set[str]] = {}
         real_persist = aw._persist_aggregator_outputs
@@ -484,7 +484,7 @@ class TestSysconfigParity:
 class _StubSymbolizer:
     """Stand-in for the real dbghelp-backed symbolizer.
 
-    The csharp sidecar does NOT yet emit Image/Load events
+    The dotnet sidecar does NOT yet emit Image/Load events
     (Phase B follow-up), so the real Symbolizer can't be built. This
     stub lets us still exercise the stacks aggregator end-to-end and
     prove the adapter + dispatch path produces output when a symbolizer
@@ -511,14 +511,14 @@ class TestStacksParity:
     """End-to-end stacks adapter — Phase B sidecar will provide real symbols.
 
     These tests inject a stub symbolizer so we can validate that the
-    csharp dumper_df normalization (Stack column survives, addresses
+    dotnet dumper_df normalization (Stack column survives, addresses
     are usable) lets the existing aggregator emit the correct output.
     """
 
     def _seed_with_symbolizer(self, tmp_path: Path):
         etl = _make_etl(tmp_path)
         staging = tmp_path / "staging"
-        _seed_csharp_staging(staging, etl, sampled_rows=50, cpu_count=4)
+        _seed_dotnet_staging(staging, etl, sampled_rows=50, cpu_count=4)
         return etl, staging
 
     def test_stacks_parquet_produced_with_symbolizer(self, tmp_path: Path):
@@ -584,15 +584,15 @@ class TestStacksParity:
 # ---- cache rehydrate / end-to-end ---------------------------------------
 
 
-class TestCsharpCacheRehydrate:
-    def test_manifest_lists_csharp_dumper_kind_for_aggregator_outputs(
+class TestDotnetCacheRehydrate:
+    def test_manifest_lists_dotnet_dumper_kind_for_aggregator_outputs(
         self, tmp_path: Path,
     ):
         """Aggregator parquets in the rewritten manifest get kind='parquet'
         and the sidecar dumper parquets keep kind='dumper-parquet'."""
         etl = _make_etl(tmp_path)
         staging = tmp_path / "staging"
-        _seed_csharp_staging(staging, etl)
+        _seed_dotnet_staging(staging, etl)
         aggregation_worker.run_aggregation_worker(
             staging, etl, trace_id="trace_kinds",
         )
@@ -618,7 +618,7 @@ class TestCsharpCacheRehydrate:
         """
         etl = _make_etl(tmp_path)
         staging = tmp_path / "staging"
-        _seed_csharp_staging(staging, etl, sampled_rows=200, cpu_count=4)
+        _seed_dotnet_staging(staging, etl, sampled_rows=200, cpu_count=4)
 
         from etw_analyzer.native import aggregation_worker as aw
         # Tap into the trace before manifest write to inspect raw_csv keys

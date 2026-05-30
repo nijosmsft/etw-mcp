@@ -111,7 +111,7 @@ def test_manifest_writer_defaults_to_schema_v3(tmp_path: Path):
     assert "producer" in raw
 
 
-def test_manifest_writer_accepts_csharp_producer(tmp_path: Path):
+def test_manifest_writer_accepts_dotnet_producer(tmp_path: Path):
     etl = _make_etl(tmp_path)
     export_dir = tmp_path / ".etw-export-sample"
     manifest = native_cache.CacheManifest.materialized_small(

@@ -6,7 +6,7 @@ or count by section header. The same section is rendered both by
 ``load_trace`` (via ``_format_load_summary``) and by ``trace_info``,
 which is what these tests pin.
 
-Also pins the csharp sidecar plumbing: aggregation_warnings from the
+Also pins the dotnet sidecar plumbing: aggregation_warnings from the
 worker result must flow through ``_register_cached_trace`` into
 ``trace.export_errors`` so they actually appear in the rendered
 section.
@@ -96,7 +96,7 @@ def test_trace_info_single_error_renders_count_one(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
-# aggregation_warnings → export_errors plumbing on csharp success
+# aggregation_warnings → export_errors plumbing on dotnet success
 # ---------------------------------------------------------------------------
 
 def test_native_worker_result_carries_aggregation_warnings_field():
@@ -112,8 +112,8 @@ def test_native_worker_result_carries_aggregation_warnings_field():
     assert r2.aggregation_warnings == ["warning A", "warning B"]
 
 
-def test_csharp_dispatch_merges_aggregation_warnings_into_export_errors(tmp_path: Path):
-    """The csharp success path must surface agg_result.warnings via trace.export_errors."""
+def test_dotnet_dispatch_merges_aggregation_warnings_into_export_errors(tmp_path: Path):
+    """The dotnet success path must surface agg_result.warnings via trace.export_errors."""
 
     etl = tmp_path / "real.etl"
     etl.write_bytes(b"ETL\0synthetic")
@@ -160,7 +160,7 @@ def test_csharp_dispatch_merges_aggregation_warnings_into_export_errors(tmp_path
         clear_traces()
 
 
-def test_csharp_dispatch_no_aggregation_warnings_no_section(tmp_path: Path):
+def test_dotnet_dispatch_no_aggregation_warnings_no_section(tmp_path: Path):
     """When aggregation_warnings is empty the section MUST be omitted."""
 
     etl = tmp_path / "real.etl"

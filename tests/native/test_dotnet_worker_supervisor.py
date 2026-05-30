@@ -1,7 +1,7 @@
 """Tests for the C# sidecar invocation path in worker_supervisor.
 
 The supervisor reuses the same JSONL/heartbeat/tail infrastructure as the
-legacy native worker; these tests pin the csharp-specific behaviour:
+legacy native worker; these tests pin the dotnet-specific behaviour:
 request shape, sidecar discovery, aggregation hand-off, and atomic
 promotion.
 """
@@ -77,7 +77,7 @@ def _seed_sidecar_outputs(staging_dir: Path, etl: Path) -> None:
 # Request shape
 # ---------------------------------------------------------------------------
 
-def test_build_csharp_request_matches_contract(tmp_path: Path):
+def test_build_dotnet_request_matches_contract(tmp_path: Path):
     etl = _make_etl(tmp_path)
     staging = tmp_path / "staging"
     req = worker_supervisor.build_dotnet_request(
@@ -100,7 +100,7 @@ def test_build_csharp_request_matches_contract(tmp_path: Path):
     assert req["max_etl_mb"] >= 512
 
 
-def test_build_csharp_request_dedupes_event_classes(tmp_path: Path):
+def test_build_dotnet_request_dedupes_event_classes(tmp_path: Path):
     req = worker_supervisor.build_dotnet_request(
         trace_id="t",
         etl_path=_make_etl(tmp_path),
@@ -110,7 +110,7 @@ def test_build_csharp_request_dedupes_event_classes(tmp_path: Path):
     assert req["requested_event_classes"] == ["SampledProfile", "CSwitch"]
 
 
-def test_build_csharp_command_uses_only_request_flag(tmp_path: Path):
+def test_build_dotnet_command_uses_only_request_flag(tmp_path: Path):
     sidecar = _fake_sidecar(tmp_path)
     req = tmp_path / "request.json"
     cmd = worker_supervisor.build_dotnet_command(sidecar, req)
@@ -121,13 +121,13 @@ def test_build_csharp_command_uses_only_request_flag(tmp_path: Path):
 # End-to-end successful path with a fake process runner.
 # ---------------------------------------------------------------------------
 
-def test_run_csharp_worker_success_promotes_to_export_dir(
+def test_run_dotnet_worker_success_promotes_to_export_dir(
     tmp_path: Path, monkeypatch
 ):
     etl = _make_etl(tmp_path)
     sidecar = _fake_sidecar(tmp_path)
     export_dir = tmp_path / ".etw-export-sample"
-    trace_id = "trace_csharp_ok"
+    trace_id = "trace_dotnet_ok"
 
     seen: dict = {}
 
@@ -165,7 +165,7 @@ def test_run_csharp_worker_success_promotes_to_export_dir(
     assert loaded.producer == "dotnet"
 
 
-def test_run_csharp_worker_sidecar_failure_leaves_staging_for_debug(
+def test_run_dotnet_worker_sidecar_failure_leaves_staging_for_debug(
     tmp_path: Path,
 ):
     etl = _make_etl(tmp_path)
@@ -186,7 +186,7 @@ def test_run_csharp_worker_sidecar_failure_leaves_staging_for_debug(
     result = worker_supervisor.run_dotnet_worker_extraction(
         etl_path=etl,
         export_dir=export_dir,
-        trace_id="trace_csharp_fail",
+        trace_id="trace_dotnet_fail",
         symbol_path=None,
         requested_event_classes=["SampledProfile"],
         sidecar_path=sidecar,
@@ -199,7 +199,7 @@ def test_run_csharp_worker_sidecar_failure_leaves_staging_for_debug(
     assert not export_dir.exists()
 
 
-def test_run_csharp_worker_missing_binary_raises(tmp_path: Path, monkeypatch):
+def test_run_dotnet_worker_missing_binary_raises(tmp_path: Path, monkeypatch):
     # Pin env var to a path that doesn't exist. Because env_override is
     # exclusive, the in-tree publish path won't be consulted, so
     # find_dotnet_sidecar returns None and the supervisor raises.
@@ -220,7 +220,7 @@ def test_run_csharp_worker_missing_binary_raises(tmp_path: Path, monkeypatch):
         )
 
 
-def test_run_csharp_worker_invalid_manifest_returns_invalid_cache(tmp_path: Path):
+def test_run_dotnet_worker_invalid_manifest_returns_invalid_cache(tmp_path: Path):
     etl = _make_etl(tmp_path)
     sidecar = _fake_sidecar(tmp_path)
     export_dir = tmp_path / ".etw-export-sample"
@@ -249,7 +249,7 @@ def test_run_csharp_worker_invalid_manifest_returns_invalid_cache(tmp_path: Path
     assert result.failure_kind == "invalid-cache"
 
 
-def test_run_csharp_worker_aggregation_failure_returns_aggregation_kind(
+def test_run_dotnet_worker_aggregation_failure_returns_aggregation_kind(
     tmp_path: Path,
 ):
     etl = _make_etl(tmp_path)
@@ -318,7 +318,7 @@ class _FakeProcess:
         self.returncode = -9
 
 
-def test_run_csharp_process_parses_heartbeat_progress_result(tmp_path: Path):
+def test_run_dotnet_process_parses_heartbeat_progress_result(tmp_path: Path):
     sidecar = _fake_sidecar(tmp_path)
     request_path = tmp_path / "request.json"
     request_path.write_text("{}", encoding="utf-8")
@@ -348,7 +348,7 @@ def test_run_csharp_process_parses_heartbeat_progress_result(tmp_path: Path):
     assert result.result["producer"] == "dotnet"
 
 
-def test_run_csharp_process_structured_failure_surfaces_kind(tmp_path: Path):
+def test_run_dotnet_process_structured_failure_surfaces_kind(tmp_path: Path):
     sidecar = _fake_sidecar(tmp_path)
     request_path = tmp_path / "request.json"
     request_path.write_text("{}", encoding="utf-8")
@@ -373,7 +373,7 @@ def test_run_csharp_process_structured_failure_surfaces_kind(tmp_path: Path):
     assert "etl too big" in result.message
 
 
-def test_run_csharp_process_no_result_treated_as_crash(tmp_path: Path):
+def test_run_dotnet_process_no_result_treated_as_crash(tmp_path: Path):
     sidecar = _fake_sidecar(tmp_path)
     request_path = tmp_path / "request.json"
     request_path.write_text("{}", encoding="utf-8")

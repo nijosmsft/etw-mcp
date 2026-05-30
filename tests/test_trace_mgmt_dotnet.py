@@ -4,13 +4,13 @@ Mirrors tests/test_trace_mgmt_worker.py for the native worker. Stubs the
 sidecar supervisor (worker_supervisor.run_dotnet_worker_extraction) and
 asserts that load_trace correctly:
 
-* dispatches to the csharp worker when ``mode="dotnet"`` (or
+* dispatches to the dotnet worker when ``mode="dotnet"`` (or
   ``WPR_MCP_mode=dotnet``) is in effect,
 * registers the loaded trace with ``trace.mode == "dotnet"`` and the
   expected raw_csv contents,
-* falls back along the documented ``csharp → native → xperf`` chain when
-  the csharp pipeline fails under auto resolution, and
-* fails fast (no fallback, no registration) when csharp is forced.
+* falls back along the documented ``dotnet → native → xperf`` chain when
+  the dotnet pipeline fails under auto resolution, and
+* fails fast (no fallback, no registration) when dotnet is forced.
 """
 
 from __future__ import annotations
@@ -39,8 +39,8 @@ def isolate_traces():
 
 
 def _make_etl(tmp_path: Path) -> Path:
-    etl = tmp_path / "csharp-sample.etl"
-    etl.write_bytes(b"synthetic etl for csharp dispatch test")
+    etl = tmp_path / "dotnet-sample.etl"
+    etl.write_bytes(b"synthetic etl for dotnet dispatch test")
     return etl
 
 
@@ -64,10 +64,10 @@ def _cpu_sampling(cache: Path, weight: int) -> pd.DataFrame:
     return df
 
 
-def _write_csharp_cache(cache: Path, etl: Path, weight: int) -> None:
+def _write_dotnet_cache(cache: Path, etl: Path, weight: int) -> None:
     """Write a v3 manifest with producer='dotnet' alongside fake parquets.
 
-    The csharp sidecar emits all canonical dumper stems even when empty, so
+    The dotnet sidecar emits all canonical dumper stems even when empty, so
     we mirror that here. cpu_sampling carries the weight value the assertion
     checks for.
     """
@@ -101,14 +101,14 @@ def _write_csharp_cache(cache: Path, etl: Path, weight: int) -> None:
     native_cache.write_manifest(cache, manifest)
 
 
-def _fake_csharp_sidecar_path(tmp_path: Path) -> Path:
+def _fake_dotnet_sidecar_path(tmp_path: Path) -> Path:
     """Create a fake (empty) sidecar binary the resolver will accept."""
     fake = tmp_path / "wpr-mcp-extract.exe"
     fake.write_bytes(b"MZ")
     return fake
 
 
-def test_load_trace_csharp_worker_success_loads_promoted_cache(
+def test_load_trace_dotnet_worker_success_loads_promoted_cache(
     monkeypatch,
     tmp_path: Path,
 ):
@@ -117,7 +117,7 @@ def test_load_trace_csharp_worker_success_loads_promoted_cache(
 
     monkeypatch.setenv(
         native_config.DOTNET_SIDECAR_ENV,
-        str(_fake_csharp_sidecar_path(tmp_path)),
+        str(_fake_dotnet_sidecar_path(tmp_path)),
     )
     native_config.reset_dotnet_cache()
     monkeypatch.setattr(trace_mgmt, "find_xperf", lambda: None)
@@ -125,7 +125,7 @@ def test_load_trace_csharp_worker_success_loads_promoted_cache(
     def fake_worker(**kwargs):
         assert kwargs["export_dir"] == export_dir
         assert kwargs["etl_path"] == etl
-        _write_csharp_cache(export_dir, etl, weight=91)
+        _write_dotnet_cache(export_dir, etl, weight=91)
         return worker_supervisor.NativeWorkerResult(
             ok=True,
             message="ok",
@@ -144,7 +144,7 @@ def test_load_trace_csharp_worker_success_loads_promoted_cache(
     assert trace.raw_csv["cpu_sampling"]["Weight"].tolist() == [91]
 
 
-def test_load_trace_auto_picks_csharp_when_sidecar_is_configured(
+def test_load_trace_auto_picks_dotnet_when_sidecar_is_configured(
     monkeypatch,
     tmp_path: Path,
 ):
@@ -153,14 +153,14 @@ def test_load_trace_auto_picks_csharp_when_sidecar_is_configured(
 
     monkeypatch.setenv(
         native_config.DOTNET_SIDECAR_ENV,
-        str(_fake_csharp_sidecar_path(tmp_path)),
+        str(_fake_dotnet_sidecar_path(tmp_path)),
     )
     native_config.reset_dotnet_cache()
     monkeypatch.delenv("WPR_MCP_MODE", raising=False)
     monkeypatch.setattr(trace_mgmt, "find_xperf", lambda: None)
 
     def fake_worker(**kwargs):
-        _write_csharp_cache(export_dir, etl, weight=42)
+        _write_dotnet_cache(export_dir, etl, weight=42)
         return worker_supervisor.NativeWorkerResult(
             ok=True,
             message="ok",
@@ -169,7 +169,7 @@ def test_load_trace_auto_picks_csharp_when_sidecar_is_configured(
 
     def refuse_native(**kwargs):
         pytest.fail(
-            "native worker must not be invoked when csharp wins auto-resolution"
+            "native worker must not be invoked when dotnet wins auto-resolution"
         )
 
     monkeypatch.setattr(
@@ -186,7 +186,7 @@ def test_load_trace_auto_picks_csharp_when_sidecar_is_configured(
     assert trace.mode == "dotnet"
 
 
-def test_auto_csharp_failure_falls_back_to_native_worker(
+def test_auto_dotnet_failure_falls_back_to_native_worker(
     monkeypatch,
     tmp_path: Path,
 ):
@@ -195,7 +195,7 @@ def test_auto_csharp_failure_falls_back_to_native_worker(
 
     monkeypatch.setenv(
         native_config.DOTNET_SIDECAR_ENV,
-        str(_fake_csharp_sidecar_path(tmp_path)),
+        str(_fake_dotnet_sidecar_path(tmp_path)),
     )
     native_config.reset_dotnet_cache()
     monkeypatch.delenv("WPR_MCP_MODE", raising=False)
@@ -203,10 +203,10 @@ def test_auto_csharp_failure_falls_back_to_native_worker(
     monkeypatch.setattr(native_config, "_etl_size_mb", lambda etl_path: 0.1)
     monkeypatch.setattr(trace_mgmt, "find_xperf", lambda: None)
 
-    def fail_csharp(**kwargs):
+    def fail_dotnet(**kwargs):
         return worker_supervisor.NativeWorkerResult(
             ok=False,
-            message="synthetic csharp sidecar failure",
+            message="synthetic dotnet sidecar failure",
             failure_kind="sidecar-crash",
         )
 
@@ -243,7 +243,7 @@ def test_auto_csharp_failure_falls_back_to_native_worker(
         )
 
     monkeypatch.setattr(
-        worker_supervisor, "run_dotnet_worker_extraction", fail_csharp
+        worker_supervisor, "run_dotnet_worker_extraction", fail_dotnet
     )
     monkeypatch.setattr(
         worker_supervisor, "run_native_worker_extraction", fake_native
@@ -258,7 +258,7 @@ def test_auto_csharp_failure_falls_back_to_native_worker(
     assert trace.raw_csv["cpu_sampling"]["Weight"].tolist() == [33]
 
 
-def test_explicit_csharp_failure_does_not_fallback_or_register(
+def test_explicit_dotnet_failure_does_not_fallback_or_register(
     monkeypatch,
     tmp_path: Path,
 ):
@@ -266,37 +266,37 @@ def test_explicit_csharp_failure_does_not_fallback_or_register(
 
     monkeypatch.setenv(
         native_config.DOTNET_SIDECAR_ENV,
-        str(_fake_csharp_sidecar_path(tmp_path)),
+        str(_fake_dotnet_sidecar_path(tmp_path)),
     )
     native_config.reset_dotnet_cache()
     monkeypatch.setattr(trace_mgmt, "find_xperf", lambda: Path(r"C:\fake\xperf.exe"))
 
-    def fail_csharp(**kwargs):
+    def fail_dotnet(**kwargs):
         return worker_supervisor.NativeWorkerResult(
             ok=False,
-            message="synthetic csharp sidecar failure",
+            message="synthetic dotnet sidecar failure",
             failure_kind="timeout",
             stderr_tail="bounded stderr",
         )
 
     monkeypatch.setattr(
-        worker_supervisor, "run_dotnet_worker_extraction", fail_csharp
+        worker_supervisor, "run_dotnet_worker_extraction", fail_dotnet
     )
     monkeypatch.setattr(
         worker_supervisor,
         "run_native_worker_extraction",
-        lambda **kwargs: pytest.fail("native fallback must not run when csharp is forced"),
+        lambda **kwargs: pytest.fail("native fallback must not run when dotnet is forced"),
     )
     monkeypatch.setattr(
         trace_mgmt,
         "export_all_profiles",
-        lambda *args, **kwargs: pytest.fail("xperf fallback must not run when csharp is forced"),
+        lambda *args, **kwargs: pytest.fail("xperf fallback must not run when dotnet is forced"),
     )
 
     result = trace_mgmt.load_trace(str(etl), mode="dotnet")
 
     assert ".NET sidecar ETW worker extraction failed" in result
-    assert "timeout: synthetic csharp sidecar failure" in result
+    assert "timeout: synthetic dotnet sidecar failure" in result
     assert "bounded stderr" in result
     # Producer-aware fallback hints must name both alternative pipelines so
     # the caller can recover without guessing.

@@ -30,13 +30,13 @@ def _clear_caches(monkeypatch):
     config.reset_auto_cache()
 
 
-def test_csharp_in_valid_modes():
+def test_dotnet_in_valid_modes():
     assert "dotnet" in config.VALID_MODES
     # The other modes must still be accepted.
     assert {"native", "xperf", "auto"}.issubset(config.VALID_MODES)
 
 
-def test_normalize_mode_accepts_csharp():
+def test_normalize_mode_accepts_dotnet():
     assert config.normalize_mode("dotnet") == "dotnet"
     assert config.normalize_mode("dotnet") == "dotnet"
 
@@ -46,7 +46,7 @@ def test_normalize_mode_rejects_unknown_mode():
         config.normalize_mode("rust")
 
 
-def test_find_csharp_sidecar_honors_env_var(tmp_path, monkeypatch):
+def test_find_dotnet_sidecar_honors_env_var(tmp_path, monkeypatch):
     sidecar = _make_fake_sidecar(tmp_path)
     monkeypatch.setenv(config.DOTNET_SIDECAR_ENV, str(sidecar))
     config.reset_dotnet_cache()
@@ -54,7 +54,7 @@ def test_find_csharp_sidecar_honors_env_var(tmp_path, monkeypatch):
     assert found == sidecar.resolve()
 
 
-def test_find_csharp_sidecar_env_missing_file_returns_none(tmp_path, monkeypatch):
+def test_find_dotnet_sidecar_env_missing_file_returns_none(tmp_path, monkeypatch):
     monkeypatch.setenv(
         config.DOTNET_SIDECAR_ENV,
         str(tmp_path / "does-not-exist.exe"),
@@ -70,7 +70,7 @@ def test_find_csharp_sidecar_env_missing_file_returns_none(tmp_path, monkeypatch
         assert found is None
 
 
-def test_find_csharp_sidecar_cached(tmp_path, monkeypatch):
+def test_find_dotnet_sidecar_cached(tmp_path, monkeypatch):
     sidecar = _make_fake_sidecar(tmp_path)
     monkeypatch.setenv(config.DOTNET_SIDECAR_ENV, str(sidecar))
     config.reset_dotnet_cache()
@@ -81,14 +81,14 @@ def test_find_csharp_sidecar_cached(tmp_path, monkeypatch):
     assert first == second
 
 
-def test_resolve_mode_csharp_explicit_with_binary(tmp_path, monkeypatch):
+def test_resolve_mode_dotnet_explicit_with_binary(tmp_path, monkeypatch):
     sidecar = _make_fake_sidecar(tmp_path)
     monkeypatch.setenv(config.DOTNET_SIDECAR_ENV, str(sidecar))
     config.reset_dotnet_cache()
     assert config.resolve_mode("dotnet") == "dotnet"
 
 
-def test_resolve_mode_csharp_explicit_missing_binary_raises(monkeypatch, tmp_path):
+def test_resolve_mode_dotnet_explicit_missing_binary_raises(monkeypatch, tmp_path):
     # Ensure no binary is findable: clear env, point at non-existent path.
     monkeypatch.setenv(config.DOTNET_SIDECAR_ENV, str(tmp_path / "nope.exe"))
     config.reset_dotnet_cache()
@@ -103,16 +103,16 @@ def test_resolve_mode_csharp_explicit_missing_binary_raises(monkeypatch, tmp_pat
         config.resolve_mode("dotnet")
 
 
-def test_resolve_mode_auto_prefers_csharp_when_available(tmp_path, monkeypatch):
+def test_resolve_mode_auto_prefers_dotnet_when_available(tmp_path, monkeypatch):
     sidecar = _make_fake_sidecar(tmp_path)
     monkeypatch.setenv(config.DOTNET_SIDECAR_ENV, str(sidecar))
     config.reset_auto_cache()
-    # No etl_path needed for the csharp branch — sidecar location is the
+    # No etl_path needed for the dotnet branch — sidecar location is the
     # gating signal.
     assert config.resolve_mode("auto") == "dotnet"
 
 
-def test_resolve_mode_auto_falls_back_to_native_when_csharp_missing(
+def test_resolve_mode_auto_falls_back_to_native_when_dotnet_missing(
     tmp_path,
     monkeypatch,
 ):
@@ -125,13 +125,13 @@ def test_resolve_mode_auto_falls_back_to_native_when_csharp_missing(
         pytest.skip("wpr-mcp-extract.exe is on PATH; cannot test fallback")
 
     # The native vs xperf branch depends on host capability; we only assert
-    # that csharp was NOT chosen (the fallback chain advanced past it).
+    # that dotnet was NOT chosen (the fallback chain advanced past it).
     resolved = config.resolve_mode("auto")
     assert resolved != "dotnet"
     assert resolved in {"native", "xperf"}
 
 
-def test_wpr_mcp_mode_env_csharp_honored(tmp_path, monkeypatch):
+def test_wpr_mcp_mode_env_dotnet_honored(tmp_path, monkeypatch):
     sidecar = _make_fake_sidecar(tmp_path)
     monkeypatch.setenv(config.DOTNET_SIDECAR_ENV, str(sidecar))
     monkeypatch.setenv("WPR_MCP_MODE", "dotnet")
@@ -168,7 +168,7 @@ def test_explicit_arg_overrides_env_var(tmp_path, monkeypatch):
     monkeypatch.setenv(config.DOTNET_SIDECAR_ENV, str(sidecar))
     monkeypatch.setenv("WPR_MCP_MODE", "dotnet")
     config.reset_auto_cache()
-    # Explicit xperf wins over env var csharp.
+    # Explicit xperf wins over env var dotnet.
     assert config.resolve_mode("xperf") == "xperf"
 
 
@@ -180,9 +180,9 @@ def test_explicit_auto_arg_lets_env_var_win(monkeypatch):
     assert config.resolve_mode("auto") == "xperf"
 
 
-def test_auto_detect_ignores_in_tree_csharp_binary(monkeypatch):
-    """Auto mode must not silently flip to csharp just because an in-tree
-    publish build is sitting in ``csharp/publish/win-x64/``. That binary is
+def test_auto_detect_ignores_in_tree_dotnet_binary(monkeypatch):
+    """Auto mode must not silently flip to dotnet just because an in-tree
+    publish build is sitting in ``dotnet/publish/win-x64/``. That binary is
     a dev convenience; flipping the default pipeline on its presence would
     be a surprise to every dev with a published checkout.
 
@@ -206,7 +206,7 @@ def test_auto_detect_ignores_in_tree_csharp_binary(monkeypatch):
     # We don't assert on it because the in-tree publish may not be present.
 
 
-def test_explicit_csharp_lookup_includes_in_tree(monkeypatch):
+def test_explicit_dotnet_lookup_includes_in_tree(monkeypatch):
     """The non-auto variant of find_dotnet_sidecar checks the in-tree path."""
 
     monkeypatch.delenv(config.DOTNET_SIDECAR_ENV, raising=False)

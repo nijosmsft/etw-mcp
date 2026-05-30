@@ -1,4 +1,4 @@
-"""Cross-producer parity test: csharp sidecar vs native in-process consumer.
+"""Cross-producer parity test: dotnet sidecar vs native in-process consumer.
 
 This test is opt-in via ``--run-parity``. It runs the same real ETL through
 both the C# sidecar and the native ``OpenTraceW`` consumer and asserts that
@@ -10,7 +10,7 @@ chunking decisions can move counts by a row or two, but the core data
 
 Invocation::
 
-    uv run --group dev pytest tests/native/test_csharp_native_parity.py \\
+    uv run --group dev pytest tests/native/test_dotnet_native_parity.py \\
         --run-parity -v
 
 The test silently skips unless **all** of:
@@ -18,7 +18,7 @@ The test silently skips unless **all** of:
 * ``--run-parity`` was passed on the command line, AND
 * the platform is Windows (``os.name == "nt"``), AND
 * ``find_dotnet_sidecar()`` returns a binary (env var or PATH), AND
-* a real fixture ETL is reachable at ``WPR_MCP_CSHARP_E2E_FIXTURE`` or the
+* a real fixture ETL is reachable at ``__KEEP_DOTNET_E2E__`` or the
   default ``C:\\git\\wpr-mcp-poc-staging\\real-fixture\\spike-fixture.etl``.
 
 Tolerances (P2 D2):
@@ -34,7 +34,7 @@ Tolerances (P2 D2):
   is logged but does not fail the test.
 
 The test stages two independent copies of the ETL (one per mode) under
-``tmp_path`` so the side-by-side caches don't collide. The csharp pipeline
+``tmp_path`` so the side-by-side caches don't collide. The dotnet pipeline
 emits ``producer="dotnet"`` parquets; the native pipeline emits
 ``producer="native"``. Both share the v3 manifest schema.
 """
@@ -53,7 +53,7 @@ from etw_analyzer import trace_state
 from etw_analyzer.tools import trace_mgmt
 
 
-_REAL_FIXTURE_ENV = "WPR_MCP_CSHARP_E2E_FIXTURE"
+_REAL_FIXTURE_ENV = "__KEEP_DOTNET_E2E__"
 _REAL_FIXTURE_DEFAULT = (
     r"C:\git\wpr-mcp-poc-staging\real-fixture\spike-fixture.etl"
 )
@@ -77,8 +77,8 @@ _TOLERANT_DATASETS: dict[str, float] = {
 
 # Streaming-mode peak-RSS ceiling. The sidecar's event-store-streaming
 # strategy must stay under this when processing the spike fixture; the
-# smoke test enforces the same number on the csharp side and the parity
-# gate doubles as a perf regression guardrail on the python+csharp pair.
+# smoke test enforces the same number on the dotnet side and the parity
+# gate doubles as a perf regression guardrail on the python+dotnet pair.
 _STREAMING_RSS_CEILING_MB = 2_500.0
 
 
@@ -117,13 +117,13 @@ def _row_counts(raw_csv: dict) -> dict[str, int]:
 
 
 def _format_drift_table(
-    csharp_counts: dict[str, int],
+    dotnet_counts: dict[str, int],
     native_counts: dict[str, int],
 ) -> str:
-    keys = sorted(set(csharp_counts) | set(native_counts))
-    lines = ["| dataset | csharp | native | delta | drift% |", "|---|---:|---:|---:|---:|"]
+    keys = sorted(set(dotnet_counts) | set(native_counts))
+    lines = ["| dataset | dotnet | native | delta | drift% |", "|---|---:|---:|---:|---:|"]
     for k in keys:
-        c = csharp_counts.get(k, 0)
+        c = dotnet_counts.get(k, 0)
         n = native_counts.get(k, 0)
         delta = c - n
         if n > 0:
@@ -139,33 +139,33 @@ def _format_drift_table(
 
 def _assert_exact(
     name: str,
-    csharp_counts: dict[str, int],
+    dotnet_counts: dict[str, int],
     native_counts: dict[str, int],
     errors: list[str],
 ) -> None:
-    c = csharp_counts.get(name)
+    c = dotnet_counts.get(name)
     n = native_counts.get(name)
     if c is None and n is None:
         return  # neither pipeline produced it; not a parity failure
     if c is None or n is None:
         errors.append(
-            f"{name}: only one mode produced this dataset (csharp={c}, native={n})"
+            f"{name}: only one mode produced this dataset (dotnet={c}, native={n})"
         )
         return
     if c != n:
         errors.append(
-            f"{name}: exact match required; csharp={c:,} native={n:,} delta={c - n:+,}"
+            f"{name}: exact match required; dotnet={c:,} native={n:,} delta={c - n:+,}"
         )
 
 
 def _assert_within(
     name: str,
     tolerance: float,
-    csharp_counts: dict[str, int],
+    dotnet_counts: dict[str, int],
     native_counts: dict[str, int],
     errors: list[str],
 ) -> None:
-    c = csharp_counts.get(name)
+    c = dotnet_counts.get(name)
     n = native_counts.get(name)
     if c is None and n is None:
         return
@@ -175,7 +175,7 @@ def _assert_within(
     if n == 0:
         if c != 0:
             errors.append(
-                f"{name}: native produced 0 rows but csharp produced {c:,}"
+                f"{name}: native produced 0 rows but dotnet produced {c:,}"
             )
         return
     drift = abs(c - n) / float(n)
@@ -193,7 +193,7 @@ def _load_via(
     """Run ``load_trace`` for the given mode and return (trace_id,
     row_counts, export_errors, wall_seconds, peak_rss_mb).
 
-    ``peak_rss_mb`` is best-effort — only the csharp pipeline reports it
+    ``peak_rss_mb`` is best-effort — only the dotnet pipeline reports it
     (the sidecar fills ``performance.peak_rss_mb`` in its terminal
     ``result`` JSONL line). For native mode this returns 0.0.
     """
@@ -239,12 +239,12 @@ def _load_via(
 
 
 @pytest.mark.parity
-def test_csharp_vs_native_row_count_parity_real_fixture(
+def test_dotnet_vs_native_row_count_parity_real_fixture(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Run the real fixture through csharp and native and pin the
+    """Run the real fixture through dotnet and native and pin the
     aggregator-by-aggregator row-count drift within published tolerances.
     """
 
@@ -278,29 +278,29 @@ def test_csharp_vs_native_row_count_parity_real_fixture(
     # this run only (monkeypatch restores it at teardown).
     monkeypatch.setenv("WPR_MCP_NATIVE_ALLOW_LARGE", "1")
 
-    csharp_dir = tmp_path / "dotnet"
+    dotnet_dir = tmp_path / "dotnet"
     native_dir = tmp_path / "native"
-    csharp_etl = _stage_etl_copy(fixture, csharp_dir)
+    dotnet_etl = _stage_etl_copy(fixture, dotnet_dir)
     native_etl = _stage_etl_copy(fixture, native_dir)
 
     # Snapshot trace registry so the parity load doesn't leak into other
     # tests in the same pytest session.
     trace_state.clear_traces()
 
-    csharp_trace_id, csharp_counts, csharp_errors, csharp_wall, csharp_rss = _load_via(
-        "dotnet", csharp_etl
+    dotnet_trace_id, dotnet_counts, dotnet_errors, dotnet_wall, dotnet_rss = _load_via(
+        "dotnet", dotnet_etl
     )
     native_trace_id, native_counts, native_errors, native_wall, native_rss = _load_via(
         "native", native_etl
     )
 
-    drift_table = _format_drift_table(csharp_counts, native_counts)
-    print("\n=== csharp vs native row-count drift ===")
-    print(f"dotnet wall: {csharp_wall:.1f}s   native wall: {native_wall:.1f}s")
+    drift_table = _format_drift_table(dotnet_counts, native_counts)
+    print("\n=== dotnet vs native row-count drift ===")
+    print(f"dotnet wall: {dotnet_wall:.1f}s   native wall: {native_wall:.1f}s")
     print(drift_table)
-    if csharp_errors:
-        print("\ncsharp export_errors:")
-        for e in csharp_errors:
+    if dotnet_errors:
+        print("\ndotnet export_errors:")
+        for e in dotnet_errors:
             print(f"  - {e}")
     if native_errors:
         print("\nnative export_errors:")
@@ -309,17 +309,17 @@ def test_csharp_vs_native_row_count_parity_real_fixture(
 
     failures: list[str] = []
     for name in _EXACT_DATASETS:
-        _assert_exact(name, csharp_counts, native_counts, failures)
+        _assert_exact(name, dotnet_counts, native_counts, failures)
     for name, tol in _TOLERANT_DATASETS.items():
-        _assert_within(name, tol, csharp_counts, native_counts, failures)
+        _assert_within(name, tol, dotnet_counts, native_counts, failures)
 
-    # D5: streaming-mode peak RSS sanity. csharp sidecar is the one whose
+    # D5: streaming-mode peak RSS sanity. dotnet sidecar is the one whose
     # streaming path we're guarding; we measure the python process's peak
     # as a proxy for "nothing got hauled into Python memory wholesale".
     # The sidecar's own RSS is enforced by its smoke test.
-    if csharp_rss > _STREAMING_RSS_CEILING_MB:
+    if dotnet_rss > _STREAMING_RSS_CEILING_MB:
         failures.append(
-            f"python RSS during csharp load reached {csharp_rss:.0f} MB, "
+            f"python RSS during dotnet load reached {dotnet_rss:.0f} MB, "
             f"exceeds streaming ceiling {_STREAMING_RSS_CEILING_MB:.0f} MB"
         )
 
@@ -333,5 +333,5 @@ def test_csharp_vs_native_row_count_parity_real_fixture(
         pytest.fail(msg)
 
     # Cleanup — drop both traces so we don't leak parquets between tests.
-    trace_state.unregister_trace(csharp_trace_id)
+    trace_state.unregister_trace(dotnet_trace_id)
     trace_state.unregister_trace(native_trace_id)

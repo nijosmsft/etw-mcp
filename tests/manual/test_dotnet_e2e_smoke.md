@@ -1,10 +1,10 @@
 # Manual smoke test — C# sidecar end-to-end against real fixture
 
-This is the human-operator playbook for verifying that `mode="csharp"`
+This is the human-operator playbook for verifying that `mode="dotnet"`
 extracts a real ETL through the C# sidecar, runs the Python aggregators,
 promotes the cache, and reloads it on a second invocation. The
 automated coverage of the same path lives in
-`tests/native/test_cross_producer_cache.py::test_csharp_e2e_against_real_fixture_rehydrates_from_cache`;
+`tests/native/test_cross_producer_cache.py::test_dotnet_e2e_against_real_fixture_rehydrates_from_cache`;
 this doc captures the wall-clock numbers and CLI-level invocations a
 reviewer can re-execute to validate a release candidate.
 
@@ -13,7 +13,7 @@ reviewer can re-execute to validate a release candidate.
 1. **Sidecar binary published.** From the repo root:
 
    ```powershell
-   cd csharp
+   cd dotnet
    dotnet publish -c Release -r win-x64 --self-contained
    Test-Path .\publish\win-x64\wpr-mcp-extract.exe   # → True
    ```
@@ -29,40 +29,40 @@ reviewer can re-execute to validate a release candidate.
 3. **Python env synced**:
 
    ```powershell
-   cd C:\git\wpr-mcp-server-csharp-sidecar
+   cd C:\git\wpr-mcp-server-dotnet-sidecar
    uv sync --group dev   # builds the venv if it isn't already
    ```
 
 ## Run the smoke
 
 ```powershell
-cd C:\git\wpr-mcp-server-csharp-sidecar
+cd C:\git\wpr-mcp-server-dotnet-sidecar
 
-$env:WPR_MCP_CSHARP_SIDECAR = `
-    "C:\git\wpr-mcp-server-csharp-sidecar\csharp\publish\win-x64\wpr-mcp-extract.exe"
-$env:WPR_MCP_MODE             = "csharp"
+$env:WPR_MCP_DOTNET_SIDECAR = `
+    "C:\git\wpr-mcp-server-dotnet-sidecar\dotnet\publish\win-x64\wpr-mcp-extract.exe"
+$env:WPR_MCP_MODE             = "dotnet"
 $env:WPR_MCP_NATIVE_ALLOW_LARGE = "1"   # required because fixture > 512 MB native limit
 
 # Clean any stale output so timings are meaningful.
-Remove-Item -Recurse -Force C:\Temp\etw-export-csharp-smoke -ErrorAction SilentlyContinue
+Remove-Item -Recurse -Force C:\Temp\etw-export-dotnet-smoke -ErrorAction SilentlyContinue
 
-uv run python tests\manual\_smoke_csharp.py
+uv run python tests\manual\_smoke_dotnet.py
 ```
 
-## Expected output (validated 2026-05-29, branch `feature/csharp-sidecar`)
+## Expected output (validated 2026-05-29, branch `feature/dotnet-sidecar`)
 
 ```
-SIDECAR_PATH=C:\git\wpr-mcp-server-csharp-sidecar\csharp\publish\win-x64\wpr-mcp-extract.exe
+SIDECAR_PATH=C:\git\wpr-mcp-server-dotnet-sidecar\dotnet\publish\win-x64\wpr-mcp-extract.exe
 ETL_SIZE_MB=1068.0
 OK=True
-MSG=csharp sidecar completed: aggregation completed: 1 aggregator parquets written, 31 datasets in manifest
+MSG=dotnet sidecar completed: aggregation completed: 1 aggregator parquets written, 31 datasets in manifest
 WALL_E2E_S=25.3
 SIDECAR_WALL_S=19.648
 SIDECAR_EPS=163720
 SIDECAR_PEAK_RSS_MB=2287.4
 EVENT_SAMPLED=55652
 EVENT_CSWITCH=2100633
-MANIFEST_PRODUCER=csharp
+MANIFEST_PRODUCER=dotnet
 MANIFEST_SCHEMA=3
 MANIFEST_DATASETS=31
 MANIFEST_DATASET_NAMES=afd_accept,afd_bind,afd_close,afd_connect,afd_recv,afd_send,cpu_sampling,cswitch_events,http_close,http_deliver,http_recv,http_send,ndis_drops,packet_capture,quic_ack_recv,quic_conn_closed,quic_conn_created,quic_packet_recv,quic_packet_send,readythread,sampled_profile,sysconfig,tcpip_accept,tcpip_connect,tcpip_disconnect,tcpip_recv,tcpip_retransmit,tcpip_send,tracelogging_events,udp_recv,udp_send
@@ -71,7 +71,7 @@ MANIFEST_DATASET_NAMES=afd_accept,afd_bind,afd_close,afd_connect,afd_recv,afd_se
 Pass criteria:
 
 * `OK=True`
-* `MANIFEST_PRODUCER=csharp` and `MANIFEST_SCHEMA=3`
+* `MANIFEST_PRODUCER=dotnet` and `MANIFEST_SCHEMA=3`
 * `cpu_sampling` appears in the manifest dataset list (proves the Python
   aggregator ran post-sidecar)
 * `WALL_E2E_S < 60` (sidecar + aggregation; sub-25s on the lab box)
@@ -93,21 +93,21 @@ modes, not the specific hex).
 
 ## Cross-mode parity (optional — slow)
 
-To verify csharp and native produce the same `cpu_sampling` row count:
+To verify dotnet and native produce the same `cpu_sampling` row count:
 
 ```powershell
-# csharp mode (already ran above) — record the row count
-uv run python -c "import pandas as pd; print('csharp_rows=', len(pd.read_parquet(r'C:\Temp\etw-export-csharp-smoke\cpu_sampling.parquet')))"
+# dotnet mode (already ran above) — record the row count
+uv run python -c "import pandas as pd; print('dotnet_rows=', len(pd.read_parquet(r'C:\Temp\etw-export-dotnet-smoke\cpu_sampling.parquet')))"
 
 # native mode — clean re-extract via the legacy in-process path
-Remove-Item Env:WPR_MCP_CSHARP_SIDECAR -ErrorAction SilentlyContinue
+Remove-Item Env:WPR_MCP_DOTNET_SIDECAR -ErrorAction SilentlyContinue
 $env:WPR_MCP_MODE = "native"
 Remove-Item -Recurse -Force C:\Temp\etw-export-native-smoke -ErrorAction SilentlyContinue
 # (no automated harness for this yet — invoke load_trace via the MCP server
-# or write a one-off harness like _smoke_csharp.py)
+# or write a one-off harness like _smoke_dotnet.py)
 ```
 
-The csharp + native cpu_sampling row counts should match within the
+The dotnet + native cpu_sampling row counts should match within the
 aggregator's tolerance (sometimes ±1 row due to symbolicate-on-missing-PID
 behaviour).
 
@@ -124,7 +124,7 @@ behaviour).
 The post-P1b streaming sidecar typically reports `SIDECAR_PEAK_RSS_MB`
 in the 2 000–2 400 MB range on this fixture. The number is recorded
 for trend tracking; the parity test
-(`tests/native/test_csharp_native_parity.py --run-parity`) is what
+(`tests/native/test_dotnet_native_parity.py --run-parity`) is what
 enforces the 2 500 MB ceiling. See `SIDECAR.md` "RSS profile" for
 strategy comparison and the residual-headroom breakdown.
 

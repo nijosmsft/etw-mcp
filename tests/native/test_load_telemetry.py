@@ -183,13 +183,13 @@ def test_load_trace_emits_start_for_existing_etl_then_error(
     assert "stub.etl" in start_record
 
 
-def test_csharp_phase_telemetry_via_mocked_supervisor(
+def test_dotnet_phase_telemetry_via_mocked_supervisor(
     caplog: pytest.LogCaptureFixture,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ):
     """End-to-end-ish telemetry coverage for the dotnet pipeline using the
-    mocked-sidecar pattern from ``test_csharp_worker_supervisor.py``.
+    mocked-sidecar pattern from ``test_dotnet_worker_supervisor.py``.
 
     Runs ``run_dotnet_worker_extraction`` with a fake process_runner +
     aggregation_runner, then asserts the full event sequence:
@@ -209,7 +209,7 @@ def test_csharp_phase_telemetry_via_mocked_supervisor(
     )
     cache_mod = importlib.import_module("etw_analyzer.native.cache")
     test_supervisor = importlib.import_module(
-        "tests.native.test_csharp_worker_supervisor"
+        "tests.native.test_dotnet_worker_supervisor"
     )
 
     etl = tmp_path / "fixture.etl"

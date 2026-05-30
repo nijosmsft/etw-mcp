@@ -88,7 +88,7 @@ def _seed_sidecar_staging(staging_dir: Path, etl: Path) -> None:
     native_cache.write_manifest(staging_dir, manifest)
 
 
-def test_run_aggregation_worker_against_csharp_staging(tmp_path: Path):
+def test_run_aggregation_worker_against_dotnet_staging(tmp_path: Path):
     etl = _make_etl(tmp_path)
     staging = tmp_path / "staging"
     _seed_sidecar_staging(staging, etl)
@@ -96,10 +96,10 @@ def test_run_aggregation_worker_against_csharp_staging(tmp_path: Path):
     result = aggregation_worker.run_aggregation_worker(
         staging,
         etl,
-        trace_id="trace_test_csharp",
+        trace_id="trace_test_dotnet",
     )
     assert result.ok is True, f"failed: {result.message}; warnings={result.warnings}"
-    # Manifest must still be valid v3 with the csharp producer stamp.
+    # Manifest must still be valid v3 with the dotnet producer stamp.
     loaded = native_cache.read_manifest(staging)
     assert loaded is not None
     assert loaded.schema_version == 3
@@ -162,7 +162,7 @@ def test_run_aggregation_worker_missing_manifest(tmp_path: Path):
     assert "manifest" in result.message.lower()
 
 
-def test_run_aggregation_worker_preserves_csharp_producer_in_rewrite(tmp_path: Path):
+def test_run_aggregation_worker_preserves_dotnet_producer_in_rewrite(tmp_path: Path):
     """The rewritten manifest must keep producer='dotnet' when that's input."""
 
     etl = _make_etl(tmp_path)

@@ -5,7 +5,7 @@ from pathlib import Path
 import time
 
 etl = Path(r'C:\git\wpr-mcp-poc-staging\real-fixture\spike-fixture.etl')
-export_dir = Path(r'C:\Temp\etw-export-csharp-smoke')
+export_dir = Path(r'C:\Temp\etw-export-dotnet-smoke')
 
 print('SIDECAR_PATH=' + str(find_dotnet_sidecar()))
 print('ETL_SIZE_MB=' + str(etl.stat().st_size / (1024*1024)))
@@ -14,7 +14,7 @@ start = time.monotonic()
 r = run_dotnet_worker_extraction(
     etl_path=etl,
     export_dir=export_dir,
-    trace_id='trace_smoke_csharp',
+    trace_id='trace_smoke_dotnet',
     symbol_path=None,
     requested_event_classes=[
         'SampledProfile', 'CSwitch',

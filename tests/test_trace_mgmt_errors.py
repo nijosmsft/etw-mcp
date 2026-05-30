@@ -75,7 +75,7 @@ def test_load_trace_no_suffix_reports_no_suffix_label(tmp_path: Path):
 # ---------------------------------------------------------------------------
 
 
-def test_load_trace_xperf_missing_lists_native_and_csharp_alternatives(
+def test_load_trace_xperf_missing_lists_native_and_dotnet_alternatives(
     tmp_path: Path,
     monkeypatch,
 ):
@@ -83,7 +83,7 @@ def test_load_trace_xperf_missing_lists_native_and_csharp_alternatives(
     etl.write_bytes(b"synthetic etl payload")
 
     # Force xperf-not-found and force the resolved mode to "xperf" so the
-    # xperf branch of the error is taken (otherwise the native/csharp
+    # xperf branch of the error is taken (otherwise the native/dotnet
     # codepath would handle the missing-xperf condition).
     monkeypatch.setattr(trace_mgmt, "find_xperf", lambda: None)
     monkeypatch.setattr(wpa_exporter, "find_xperf", lambda: None)
@@ -141,7 +141,7 @@ def test_native_worker_load_failed_default_producer_suggests_xperf():
     assert "sidecar" not in result.lower()
 
 
-def test_native_worker_load_failed_csharp_producer_suggests_rebuild_and_alternatives():
+def test_native_worker_load_failed_dotnet_producer_suggests_rebuild_and_alternatives():
     worker_result = _make_worker_result(
         message="sidecar emitted malformed JSONL",
         failure_kind="invalid-stdout",
@@ -160,7 +160,7 @@ def test_native_worker_load_failed_csharp_producer_suggests_rebuild_and_alternat
     assert "mode='xperf'" in result
 
 
-def test_native_worker_load_failed_csharp_producer_non_build_failure_omits_rebuild_hint():
+def test_native_worker_load_failed_dotnet_producer_non_build_failure_omits_rebuild_hint():
     """Non-build-related sidecar failures should not nag about rebuilding."""
 
     worker_result = _make_worker_result(

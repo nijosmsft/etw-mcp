@@ -1,12 +1,12 @@
 """Cross-producer cache compatibility tests.
 
 The cache manifest schema v3 introduced a ``producer`` field that names
-the extractor that wrote the cache (``csharp``, ``native``, or ``xperf``).
+the extractor that wrote the cache (``dotnet``, ``native``, or ``xperf``).
 A core invariant of the migration plan is that the parquet schema is
 identical across producers, so a cache written by one producer must be
 readable by a tool that ran under a different mode. These tests pin that
 invariant with synthetic data; the real-ETL smoke test lives in
-``tests/manual/test_csharp_e2e_smoke.md``.
+``tests/manual/test_dotnet_e2e_smoke.md``.
 """
 
 from __future__ import annotations
@@ -112,7 +112,7 @@ def test_v2_manifest_loads_with_default_native_producer(tmp_path: Path):
     assert loaded.producer == "native"
 
 
-def test_v3_csharp_manifest_loads_and_downstream_tools_work(tmp_path: Path):
+def test_v3_dotnet_manifest_loads_and_downstream_tools_work(tmp_path: Path):
     """A producer='dotnet' cache must hydrate via the standard loader path."""
 
     etl = _make_etl(tmp_path)
@@ -129,7 +129,7 @@ def test_v3_csharp_manifest_loads_and_downstream_tools_work(tmp_path: Path):
     native_cache.validate_manifest(loaded, cache_dir, etl, mode="native")
 
     # Now exercise the trace_mgmt loader. The mode parameter selects which
-    # consumer "asked" for the cache; native and csharp share the loader
+    # consumer "asked" for the cache; native and dotnet share the loader
     # path because the manifest mode is always "native".
     cached = trace_mgmt._load_from_cache(cache_dir, etl, mode="native")
     assert cached is not None
@@ -137,39 +137,39 @@ def test_v3_csharp_manifest_loads_and_downstream_tools_work(tmp_path: Path):
     assert cached["cpu_sampling"]["Weight"].tolist() == [100]
 
 
-def test_v3_native_manifest_loads_identically_to_csharp(tmp_path: Path):
+def test_v3_native_manifest_loads_identically_to_dotnet(tmp_path: Path):
     """Producer is metadata; the parquet shape is identical, the loader agnostic."""
 
     etl = _make_etl(tmp_path)
-    csharp_dir = tmp_path / ".etw-export-csharp"
+    dotnet_dir = tmp_path / ".etw-export-dotnet"
     native_dir = tmp_path / ".etw-export-native"
 
-    _write_minimal_native_cache(csharp_dir, etl, producer="dotnet")
+    _write_minimal_native_cache(dotnet_dir, etl, producer="dotnet")
     _write_minimal_native_cache(native_dir, etl, producer="native")
 
-    csharp_loaded = trace_mgmt._load_from_cache(csharp_dir, etl, mode="native")
+    dotnet_loaded = trace_mgmt._load_from_cache(dotnet_dir, etl, mode="native")
     native_loaded = trace_mgmt._load_from_cache(native_dir, etl, mode="native")
-    assert csharp_loaded is not None
+    assert dotnet_loaded is not None
     assert native_loaded is not None
     # Same shape, same data, regardless of producer.
     pd.testing.assert_frame_equal(
-        csharp_loaded["cpu_sampling"].reset_index(drop=True),
+        dotnet_loaded["cpu_sampling"].reset_index(drop=True),
         native_loaded["cpu_sampling"].reset_index(drop=True),
     )
 
 
-def test_v3_csharp_cache_readable_under_xperf_mode_reload(tmp_path: Path):
-    """Spec D4: a trace extracted by csharp can be hydrated by mode='xperf'.
+def test_v3_dotnet_cache_readable_under_xperf_mode_reload(tmp_path: Path):
+    """Spec D4: a trace extracted by dotnet can be hydrated by mode='xperf'.
 
     Mode here is the *requested* mode at load time, not the producer that
     wrote the cache. trace_mgmt._load_from_cache filters by the trace's
     requested mode; cross-mode reloads only work when the cache's manifest
-    mode matches. Since the csharp sidecar writes manifest mode='native',
+    mode matches. Since the dotnet sidecar writes manifest mode='native',
     a caller requesting mode='xperf' would normally MISS this cache.
 
     This test pins that contract: xperf-mode loads MISS native-manifest
     caches (the user must request native/auto). The cross-producer
-    invariant is enforced inside the native-manifest umbrella — csharp,
+    invariant is enforced inside the native-manifest umbrella — dotnet,
     native, and (future) Rust all read each other transparently when the
     caller is requesting native mode.
     """
@@ -192,14 +192,14 @@ def test_v3_csharp_cache_readable_under_xperf_mode_reload(tmp_path: Path):
     assert cached_native is not None
 
 
-def test_v3_csharp_manifest_with_unix_epoch_mtime_validates_strict(tmp_path: Path):
-    """Regression for D1: csharp manifests with Unix-epoch mtime_ns must
+def test_v3_dotnet_manifest_with_unix_epoch_mtime_validates_strict(tmp_path: Path):
+    """Regression for D1: dotnet manifests with Unix-epoch mtime_ns must
     pass the strict three-field identity check, not the deprecated loose
     fall-back.
 
     The C# sidecar emits `(LastWriteTimeUtc - UnixEpoch).Ticks * 100` as
     of P1b, matching Python's `os.stat().st_mtime_ns` exactly. The Python
-    `matches_loose()` shim is gone — any csharp-produced manifest must
+    `matches_loose()` shim is gone — any dotnet-produced manifest must
     now round-trip through `validate_manifest` against the same ETL via
     the same code path as native and xperf producers.
     """
@@ -221,8 +221,8 @@ def test_v3_csharp_manifest_with_unix_epoch_mtime_validates_strict(tmp_path: Pat
     assert not hasattr(native_cache.EtlIdentity, "matches_loose")
 
 
-def test_v3_csharp_manifest_with_stale_mtime_is_rejected(tmp_path: Path):
-    """A csharp-produced cache whose mtime_ns no longer matches the
+def test_v3_dotnet_manifest_with_stale_mtime_is_rejected(tmp_path: Path):
+    """A dotnet-produced cache whose mtime_ns no longer matches the
     on-disk ETL must be rejected — the loose-match workaround is gone
     so this case is now an error, not a silent cache hit."""
 
@@ -244,7 +244,7 @@ def test_v3_csharp_manifest_with_stale_mtime_is_rejected(tmp_path: Path):
 
 
 
-_REAL_FIXTURE_ENV = "WPR_MCP_CSHARP_E2E_FIXTURE"
+_REAL_FIXTURE_ENV = "__KEEP_DOTNET_E2E__"
 _REAL_FIXTURE_DEFAULT = (
     r"C:\git\wpr-mcp-poc-staging\real-fixture\spike-fixture.etl"
 )
@@ -262,11 +262,11 @@ def _resolve_real_fixture() -> Path | None:
     _resolve_real_fixture() is None,
     reason=f"set {_REAL_FIXTURE_ENV} to a real ETL to exercise end-to-end",
 )
-def test_csharp_e2e_against_real_fixture_rehydrates_from_cache(tmp_path: Path):
-    """End-to-end: real ETL through csharp sidecar → reload from cache.
+def test_dotnet_e2e_against_real_fixture_rehydrates_from_cache(tmp_path: Path):
+    """End-to-end: real ETL through dotnet sidecar → reload from cache.
 
     Only runs when:
-      * ``WPR_MCP_CSHARP_E2E_FIXTURE`` (or the default real-fixture path)
+      * ``__KEEP_DOTNET_E2E__`` (or the default real-fixture path)
         points at an existing ETL, AND
       * ``find_dotnet_sidecar`` returns a binary, AND
       * the platform is Windows.
@@ -274,7 +274,7 @@ def test_csharp_e2e_against_real_fixture_rehydrates_from_cache(tmp_path: Path):
     This test is intentionally light — it exercises only the "load,
     re-load, cache hit" path. The full smoke checklist (wall time
     comparison vs native, dataset parity, etc.) lives in
-    ``tests/manual/test_csharp_e2e_smoke.md`` for manual operator use.
+    ``tests/manual/test_dotnet_e2e_smoke.md`` for manual operator use.
     """
 
     if os.name != "nt":
