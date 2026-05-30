@@ -89,7 +89,8 @@ internal sealed class ExtractRunner
                             "Process/DCEnd", "Process/Defunct",
                             "process_start", "process_end", "process_dcstart", "process_dcend", "process_defunct");
         _wantImage = Want("Image/Load", "Image/DCStart", "image", "images");
-        _wantDiskIo = Want("DiskIo", "diskio");
+        _wantDiskIo = Want("DiskIo", "diskio", "DiskIo/Read", "DiskIo/Write", "DiskIo/FlushBuffers",
+                            "diskio_read", "diskio_write", "diskio_flushbuffers");
         _wantDpcIsr = Want("PerfInfo", "PerfInfo/DPC", "PerfInfo/ThreadedDPC", "PerfInfo/TimerDPC", "PerfInfo/ISR",
                             "dpcisr", "dpc_isr", "perfinfo_dpc", "perfinfo_threaded_dpc", "perfinfo_timer_dpc", "perfinfo_isr");
         _wantThread = Want("Thread", "thread", "Thread/Start", "Thread/End", "Thread/DCStart", "Thread/DCEnd",

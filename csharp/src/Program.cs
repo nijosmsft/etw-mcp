@@ -247,7 +247,23 @@ try
         if (runner.Collector.Image.Count > 0)
             datasets.Add(new("image", "parquet", "image.parquet", 1, runner.Collector.Image.Count, true));
         if (runner.Collector.DiskIo.Count > 0)
+        {
             datasets.Add(new("diskio", "parquet", "diskio.parquet", 1, runner.Collector.DiskIo.Count, true));
+            // Phase B per-opcode DiskIo parquets.
+            int dRead = 0, dWrite = 0, dFlush = 0;
+            foreach (var r in runner.Collector.DiskIo)
+            {
+                switch (r.Kind)
+                {
+                    case "Read":         dRead++;  break;
+                    case "Write":        dWrite++; break;
+                    case "FlushBuffers": dFlush++; break;
+                }
+            }
+            datasets.Add(new("diskio_read",         "parquet", "diskio_read.parquet",         1, dRead,  false));
+            datasets.Add(new("diskio_write",        "parquet", "diskio_write.parquet",        1, dWrite, false));
+            datasets.Add(new("diskio_flushbuffers", "parquet", "diskio_flushbuffers.parquet", 1, dFlush, false));
+        }
         if (runner.Collector.DpcIsr.Count > 0)
         {
             datasets.Add(new("dpc_isr", "parquet", "dpc_isr.parquet", 1, runner.Collector.DpcIsr.Count, true));

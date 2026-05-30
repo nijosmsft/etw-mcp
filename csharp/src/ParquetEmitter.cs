@@ -66,7 +66,14 @@ internal static class ParquetEmitter
             total += await WriteProcessByKindAsync(ec.Process, "Defunct", Path.Combine(stagingDir, "process_defunct.parquet"));
         }
         if (ec.Image.Count > 0)    total += await WriteImageAsync(ec.Image,     Path.Combine(stagingDir, "image.parquet"));
-        if (ec.DiskIo.Count > 0)   total += await WriteDiskIoAsync(ec.DiskIo,   Path.Combine(stagingDir, "diskio.parquet"));
+        if (ec.DiskIo.Count > 0)
+        {
+            total += await WriteDiskIoAsync(ec.DiskIo,   Path.Combine(stagingDir, "diskio.parquet"));
+            // Phase B per-opcode DiskIo parquets.
+            total += await WriteDiskIoByKindAsync(ec.DiskIo, "Read",         Path.Combine(stagingDir, "diskio_read.parquet"));
+            total += await WriteDiskIoByKindAsync(ec.DiskIo, "Write",        Path.Combine(stagingDir, "diskio_write.parquet"));
+            total += await WriteDiskIoByKindAsync(ec.DiskIo, "FlushBuffers", Path.Combine(stagingDir, "diskio_flushbuffers.parquet"));
+        }
         if (ec.DpcIsr.Count > 0)   total += await WriteDpcIsrAsync(ec.DpcIsr,   Path.Combine(stagingDir, "dpc_isr.parquet"));
         // Per-opcode PerfInfo parquets (Phase B). Always emit so Python aggregators
         // can rely on stable filenames; the writer produces an empty parquet when
@@ -710,6 +717,44 @@ internal static class ParquetEmitter
             await rg.WriteColumnAsync(new DataColumn(fQpc, qpc));
             await rg.WriteColumnAsync(new DataColumn(fCpu, cpu));
             await rg.WriteColumnAsync(new DataColumn(fKind, kind));
+            await rg.WriteColumnAsync(new DataColumn(fDisk, disk));
+            await rg.WriteColumnAsync(new DataColumn(fOff, off));
+            await rg.WriteColumnAsync(new DataColumn(fSize, sz));
+            await rg.WriteColumnAsync(new DataColumn(fPid, pid));
+            await rg.WriteColumnAsync(new DataColumn(fFile, fn));
+            await rg.WriteColumnAsync(new DataColumn(fEla, ela));
+        });
+    }
+
+    /// <summary>
+    /// Per-opcode DiskIo parquet writer — filters by <c>Kind</c>. Schema matches
+    /// <see cref="WriteDiskIoAsync"/> minus the <c>Kind</c> column.
+    /// </summary>
+    internal static async Task<long> WriteDiskIoByKindAsync(List<DiskIoRow> rows, string kind, string path)
+    {
+        var fEventSeq = Df<ulong>("EventSequence", false);
+        var fQpc = Df<long>("TimeStampQpc", false);
+        var fCpu = Df<int>("CPU", false);
+        var fDisk = Df<long>("DiskNumber", true);
+        var fOff = Df<ulong>("ByteOffset", true);
+        var fSize = Df<long>("TransferSize", true);
+        var fPid = Df<long>("PID", true);
+        var fFile = DfStr("FileName");
+        var fEla = Df<long>("ElapsedMicros", true);
+        var schema = new ParquetSchema(fEventSeq, fQpc, fCpu, fDisk, fOff, fSize, fPid, fFile, fEla);
+        var filtered = new List<DiskIoRow>(rows.Count);
+        for (int i = 0; i < rows.Count; i++)
+            if (string.Equals(rows[i].Kind, kind, StringComparison.Ordinal)) filtered.Add(rows[i]);
+        return await WriteRowGroupAsync(path, schema, async rg =>
+        {
+            int n = filtered.Count;
+            var es = new ulong[n]; var qpc = new long[n]; var cpu = new int[n];
+            var disk = new long?[n]; var off = new ulong?[n];
+            var sz = new long?[n]; var pid = new long?[n]; var fn = new string?[n]; var ela = new long?[n];
+            for (int i = 0; i < n; i++) { var r = filtered[i]; es[i] = r.EventSequence; qpc[i] = r.TimeStampQpc; cpu[i] = r.Cpu; disk[i] = r.DiskNumber; off[i] = r.ByteOffset; sz[i] = r.TransferSize; pid[i] = r.Pid; fn[i] = r.FileName; ela[i] = r.ElapsedMicros; }
+            await rg.WriteColumnAsync(new DataColumn(fEventSeq, es));
+            await rg.WriteColumnAsync(new DataColumn(fQpc, qpc));
+            await rg.WriteColumnAsync(new DataColumn(fCpu, cpu));
             await rg.WriteColumnAsync(new DataColumn(fDisk, disk));
             await rg.WriteColumnAsync(new DataColumn(fOff, off));
             await rg.WriteColumnAsync(new DataColumn(fSize, sz));
