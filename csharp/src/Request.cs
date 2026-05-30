@@ -16,7 +16,7 @@ internal sealed class Request
     [JsonPropertyName("heartbeat_interval_ms")] public int HeartbeatIntervalMs { get; init; } = 1000;
     [JsonPropertyName("log_level")] public string LogLevel { get; init; } = "info";
     [JsonPropertyName("panic_probe")] public string? PanicProbe { get; init; }
-    [JsonPropertyName("include_tracelogging")] public bool IncludeTracelogging { get; init; }
+    [JsonPropertyName("include_tracelogging")] public bool IncludeTracelogging { get; set; } = true;
 }
 
 internal sealed record RequestValidation(bool Ok, string? FailureKind = null, string? Error = null)

@@ -27,6 +27,7 @@ void EmitFailure(string failureKind, string error, string? tracebackTail = null)
 
 // ---- Parse CLI args ------------------------------------------------------
 string? requestPath = null;
+bool? cliIncludeTracelogging = null;  // null = unset, takes default from request.json
 try
 {
     for (int i = 0; i < args.Length; i++)
@@ -34,6 +35,23 @@ try
         if (args[i] == "--request" && i + 1 < args.Length)
         {
             requestPath = args[++i];
+        }
+        else if (args[i] == "--include-tracelogging")
+        {
+            cliIncludeTracelogging = true;
+        }
+        else if (args[i] == "--no-include-tracelogging")
+        {
+            cliIncludeTracelogging = false;
+        }
+        else if (args[i] == "--help" || args[i] == "-h")
+        {
+            Console.Error.WriteLine("wpr-mcp-extract --request <path> [--include-tracelogging|--no-include-tracelogging]");
+            Console.Error.WriteLine("  Per spike-contract §2.2 the only required flag is --request.");
+            Console.Error.WriteLine("  --include-tracelogging (default: true) writes a generic TraceLogging");
+            Console.Error.WriteLine("  passthrough parquet for self-describing providers not routed to a");
+            Console.Error.WriteLine("  typed buffer; --no-include-tracelogging disables it.");
+            return 0;
         }
         else
         {
@@ -64,6 +82,8 @@ try
         return 1;
     }
     req = loaded!;
+    if (cliIncludeTracelogging.HasValue)
+        req.IncludeTracelogging = cliIncludeTracelogging.Value;
 }
 catch (Exception ex)
 {
