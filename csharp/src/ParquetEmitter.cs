@@ -78,6 +78,17 @@ internal static class ParquetEmitter
             total += await WriteDpcIsrByKindAsync(ec.DpcIsr, "TimerDPC",    Path.Combine(stagingDir, "perfinfo_timer_dpc.parquet"));
             total += await WriteDpcIsrByKindAsync(ec.DpcIsr, "ISR",         Path.Combine(stagingDir, "perfinfo_isr.parquet"));
         }
+        // Phase B: Thread/* per-opcode parquets.
+        if (ec.Thread.Count > 0)
+        {
+            total += await WriteThreadByKindAsync(ec.Thread, "Start",   Path.Combine(stagingDir, "thread_start.parquet"));
+            total += await WriteThreadByKindAsync(ec.Thread, "End",     Path.Combine(stagingDir, "thread_end.parquet"));
+            total += await WriteThreadByKindAsync(ec.Thread, "DCStart", Path.Combine(stagingDir, "thread_dcstart.parquet"));
+            total += await WriteThreadByKindAsync(ec.Thread, "DCEnd",   Path.Combine(stagingDir, "thread_dcend.parquet"));
+        }
+        // Phase B: EventTrace/Header (one row per ETL).
+        if (ec.EventTraceHeader.Count > 0)
+            total += await WriteEventTraceHeaderAsync(ec.EventTraceHeader, Path.Combine(stagingDir, "eventtrace_header.parquet"));
         if (ec.Tracelogging.Count > 0)
             total += await WriteTraceloggingAsync(ec.Tracelogging, Path.Combine(stagingDir, "tracelogging_events.parquet"));
         return total;
@@ -759,6 +770,127 @@ internal static class ParquetEmitter
             await rg.WriteColumnAsync(new DataColumn(fCpu, cpu));
             await rg.WriteColumnAsync(new DataColumn(fRoutine, rt));
             await rg.WriteColumnAsync(new DataColumn(fEla, ela));
+        });
+    }
+
+    /// <summary>
+    /// Per-opcode Thread parquet writer. Single-Kind output (Start/End/DCStart/DCEnd).
+    /// </summary>
+    internal static async Task<long> WriteThreadByKindAsync(List<ThreadRow> rows, string kind, string path)
+    {
+        var fEventSeq = Df<ulong>("EventSequence", false);
+        var fQpc = Df<long>("TimeStampQpc", false);
+        var fCpu = Df<int>("CPU", false);
+        var fPid = Df<long>("PID", false);
+        var fTid = Df<long>("TID", false);
+        var fParentPid = Df<long>("ParentPID", true);
+        var fParentTid = Df<long>("ParentTID", true);
+        var fStart = Df<ulong>("StartAddr", false);
+        var fWin32Start = Df<ulong>("Win32StartAddr", false);
+        var fStackBase = Df<ulong>("StackBase", false);
+        var fStackLimit = Df<ulong>("StackLimit", false);
+        var fUserStackBase = Df<ulong>("UserStackBase", false);
+        var fUserStackLimit = Df<ulong>("UserStackLimit", false);
+        var fBasePri = Df<int>("BasePriority", true);
+        var fName = DfStr("ThreadName");
+        var schema = new ParquetSchema(fEventSeq, fQpc, fCpu, fPid, fTid, fParentPid, fParentTid,
+            fStart, fWin32Start, fStackBase, fStackLimit, fUserStackBase, fUserStackLimit, fBasePri, fName);
+        var filtered = new List<ThreadRow>(rows.Count);
+        for (int i = 0; i < rows.Count; i++)
+            if (string.Equals(rows[i].Kind, kind, StringComparison.Ordinal)) filtered.Add(rows[i]);
+        return await WriteRowGroupAsync(path, schema, async rg =>
+        {
+            int n = filtered.Count;
+            var es = new ulong[n]; var qpc = new long[n]; var cpu = new int[n];
+            var pid = new long[n]; var tid = new long[n];
+            var ppid = new long?[n]; var ptid = new long?[n];
+            var sa = new ulong[n]; var wsa = new ulong[n];
+            var sb = new ulong[n]; var sl = new ulong[n]; var usb = new ulong[n]; var usl = new ulong[n];
+            var bp = new int?[n]; var tn = new string?[n];
+            for (int i = 0; i < n; i++)
+            {
+                var r = filtered[i];
+                es[i] = r.EventSequence; qpc[i] = r.TimeStampQpc; cpu[i] = r.Cpu;
+                pid[i] = r.Pid; tid[i] = r.Tid;
+                ppid[i] = r.ParentPid; ptid[i] = r.ParentTid;
+                sa[i] = r.StartAddr; wsa[i] = r.Win32StartAddr;
+                sb[i] = r.StackBase; sl[i] = r.StackLimit; usb[i] = r.UserStackBase; usl[i] = r.UserStackLimit;
+                bp[i] = r.BasePriority; tn[i] = r.ThreadName;
+            }
+            await rg.WriteColumnAsync(new DataColumn(fEventSeq, es));
+            await rg.WriteColumnAsync(new DataColumn(fQpc, qpc));
+            await rg.WriteColumnAsync(new DataColumn(fCpu, cpu));
+            await rg.WriteColumnAsync(new DataColumn(fPid, pid));
+            await rg.WriteColumnAsync(new DataColumn(fTid, tid));
+            await rg.WriteColumnAsync(new DataColumn(fParentPid, ppid));
+            await rg.WriteColumnAsync(new DataColumn(fParentTid, ptid));
+            await rg.WriteColumnAsync(new DataColumn(fStart, sa));
+            await rg.WriteColumnAsync(new DataColumn(fWin32Start, wsa));
+            await rg.WriteColumnAsync(new DataColumn(fStackBase, sb));
+            await rg.WriteColumnAsync(new DataColumn(fStackLimit, sl));
+            await rg.WriteColumnAsync(new DataColumn(fUserStackBase, usb));
+            await rg.WriteColumnAsync(new DataColumn(fUserStackLimit, usl));
+            await rg.WriteColumnAsync(new DataColumn(fBasePri, bp));
+            await rg.WriteColumnAsync(new DataColumn(fName, tn));
+        });
+    }
+
+    /// <summary>EventTrace/Header parquet — one row per ETL with authoritative metadata.</summary>
+    internal static async Task<long> WriteEventTraceHeaderAsync(List<EventTraceHeaderRow> rows, string path)
+    {
+        var fEventSeq = Df<ulong>("EventSequence", false);
+        var fQpc = Df<long>("TimeStampQpc", false);
+        var fCpu = Df<int>("CPU", false);
+        var fPerfFreq = Df<long>("PerfFreq", false);
+        var fNumProc = Df<int>("NumberOfProcessors", false);
+        var fTimerRes = Df<int>("TimerResolution", false);
+        var fStart = Df<long>("StartTime100Ns", false);
+        var fEnd = Df<long>("EndTime100Ns", false);
+        var fBoot = Df<long>("BootTime100Ns", false);
+        var fCpuSpeed = Df<int>("CpuSpeedMHz", false);
+        var fPointerSize = Df<int>("PointerSize", false);
+        var fLogMode = Df<int>("LogFileMode", false);
+        var fBuffers = Df<int>("BuffersWritten", false);
+        var fLost = Df<int>("EventsLost", false);
+        var fSession = DfStr("SessionName");
+        var fLogFile = DfStr("LogFileName");
+        var schema = new ParquetSchema(fEventSeq, fQpc, fCpu, fPerfFreq, fNumProc, fTimerRes,
+            fStart, fEnd, fBoot, fCpuSpeed, fPointerSize, fLogMode, fBuffers, fLost, fSession, fLogFile);
+        return await WriteRowGroupAsync(path, schema, async rg =>
+        {
+            int n = rows.Count;
+            var es = new ulong[n]; var qpc = new long[n]; var cpu = new int[n];
+            var pf = new long[n]; var np = new int[n]; var tr = new int[n];
+            var st = new long[n]; var en = new long[n]; var bt = new long[n];
+            var cs = new int[n]; var ps = new int[n]; var lm = new int[n];
+            var bw = new int[n]; var el = new int[n];
+            var sn = new string?[n]; var lf = new string?[n];
+            for (int i = 0; i < n; i++)
+            {
+                var r = rows[i];
+                es[i] = r.EventSequence; qpc[i] = r.TimeStampQpc; cpu[i] = r.Cpu;
+                pf[i] = r.PerfFreq; np[i] = r.NumberOfProcessors; tr[i] = r.TimerResolution;
+                st[i] = r.StartTime100Ns; en[i] = r.EndTime100Ns; bt[i] = r.BootTime100Ns;
+                cs[i] = r.CpuSpeedMHz; ps[i] = r.PointerSize; lm[i] = r.LogFileMode;
+                bw[i] = r.BuffersWritten; el[i] = r.EventsLost;
+                sn[i] = r.SessionName; lf[i] = r.LogFileName;
+            }
+            await rg.WriteColumnAsync(new DataColumn(fEventSeq, es));
+            await rg.WriteColumnAsync(new DataColumn(fQpc, qpc));
+            await rg.WriteColumnAsync(new DataColumn(fCpu, cpu));
+            await rg.WriteColumnAsync(new DataColumn(fPerfFreq, pf));
+            await rg.WriteColumnAsync(new DataColumn(fNumProc, np));
+            await rg.WriteColumnAsync(new DataColumn(fTimerRes, tr));
+            await rg.WriteColumnAsync(new DataColumn(fStart, st));
+            await rg.WriteColumnAsync(new DataColumn(fEnd, en));
+            await rg.WriteColumnAsync(new DataColumn(fBoot, bt));
+            await rg.WriteColumnAsync(new DataColumn(fCpuSpeed, cs));
+            await rg.WriteColumnAsync(new DataColumn(fPointerSize, ps));
+            await rg.WriteColumnAsync(new DataColumn(fLogMode, lm));
+            await rg.WriteColumnAsync(new DataColumn(fBuffers, bw));
+            await rg.WriteColumnAsync(new DataColumn(fLost, el));
+            await rg.WriteColumnAsync(new DataColumn(fSession, sn));
+            await rg.WriteColumnAsync(new DataColumn(fLogFile, lf));
         });
     }
 }

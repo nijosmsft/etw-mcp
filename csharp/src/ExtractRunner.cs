@@ -37,6 +37,7 @@ internal sealed class ExtractRunner
     private readonly bool _wantHttpRecv, _wantHttpDeliver, _wantHttpSend, _wantHttpClose;
     private readonly bool _wantQuicCreate, _wantQuicClose, _wantQuicPktRecv, _wantQuicPktSend, _wantQuicAck;
     private readonly bool _wantProcess, _wantImage, _wantDiskIo, _wantDpcIsr;
+    private readonly bool _wantThread, _wantEventTraceHeader;
     private readonly bool _includeTracelogging;
     private readonly bool _panicCallback;
     private bool _panicFired;
@@ -91,6 +92,9 @@ internal sealed class ExtractRunner
         _wantDiskIo = Want("DiskIo", "diskio");
         _wantDpcIsr = Want("PerfInfo", "PerfInfo/DPC", "PerfInfo/ThreadedDPC", "PerfInfo/TimerDPC", "PerfInfo/ISR",
                             "dpcisr", "dpc_isr", "perfinfo_dpc", "perfinfo_threaded_dpc", "perfinfo_timer_dpc", "perfinfo_isr");
+        _wantThread = Want("Thread", "thread", "Thread/Start", "Thread/End", "Thread/DCStart", "Thread/DCEnd",
+                            "thread_start", "thread_end", "thread_dcstart", "thread_dcend");
+        _wantEventTraceHeader = Want("EventTrace", "EventTrace/Header", "eventtrace_header");
         _wantSysconfig = Want("SystemConfig", "sysconfig");
         _includeTracelogging = req.IncludeTracelogging;
         _panicCallback = req.PanicProbe == "callback_panic";
@@ -282,6 +286,41 @@ internal sealed class ExtractRunner
             kernel.ProcessDCStart += (ProcessTraceData data) => Wrap(() => AddProcess(data, "DCStart"));
             kernel.ProcessDCStop += (ProcessTraceData data) => Wrap(() => AddProcess(data, "DCEnd"));
             kernel.ProcessDefunct += (ProcessTraceData data) => Wrap(() => AddProcess(data, "Defunct"));
+        }
+        if (_wantThread)
+        {
+            kernel.ThreadStart += (ThreadTraceData data) => Wrap(() => AddThread(data, "Start"));
+            kernel.ThreadStop += (ThreadTraceData data) => Wrap(() => AddThread(data, "End"));
+            kernel.ThreadDCStart += (ThreadTraceData data) => Wrap(() => AddThread(data, "DCStart"));
+            kernel.ThreadDCStop += (ThreadTraceData data) => Wrap(() => AddThread(data, "DCEnd"));
+        }
+        if (_wantEventTraceHeader)
+        {
+            kernel.EventTraceHeader += (EventTraceHeaderTraceData data) => Wrap(() =>
+            {
+                Collector.EventTraceHeader.Add(new EventTraceHeaderRow
+                {
+                    EventSequence = Collector.NextSeq(),
+                    TimeStampQpc = data.TimeStampQPC,
+                    Cpu = data.ProcessorNumber,
+                    PerfFreq = data.PerfFreq,
+                    NumberOfProcessors = data.NumberOfProcessors,
+                    TimerResolution = data.TimerResolution,
+                    StartTime100Ns = data.StartTime.ToFileTimeUtc(),
+                    EndTime100Ns = data.EndTime != DateTime.MinValue ? data.EndTime.ToFileTimeUtc() : 0,
+                    BootTime100Ns = data.BootTime != DateTime.MinValue ? data.BootTime.ToFileTimeUtc() : 0,
+                    CpuSpeedMHz = data.CPUSpeed,
+                    PointerSize = source.PointerSize,
+                    LogFileMode = data.LogFileMode,
+                    BuffersWritten = data.BuffersWritten,
+                    EventsLost = data.EventsLost,
+                    SessionName = data.SessionName,
+                    LogFileName = data.LogFileName,
+                });
+                // Promote header values into the QPC origin & PerfFreq fields when
+                // they weren't picked up via reflection from the source header.
+                if (PerfFreq <= 0 && data.PerfFreq > 0) PerfFreq = data.PerfFreq;
+            });
         }
         if (_wantImage)
         {
@@ -862,6 +901,29 @@ internal sealed class ExtractRunner
             ParentPid = data.ParentID,
             ImageFileName = data.ImageFileName,
             CommandLine = data.CommandLine,
+        });
+    }
+
+    private void AddThread(ThreadTraceData data, string kind)
+    {
+        Collector.Thread.Add(new ThreadRow
+        {
+            EventSequence = Collector.NextSeq(),
+            TimeStampQpc = data.TimeStampQPC,
+            Cpu = data.ProcessorNumber,
+            Kind = kind,
+            Pid = data.ProcessID,
+            Tid = data.ThreadID,
+            ParentPid = data.ParentProcessID,
+            ParentTid = data.ParentThreadID,
+            StartAddr = data.StartAddr,
+            Win32StartAddr = data.Win32StartAddr,
+            StackBase = data.StackBase,
+            StackLimit = data.StackLimit,
+            UserStackBase = data.UserStackBase,
+            UserStackLimit = data.UserStackLimit,
+            BasePriority = data.BasePriority,
+            ThreadName = data.ThreadName,
         });
     }
 

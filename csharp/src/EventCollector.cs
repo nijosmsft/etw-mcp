@@ -112,6 +112,8 @@ internal sealed class EventCollector
     public readonly List<ImageRow> Image = new();
     public readonly List<DiskIoRow> DiskIo = new();
     public readonly List<DpcIsrRow> DpcIsr = new();
+    public readonly List<ThreadRow> Thread = new();
+    public readonly List<EventTraceHeaderRow> EventTraceHeader = new();
 
     // Generic self-describing TraceLogging passthrough.
     public readonly List<TraceloggingRow> Tracelogging = new();

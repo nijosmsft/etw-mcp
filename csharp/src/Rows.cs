@@ -229,6 +229,51 @@ internal sealed class DpcIsrRow
     public long ElapsedMicros;
 }
 
+/// <summary>Thread create/exit row (Start/End/DCStart/DCEnd).</summary>
+internal sealed class ThreadRow
+{
+    public ulong EventSequence;
+    public long TimeStampQpc;
+    public int Cpu;
+    public string Kind = ""; // "Start" | "End" | "DCStart" | "DCEnd"
+    public long Pid;
+    public long Tid;
+    public long? ParentPid;
+    public long? ParentTid;
+    public ulong StartAddr;
+    public ulong Win32StartAddr;
+    public ulong StackBase;
+    public ulong StackLimit;
+    public ulong UserStackBase;
+    public ulong UserStackLimit;
+    public int? BasePriority;
+    public string? ThreadName;
+}
+
+/// <summary>
+/// EventTrace/Header row — single-row table per ETL with authoritative trace
+/// metadata. Source: <c>kernel.EventTraceHeader</c>.
+/// </summary>
+internal sealed class EventTraceHeaderRow
+{
+    public ulong EventSequence;
+    public long TimeStampQpc;
+    public int Cpu;
+    public long PerfFreq;
+    public int NumberOfProcessors;
+    public int TimerResolution;
+    public long StartTime100Ns;        // FILETIME-style 100ns since 1601
+    public long EndTime100Ns;
+    public long BootTime100Ns;
+    public int CpuSpeedMHz;
+    public int PointerSize;            // 4 or 8
+    public int LogFileMode;
+    public int BuffersWritten;
+    public int EventsLost;
+    public string? SessionName;
+    public string? LogFileName;
+}
+
 internal sealed class TraceloggingRow
 {
     public long TimeStampQpc;

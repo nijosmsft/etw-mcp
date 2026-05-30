@@ -268,6 +268,29 @@ try
             datasets.Add(new("perfinfo_timer_dpc",    "parquet", "perfinfo_timer_dpc.parquet",    1, nTimDpc, false));
             datasets.Add(new("perfinfo_isr",          "parquet", "perfinfo_isr.parquet",          1, nIsr,    false));
         }
+        // Phase B: Thread/* per-opcode parquets.
+        if (runner.Collector.Thread.Count > 0)
+        {
+            int tStart = 0, tEnd = 0, tDcStart = 0, tDcEnd = 0;
+            foreach (var r in runner.Collector.Thread)
+            {
+                switch (r.Kind)
+                {
+                    case "Start":   tStart++;   break;
+                    case "End":     tEnd++;     break;
+                    case "DCStart": tDcStart++; break;
+                    case "DCEnd":   tDcEnd++;   break;
+                }
+            }
+            datasets.Add(new("thread_start",   "parquet", "thread_start.parquet",   1, tStart,   false));
+            datasets.Add(new("thread_end",     "parquet", "thread_end.parquet",     1, tEnd,     false));
+            datasets.Add(new("thread_dcstart", "parquet", "thread_dcstart.parquet", 1, tDcStart, false));
+            datasets.Add(new("thread_dcend",   "parquet", "thread_dcend.parquet",   1, tDcEnd,   false));
+        }
+        // Phase B: EventTrace/Header.
+        if (runner.Collector.EventTraceHeader.Count > 0)
+            datasets.Add(new("eventtrace_header", "parquet", "eventtrace_header.parquet", 1,
+                runner.Collector.EventTraceHeader.Count, true));
         if (req.IncludeTracelogging && runner.Collector.Tracelogging.Count > 0)
             datasets.Add(new("tracelogging_events", "parquet", "tracelogging_events.parquet", 1, runner.Collector.Tracelogging.Count, true));
     }
@@ -313,7 +336,9 @@ long totalEvents = runner.Collector.EventsDecoded
     + runner.Collector.Process.Count
     + runner.Collector.Image.Count
     + runner.Collector.DiskIo.Count
-    + runner.Collector.DpcIsr.Count;
+    + runner.Collector.DpcIsr.Count
+    + runner.Collector.Thread.Count
+    + runner.Collector.EventTraceHeader.Count;
 double eps = wall > 0 ? totalEvents / wall : 0.0;
 double stackRate = runner.Collector.StackEligibleEvents > 0
     ? (double)runner.Collector.StacksPaired / runner.Collector.StackEligibleEvents
@@ -373,6 +398,8 @@ emit.Emit(new
         ["Image"]        = runner.Collector.Image.Count,
         ["DiskIo"]       = runner.Collector.DiskIo.Count,
         ["PerfInfo"]     = runner.Collector.DpcIsr.Count,
+        ["Thread"]       = runner.Collector.Thread.Count,
+        ["EventTrace/Header"] = runner.Collector.EventTraceHeader.Count,
         ["SystemConfig"] = runner.Sysconfig.Nics.Count + runner.Sysconfig.Disks.Count + 1,
         ["TraceLogging"] = runner.Collector.Tracelogging.Count,
     },
