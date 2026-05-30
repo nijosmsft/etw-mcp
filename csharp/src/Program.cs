@@ -223,7 +223,27 @@ try
             new DatasetEntry("quic_ack_recv",    "parquet", "quic_ack_recv.parquet",    1, runner.Collector.QuicAckReceived.Count, false),
         });
         if (runner.Collector.Process.Count > 0)
+        {
             datasets.Add(new("process", "parquet", "process.parquet", 1, runner.Collector.Process.Count, true));
+            // Phase B per-opcode Process parquets.
+            int nStart = 0, nEnd = 0, nDcStart = 0, nDcEnd = 0, nDefunct = 0;
+            foreach (var r in runner.Collector.Process)
+            {
+                switch (r.Kind)
+                {
+                    case "Start":   nStart++;   break;
+                    case "End":     nEnd++;     break;
+                    case "DCStart": nDcStart++; break;
+                    case "DCEnd":   nDcEnd++;   break;
+                    case "Defunct": nDefunct++; break;
+                }
+            }
+            datasets.Add(new("process_start",   "parquet", "process_start.parquet",   1, nStart,   false));
+            datasets.Add(new("process_end",     "parquet", "process_end.parquet",     1, nEnd,     false));
+            datasets.Add(new("process_dcstart", "parquet", "process_dcstart.parquet", 1, nDcStart, false));
+            datasets.Add(new("process_dcend",   "parquet", "process_dcend.parquet",   1, nDcEnd,   false));
+            datasets.Add(new("process_defunct", "parquet", "process_defunct.parquet", 1, nDefunct, false));
+        }
         if (runner.Collector.Image.Count > 0)
             datasets.Add(new("image", "parquet", "image.parquet", 1, runner.Collector.Image.Count, true));
         if (runner.Collector.DiskIo.Count > 0)

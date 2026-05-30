@@ -84,7 +84,9 @@ internal sealed class ExtractRunner
         _wantQuicPktRecv = Want("Quic/PacketRecv", "quic_packet_recv");
         _wantQuicPktSend = Want("Quic/PacketSend", "quic_packet_send");
         _wantQuicAck = Want("Quic/AckReceived", "quic_ack_recv");
-        _wantProcess = Want("Process", "process");
+        _wantProcess = Want("Process", "process", "Process/Start", "Process/End", "Process/DCStart",
+                            "Process/DCEnd", "Process/Defunct",
+                            "process_start", "process_end", "process_dcstart", "process_dcend", "process_defunct");
         _wantImage = Want("Image/Load", "Image/DCStart", "image", "images");
         _wantDiskIo = Want("DiskIo", "diskio");
         _wantDpcIsr = Want("PerfInfo", "PerfInfo/DPC", "PerfInfo/ThreadedDPC", "PerfInfo/TimerDPC", "PerfInfo/ISR",
@@ -279,6 +281,7 @@ internal sealed class ExtractRunner
             kernel.ProcessStop += (ProcessTraceData data) => Wrap(() => AddProcess(data, "End"));
             kernel.ProcessDCStart += (ProcessTraceData data) => Wrap(() => AddProcess(data, "DCStart"));
             kernel.ProcessDCStop += (ProcessTraceData data) => Wrap(() => AddProcess(data, "DCEnd"));
+            kernel.ProcessDefunct += (ProcessTraceData data) => Wrap(() => AddProcess(data, "Defunct"));
         }
         if (_wantImage)
         {

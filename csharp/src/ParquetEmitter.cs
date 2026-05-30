@@ -55,7 +55,16 @@ internal static class ParquetEmitter
         total += await WriteQuicAsync(ec.QuicPacketSend,   Path.Combine(stagingDir, "quic_packet_send.parquet"));
         total += await WriteQuicAsync(ec.QuicAckReceived,  Path.Combine(stagingDir, "quic_ack_recv.parquet"));
         // Kernel meta — only emit if collected (request opt-in).
-        if (ec.Process.Count > 0)  total += await WriteProcessAsync(ec.Process, Path.Combine(stagingDir, "process.parquet"));
+        if (ec.Process.Count > 0)
+        {
+            total += await WriteProcessAsync(ec.Process, Path.Combine(stagingDir, "process.parquet"));
+            // Phase B per-opcode Process parquets.
+            total += await WriteProcessByKindAsync(ec.Process, "Start",   Path.Combine(stagingDir, "process_start.parquet"));
+            total += await WriteProcessByKindAsync(ec.Process, "End",     Path.Combine(stagingDir, "process_end.parquet"));
+            total += await WriteProcessByKindAsync(ec.Process, "DCStart", Path.Combine(stagingDir, "process_dcstart.parquet"));
+            total += await WriteProcessByKindAsync(ec.Process, "DCEnd",   Path.Combine(stagingDir, "process_dcend.parquet"));
+            total += await WriteProcessByKindAsync(ec.Process, "Defunct", Path.Combine(stagingDir, "process_defunct.parquet"));
+        }
         if (ec.Image.Count > 0)    total += await WriteImageAsync(ec.Image,     Path.Combine(stagingDir, "image.parquet"));
         if (ec.DiskIo.Count > 0)   total += await WriteDiskIoAsync(ec.DiskIo,   Path.Combine(stagingDir, "diskio.parquet"));
         if (ec.DpcIsr.Count > 0)   total += await WriteDpcIsrAsync(ec.DpcIsr,   Path.Combine(stagingDir, "dpc_isr.parquet"));
@@ -594,6 +603,40 @@ internal static class ParquetEmitter
             await rg.WriteColumnAsync(new DataColumn(fQpc, qpc));
             await rg.WriteColumnAsync(new DataColumn(fCpu, cpu));
             await rg.WriteColumnAsync(new DataColumn(fKind, kind));
+            await rg.WriteColumnAsync(new DataColumn(fPid, pid));
+            await rg.WriteColumnAsync(new DataColumn(fParent, par));
+            await rg.WriteColumnAsync(new DataColumn(fImg, img));
+            await rg.WriteColumnAsync(new DataColumn(fCmd, cmd));
+        });
+    }
+
+    /// <summary>
+    /// Per-opcode Process parquet writer — filters by <c>Kind</c>. Schema matches
+    /// <see cref="WriteProcessAsync"/> minus the <c>Kind</c> column.
+    /// </summary>
+    internal static async Task<long> WriteProcessByKindAsync(List<ProcessRow> rows, string kind, string path)
+    {
+        var fEventSeq = Df<ulong>("EventSequence", false);
+        var fQpc = Df<long>("TimeStampQpc", false);
+        var fCpu = Df<int>("CPU", false);
+        var fPid = Df<long>("PID", false);
+        var fParent = Df<long>("ParentPID", false);
+        var fImg = DfStr("ImageFileName");
+        var fCmd = DfStr("CommandLine");
+        var schema = new ParquetSchema(fEventSeq, fQpc, fCpu, fPid, fParent, fImg, fCmd);
+        var filtered = new List<ProcessRow>(rows.Count);
+        for (int i = 0; i < rows.Count; i++)
+            if (string.Equals(rows[i].Kind, kind, StringComparison.Ordinal)) filtered.Add(rows[i]);
+        return await WriteRowGroupAsync(path, schema, async rg =>
+        {
+            int n = filtered.Count;
+            var es = new ulong[n]; var qpc = new long[n]; var cpu = new int[n];
+            var pid = new long[n]; var par = new long[n];
+            var img = new string?[n]; var cmd = new string?[n];
+            for (int i = 0; i < n; i++) { var r = filtered[i]; es[i] = r.EventSequence; qpc[i] = r.TimeStampQpc; cpu[i] = r.Cpu; pid[i] = r.Pid; par[i] = r.ParentPid; img[i] = r.ImageFileName; cmd[i] = r.CommandLine; }
+            await rg.WriteColumnAsync(new DataColumn(fEventSeq, es));
+            await rg.WriteColumnAsync(new DataColumn(fQpc, qpc));
+            await rg.WriteColumnAsync(new DataColumn(fCpu, cpu));
             await rg.WriteColumnAsync(new DataColumn(fPid, pid));
             await rg.WriteColumnAsync(new DataColumn(fParent, par));
             await rg.WriteColumnAsync(new DataColumn(fImg, img));
