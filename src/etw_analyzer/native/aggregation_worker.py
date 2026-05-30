@@ -1,0 +1,442 @@
+"""Post-sidecar aggregator runner.
+
+The C# sidecar (``wpr-mcp-extract.exe``) writes ETW Layer-1 (raw decoded
+events) and Layer-2 (per-class parquets) into a staging directory. This
+module runs the Python-side aggregators (Layer 3 — ``cpu_sampling``,
+``dpc_isr``, ``stacks``, ``cpu_timeline``, ``sysconfig``, ``process_info``,
+``diskio``, ``tracestats``) against those inputs so the Python tool surface
+returns the same shape regardless of which producer extracted the trace.
+
+Architectural split (per ``rust-hybrid-migration-plan.md`` §4 and
+``spike-contract.md``):
+
+* ``worker.py``      — legacy in-process native extractor + aggregators.
+                       Still used for ``mode="native"`` (no sidecar).
+* ``aggregation_worker.py`` (this file) — runs aggregators *only*, against
+                       a pre-existing staging dir produced by the sidecar.
+                       Used for ``mode="csharp"``.
+
+The contract is intentionally narrow:
+
+* Input  — ``staging_dir`` with the sidecar's parquets + manifest.
+* Output — additional aggregate parquets written into the same dir, and
+           a refreshed manifest. The supervisor handles atomic promotion
+           to the final cache dir.
+
+Failure mode is best-effort: individual aggregator exceptions are logged
+but do not fail the whole run, mirroring the legacy native path. The
+manifest is rewritten only if every step succeeded; on failure the staging
+dir is left intact for debugging.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+import pandas as pd
+
+from etw_analyzer.native import cache as native_cache
+from etw_analyzer.trace_state import TraceData
+
+
+LOGGER = logging.getLogger(__name__)
+
+
+# Sidecar parquet stems (per csharp/src/Program.cs) → (TraceData attribute,
+# canonical event-class name from trace_mgmt._DUMPER_EVENT_CLASSES). Kept
+# locally so aggregation_worker doesn't import trace_mgmt at module top —
+# trace_mgmt imports the whole tool surface and is heavyweight.
+_SIDECAR_STEM_TO_ATTR: dict[str, tuple[str, str]] = {
+    "sampled_profile":   ("dumper_df",           "SampledProfile"),
+    "cswitch_events":    ("cswitch_events_df",   "CSwitch"),
+    "tcpip_recv":        ("tcpip_recv_df",       "TcpIp/Recv"),
+    "tcpip_send":        ("tcpip_send_df",       "TcpIp/Send"),
+    "tcpip_retransmit":  ("tcpip_retransmit_df", "TcpIp/Retransmit"),
+    "tcpip_connect":     ("tcpip_connect_df",    "TcpIp/Connect"),
+    "tcpip_accept":      ("tcpip_accept_df",     "TcpIp/Accept"),
+    "udp_recv":          ("udp_recv_df",         "UdpIp/Recv"),
+    "udp_send":          ("udp_send_df",         "UdpIp/Send"),
+    "afd_recv":          ("afd_recv_df",         "AFD/Recv"),
+    "afd_send":          ("afd_send_df",         "AFD/Send"),
+    "afd_connect":       ("afd_connect_df",      "AFD/Connect"),
+    "afd_accept":        ("afd_accept_df",       "AFD/Accept"),
+    "afd_close":         ("afd_close_df",        "AFD/Close"),
+    "ndis_drops":        ("ndis_drops_df",       "NdisDrop"),
+    "packet_capture":    ("packet_capture_df",   "NdisPacketCapture"),
+    "http_recv":         ("http_recv_df",        "HttpService/Recv"),
+    "http_deliver":      ("http_deliver_df",     "HttpService/Deliver"),
+    "http_send":         ("http_send_df",        "HttpService/Send"),
+    "http_close":        ("http_close_df",       "HttpService/Close"),
+    "quic_conn_created": ("quic_conn_created_df", "Quic/ConnectionCreated"),
+    "quic_conn_closed":  ("quic_conn_closed_df",  "Quic/ConnectionClosed"),
+    "quic_packet_recv":  ("quic_packet_recv_df",  "Quic/PacketRecv"),
+    "quic_packet_send":  ("quic_packet_send_df",  "Quic/PacketSend"),
+    "quic_ack_recv":     ("quic_ack_recv_df",     "Quic/AckReceived"),
+}
+
+
+# Auxiliary parquets the sidecar emits that are not in _DUMPER_EVENT_CLASSES
+# but are still useful to downstream aggregators. They land in ``raw_csv``
+# under the canonical event-class name so the existing aggregators find them.
+_SIDECAR_AUX_STEMS: dict[str, str] = {
+    "process":  "Process/DCStart",
+    "image":    "Image/DCStart",
+    "diskio":   "DiskIo/Read",
+    "dpc_isr":  "PerfInfo/DPC",
+}
+
+
+@dataclass
+class AggregationResult:
+    """Outcome of running aggregators against a sidecar staging dir."""
+
+    ok: bool
+    message: str
+    staging_dir: Path
+    datasets_written: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+    manifest_path: Path | None = None
+
+
+def run_aggregation_worker(
+    staging_dir: Path,
+    etl_path: Path,
+    trace_id: str,
+    *,
+    producer: str = "csharp",
+) -> AggregationResult:
+    """Run the Python aggregators against a sidecar staging directory.
+
+    Parameters
+    ----------
+    staging_dir:
+        Directory the sidecar wrote its layer-1/2 parquets and manifest into.
+        Aggregator output is written alongside those files.
+    etl_path:
+        Original ETL path — needed for manifest re-write (ETL identity
+        round-trip is part of the cache match check).
+    trace_id:
+        Echoed back for symmetry with the rest of the worker protocol.
+    producer:
+        Producer name to stamp on the rewritten manifest. Defaults to
+        ``"csharp"`` because that's the only sidecar that exists today,
+        but kept parameterized for future Rust / other producers.
+
+    Returns
+    -------
+    :class:`AggregationResult` describing what was written. Best-effort:
+    individual aggregator failures are recorded under ``warnings`` and do
+    not flip ``ok`` to False; only manifest-rewrite failures or an absent
+    sidecar manifest are fatal.
+    """
+
+    staging_dir = staging_dir.resolve()
+    if not staging_dir.exists():
+        return AggregationResult(
+            ok=False,
+            message=f"staging dir does not exist: {staging_dir}",
+            staging_dir=staging_dir,
+        )
+
+    try:
+        sidecar_manifest = native_cache.read_manifest(staging_dir)
+    except native_cache.NativeCacheError as exc:
+        return AggregationResult(
+            ok=False,
+            message=f"sidecar manifest unreadable: {exc}",
+            staging_dir=staging_dir,
+        )
+    if sidecar_manifest is None:
+        return AggregationResult(
+            ok=False,
+            message=(
+                "sidecar wrote no cache manifest at "
+                f"{staging_dir / native_cache.MANIFEST_FILENAME}"
+            ),
+            staging_dir=staging_dir,
+        )
+
+    result = AggregationResult(
+        ok=True,
+        message="aggregation completed",
+        staging_dir=staging_dir,
+    )
+
+    trace = _build_trace_from_staging(
+        staging_dir=staging_dir,
+        etl_path=etl_path,
+        trace_id=trace_id,
+        sidecar_manifest=sidecar_manifest,
+        warnings=result.warnings,
+    )
+
+    # Run aggregators. Import lazily so this module stays importable from
+    # the supervisor even when the legacy worker is not loaded.
+    try:
+        import etw_analyzer.tools.trace_mgmt as trace_mgmt
+    except Exception as exc:
+        return AggregationResult(
+            ok=False,
+            message=f"failed to import trace_mgmt: {exc}",
+            staging_dir=staging_dir,
+        )
+
+    try:
+        trace_mgmt._run_native_aggregators(trace)
+    except Exception as exc:
+        # _run_native_aggregators is already best-effort internally; if it
+        # raises here the failure is structural (e.g. import error) and we
+        # surface it but keep going so the manifest still gets rewritten
+        # with whatever we DID produce.
+        result.warnings.append(f"native aggregators raised: {exc}")
+        LOGGER.warning("aggregation_worker: %s", exc, exc_info=True)
+
+    # cpu_sampling synthesis is its own step (the legacy worker.py calls it
+    # only when the aggregator failed to produce a cpu_sampling DataFrame).
+    if "cpu_sampling" not in trace.raw_csv:
+        try:
+            trace_mgmt._synthesize_native_cpu_sampling(trace)
+        except Exception as exc:
+            result.warnings.append(f"cpu_sampling synthesis failed: {exc}")
+
+    try:
+        trace_mgmt._populate_metadata(trace)
+    except Exception as exc:
+        result.warnings.append(f"metadata population failed: {exc}")
+
+    # Persist any aggregator outputs back to disk as parquets so the cache
+    # rehydration path picks them up. We skip dumper stems and the
+    # auxiliary keys (canonical event-class names with slashes) — those
+    # are already on disk from the sidecar.
+    written = _persist_aggregator_outputs(staging_dir, trace, result.warnings)
+    result.datasets_written = written
+
+    # Rewrite the manifest in place. We start from the sidecar's manifest
+    # so the existing dumper datasets are preserved, and add the
+    # aggregator outputs as additional CacheDataset entries.
+    try:
+        new_manifest = _rewrite_manifest(
+            staging_dir=staging_dir,
+            etl_path=etl_path,
+            sidecar_manifest=sidecar_manifest,
+            trace=trace,
+            aggregator_stems=written,
+            producer=producer,
+        )
+        result.manifest_path = staging_dir / native_cache.MANIFEST_FILENAME
+    except Exception as exc:
+        result.ok = False
+        result.message = f"manifest rewrite failed: {exc}"
+        LOGGER.error("aggregation_worker: manifest rewrite failed: %s", exc)
+        return result
+
+    if trace.symbolizer is not None:
+        try:
+            trace.symbolizer.close()
+        except Exception:
+            pass
+
+    result.message = (
+        f"aggregation completed: {len(written)} aggregator parquets written, "
+        f"{len(new_manifest.datasets)} datasets in manifest"
+    )
+    return result
+
+
+def _build_trace_from_staging(
+    *,
+    staging_dir: Path,
+    etl_path: Path,
+    trace_id: str,
+    sidecar_manifest: native_cache.CacheManifest,
+    warnings: list[str],
+) -> TraceData:
+    """Hydrate a ``TraceData`` from the sidecar's parquet outputs."""
+
+    trace = TraceData(
+        trace_id=trace_id,
+        etl_path=etl_path,
+        export_dir=staging_dir,
+        symbol_path=None,
+        mode="native",
+        raw_csv={},
+    )
+
+    # Index sidecar datasets by stem (filename without extension).
+    sidecar_datasets = {
+        Path(dataset.path).stem: dataset
+        for dataset in sidecar_manifest.datasets
+        if dataset.kind in {"parquet"}
+    }
+
+    for stem, (attr, canonical) in _SIDECAR_STEM_TO_ATTR.items():
+        parquet = staging_dir / f"{stem}.parquet"
+        if not parquet.exists():
+            continue
+        try:
+            df = pd.read_parquet(parquet)
+        except Exception as exc:
+            warnings.append(f"failed to read {stem}.parquet: {exc}")
+            continue
+        setattr(trace, attr, df)
+        # Also expose under the canonical event-class name so aggregators
+        # that look in raw_csv find the rows.
+        trace.raw_csv[canonical] = df
+
+    for stem, canonical in _SIDECAR_AUX_STEMS.items():
+        parquet = staging_dir / f"{stem}.parquet"
+        if not parquet.exists():
+            continue
+        try:
+            df = pd.read_parquet(parquet)
+        except Exception as exc:
+            warnings.append(f"failed to read {stem}.parquet: {exc}")
+            continue
+        trace.raw_csv[canonical] = df
+
+    # sysconfig.txt — preserve as raw text so the text aggregator finds it.
+    sysconfig_path = staging_dir / "sysconfig.txt"
+    if sysconfig_path.exists():
+        try:
+            trace.raw_csv["sysconfig"] = pd.DataFrame(
+                {"text": [sysconfig_path.read_text(encoding="utf-8", errors="replace")]}
+            )
+        except Exception as exc:
+            warnings.append(f"failed to read sysconfig.txt: {exc}")
+
+    return trace
+
+
+# Datasets we never want to overwrite back to disk — they came in from the
+# sidecar already, and re-writing them with possibly-trimmed in-memory
+# versions would corrupt the cache.
+_NEVER_PERSIST = frozenset(_SIDECAR_STEM_TO_ATTR.values())
+
+
+def _persist_aggregator_outputs(
+    staging_dir: Path,
+    trace: TraceData,
+    warnings: list[str],
+) -> list[str]:
+    """Write aggregator-produced parquets next to the sidecar's outputs."""
+
+    skip_keys = {canonical for _, canonical in _SIDECAR_STEM_TO_ATTR.values()}
+    skip_keys.update(_SIDECAR_AUX_STEMS.values())
+    skip_keys.add("sysconfig")  # Already a text dataset.
+
+    written: list[str] = []
+    for name, df in list(trace.raw_csv.items()):
+        if name in skip_keys:
+            continue
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            continue
+        # Skip pseudo-private entries the aggregators stash for internal use.
+        if name.startswith("_"):
+            continue
+        path = staging_dir / f"{name}.parquet"
+        try:
+            df.to_parquet(path, index=False)
+            written.append(name)
+        except Exception as exc:
+            warnings.append(f"failed to persist {name}.parquet: {exc}")
+    return written
+
+
+def _rewrite_manifest(
+    *,
+    staging_dir: Path,
+    etl_path: Path,
+    sidecar_manifest: native_cache.CacheManifest,
+    trace: TraceData,
+    aggregator_stems: list[str],
+    producer: str,
+) -> native_cache.CacheManifest:
+    """Build and write the post-aggregation manifest."""
+
+    datasets: list[native_cache.CacheDataset] = []
+    # Preserve every dataset from the sidecar manifest first — kind +
+    # row_count + materialize_on_load come from there.
+    existing_names = set()
+    for dataset in sidecar_manifest.datasets:
+        datasets.append(dataset)
+        existing_names.add(dataset.name)
+
+    for stem in aggregator_stems:
+        if stem in existing_names:
+            continue
+        parquet = staging_dir / f"{stem}.parquet"
+        if not parquet.exists():
+            continue
+        df = trace.raw_csv.get(stem)
+        row_count = int(len(df)) if isinstance(df, pd.DataFrame) else None
+        datasets.append(native_cache.CacheDataset(
+            name=stem,
+            kind="parquet",
+            path=f"{stem}.parquet",
+            row_count=row_count,
+            materialize_on_load=True,
+        ))
+
+    manifest = native_cache.CacheManifest(
+        schema_version=native_cache.SCHEMA_VERSION,
+        mode="native",
+        strategy=sidecar_manifest.strategy,
+        complete=True,
+        etl=native_cache.EtlIdentity.from_path(etl_path),
+        datasets=datasets,
+        native_store=sidecar_manifest.native_store,
+        producer=producer,
+    )
+    native_cache.write_manifest(staging_dir, manifest)
+    return manifest
+
+
+def main(argv: list[str] | None = None) -> int:
+    """CLI entry point — for ad-hoc debugging only.
+
+    Production callers should import :func:`run_aggregation_worker` directly
+    from :mod:`etw_analyzer.native.worker_supervisor`. The CLI is useful
+    when iterating on aggregator changes against an existing staging dir:
+
+    .. code-block:: bash
+
+        python -m etw_analyzer.native.aggregation_worker \\
+            --staging-dir <path> --etl <path> --trace-id <id>
+    """
+
+    import argparse
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--staging-dir", required=True, type=Path)
+    parser.add_argument("--etl", required=True, type=Path)
+    parser.add_argument("--trace-id", required=True)
+    parser.add_argument("--producer", default="csharp")
+    args = parser.parse_args(argv)
+
+    result = run_aggregation_worker(
+        args.staging_dir,
+        args.etl,
+        args.trace_id,
+        producer=args.producer,
+    )
+    print(json.dumps({
+        "ok": result.ok,
+        "message": result.message,
+        "datasets_written": result.datasets_written,
+        "warnings": result.warnings,
+    }, indent=2))
+    return 0 if result.ok else 1
+
+
+__all__ = [
+    "AggregationResult",
+    "run_aggregation_worker",
+]
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
