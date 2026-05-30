@@ -427,6 +427,38 @@ def _load_phase_b_diskio(
             trace.raw_csv[canonical] = df
 
 
+def _load_phase_b_images(
+    staging_dir: Path,
+    trace: TraceData,
+    warnings: list[str],
+) -> None:
+    """Promote Phase B image_* parquets into raw_csv and build a symbolizer.
+
+    Reads image_load.parquet and image_dcstart.parquet, lands them in
+    raw_csv under Image/Load and Image/DCStart, then calls
+    ``build_symbolizer_from_csharp_images`` so the stacks aggregators
+    can resolve addresses. Missing parquets are silent no-ops; a
+    failed symbolizer build (no native bindings, no rows) is also
+    silent — the existing csharp test path already gracefully falls
+    through when no symbolizer is available.
+    """
+
+    from etw_analyzer.native import aggregation_worker_adapters as adapters
+
+    for stem, canonical in adapters.PHASE_B_IMAGE_STEMS.items():
+        df = _read_phase_b_parquet(staging_dir, stem, warnings)
+        if df is None or df.empty:
+            continue
+        df = adapters.adapt_csharp_image_dataframe(df)
+        if df is not None and not df.empty:
+            trace.raw_csv[canonical] = df
+
+    try:
+        adapters.build_symbolizer_from_csharp_images(trace)
+    except Exception as exc:
+        warnings.append(f"csharp symbolizer build failed: {exc}")
+
+
 def _build_trace_from_staging(
     *,
     staging_dir: Path,
@@ -488,6 +520,7 @@ def _build_trace_from_staging(
     _load_phase_b_dpc_isr(staging_dir, trace, warnings)
     _load_phase_b_process(staging_dir, trace, warnings)
     _load_phase_b_diskio(staging_dir, trace, warnings)
+    _load_phase_b_images(staging_dir, trace, warnings)
 
     # sysconfig.txt — preserve as raw text so the text aggregator finds it.
     sysconfig_path = staging_dir / "sysconfig.txt"

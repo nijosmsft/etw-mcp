@@ -294,6 +294,9 @@ __all__ = [
     "PHASE_B_PROCESS_STEMS",
     "adapt_csharp_diskio_dataframe",
     "PHASE_B_DISKIO_STEMS",
+    "adapt_csharp_image_dataframe",
+    "PHASE_B_IMAGE_STEMS",
+    "build_symbolizer_from_csharp_images",
 ]
 
 
@@ -448,3 +451,99 @@ def adapt_csharp_diskio_dataframe(df: pd.DataFrame | None) -> pd.DataFrame | Non
     if "TimeStampQpc" in df.columns and "TimeStamp" not in df.columns:
         df = df.rename(columns={"TimeStampQpc": "TimeStamp"})
     return df
+
+
+# Phase B per-opcode stems that feed the symbolizer.
+PHASE_B_IMAGE_STEMS: dict[str, str] = {
+    "image_load":    "Image/Load",
+    "image_dcstart": "Image/DCStart",
+}
+
+
+def adapt_csharp_image_dataframe(df: pd.DataFrame | None) -> pd.DataFrame | None:
+    """Adapt a Phase B image_* parquet to the symbolizer-input schema.
+
+    Phase B columns: ``EventSequence, TimeStampQpc, CPU, PID, ImageBase,
+    ImageSize, TimeDateStamp, FileName``.
+
+    The native symbolizer (``_build_symbolizer_from_images``) reads
+    ``ImageBase``, ``ImageSize``, and ``FileName`` straight from each
+    row — all three Phase B names already match. Only the TimeStampQpc
+    rename is done so the row also satisfies the canonical
+    ``TimeStamp`` contract used elsewhere in the trace.
+    """
+
+    if df is None or df.empty:
+        return df
+    if "TimeStampQpc" in df.columns and "TimeStamp" not in df.columns:
+        df = df.rename(columns={"TimeStampQpc": "TimeStamp"})
+    return df
+
+
+def build_symbolizer_from_csharp_images(trace) -> bool:
+    """Build a dbghelp-backed Symbolizer from Phase B image parquets.
+
+    Reads ``trace.raw_csv['Image/Load']`` and ``trace.raw_csv['Image/DCStart']``
+    (whichever are present), deduplicates by ImageBase, and registers
+    every module with the symbolizer so subsequent
+    ``aggregate_stack_butterfly`` calls can resolve addresses.
+
+    Returns True when a symbolizer was installed (already-present
+    counts as success), False when:
+      * the native Symbolizer module isn't importable (no Windows
+        dbghelp, or a unit-test environment), OR
+      * neither Image/Load nor Image/DCStart has any rows.
+
+    This is the csharp equivalent of trace_mgmt._build_symbolizer_from_images
+    (which the native path calls during the in-process consumer's
+    Image/Load fan-out). Kept here rather than reusing the trace_mgmt
+    helper directly because the csharp path doesn't go through
+    _start_background_dumper and we want a clear chain of csharp-
+    specific helpers in this module.
+    """
+
+    if getattr(trace, "symbolizer", None) is not None:
+        return True
+
+    try:
+        from etw_analyzer.native import Symbolizer
+    except (ImportError, OSError):
+        return False
+
+    rows: list[dict] = []
+    for canonical in ("Image/Load", "Image/DCStart"):
+        df = trace.raw_csv.get(canonical)
+        if df is None or df.empty:
+            continue
+        for row in df.to_dict(orient="records"):
+            rows.append(row)
+
+    if not rows:
+        return False
+
+    try:
+        symbolizer = Symbolizer(symbol_path=getattr(trace, "symbol_path", None))
+    except Exception:
+        return False
+
+    seen_bases: set[int] = set()
+    for row in rows:
+        try:
+            base = int(row.get("ImageBase", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if not base or base in seen_bases:
+            continue
+        seen_bases.add(base)
+        try:
+            size = int(row.get("ImageSize", 0) or 0)
+        except (TypeError, ValueError):
+            size = 0
+        file_name = str(row.get("FileName", "") or "")
+        try:
+            symbolizer.add_module(base, size, file_name)
+        except Exception:
+            continue
+
+    trace.symbolizer = symbolizer
+    return True

@@ -708,3 +708,249 @@ class TestPhaseBDiskio:
         finally:
             aw._persist_aggregator_outputs = real_persist
         assert "DiskIo/Read" in captured["keys"]
+
+
+# ---- Adapter unit tests: image -----------------------------------------
+
+
+class TestAdaptCsharpImageDataframe:
+    def test_renames_timestampqpc_to_timestamp(self):
+        df = _make_image_dcstart(rows=2)
+        out = adapters.adapt_csharp_image_dataframe(df)
+        assert "TimeStamp" in out.columns
+        assert "TimeStampQpc" not in out.columns
+
+    def test_preserves_imagebase_imagesize_filename(self):
+        df = _make_image_dcstart(rows=2)
+        out = adapters.adapt_csharp_image_dataframe(df)
+        assert out["ImageBase"].iloc[0] == 0xFFFFF800_AABB0000
+        assert int(out["ImageSize"].iloc[0]) == 0x80_000
+        assert "mod_0.sys" in out["FileName"].iloc[0]
+
+    def test_handles_none_and_empty(self):
+        assert adapters.adapt_csharp_image_dataframe(None) is None
+        empty = pd.DataFrame()
+        assert adapters.adapt_csharp_image_dataframe(empty) is empty
+
+
+# ---- Adapter: symbolizer construction ----------------------------------
+
+
+class _FakeSymbolizer:
+    """In-memory symbolizer used to assert add_module is invoked.
+
+    Replaces the real dbghelp-backed Symbolizer for unit tests so we
+    can verify the adapter registers every distinct image base without
+    needing native Windows bindings.
+    """
+
+    def __init__(self, symbol_path=None):
+        self.symbol_path = symbol_path
+        self.modules: list[tuple[int, int, str]] = []
+
+    def add_module(self, base: int, size: int, file_name: str) -> None:
+        self.modules.append((int(base), int(size), str(file_name)))
+
+    def bulk_resolve(self, addrs):
+        out = {}
+        for addr in addrs:
+            module = "unknown"
+            for base, size, name in self.modules:
+                if base <= int(addr) < base + size:
+                    module = Path(name).name.lower()
+                    break
+            out[int(addr)] = f"{module}!func_{int(addr) & 0xFFF:03x}"
+        return out
+
+    def resolve(self, addr: int) -> str:
+        return self.bulk_resolve([addr])[int(addr)]
+
+    def close(self) -> None:
+        pass
+
+
+class TestBuildSymbolizerFromCsharpImages:
+    def test_registers_modules_from_image_dcstart(self, tmp_path: Path, monkeypatch):
+        from etw_analyzer.trace_state import TraceData
+        from etw_analyzer.native import aggregation_worker_adapters as ad
+
+        # Stub the native Symbolizer import.
+        import etw_analyzer.native as native_pkg
+        monkeypatch.setattr(native_pkg, "Symbolizer", _FakeSymbolizer, raising=False)
+
+        trace = TraceData(
+            trace_id="t", etl_path=tmp_path / "x.etl",
+            export_dir=tmp_path, raw_csv={},
+        )
+        trace.raw_csv["Image/DCStart"] = _make_image_dcstart(rows=3)
+        ok = ad.build_symbolizer_from_csharp_images(trace)
+        assert ok is True
+        assert trace.symbolizer is not None
+        assert len(trace.symbolizer.modules) == 3
+        # First module: base, size, name (sys ending).
+        base, size, name = trace.symbolizer.modules[0]
+        assert base == 0xFFFFF800_AABB0000
+        assert size == 0x80_000
+        assert name.endswith("mod_0.sys")
+
+    def test_deduplicates_by_imagebase(self, tmp_path: Path, monkeypatch):
+        from etw_analyzer.trace_state import TraceData
+        from etw_analyzer.native import aggregation_worker_adapters as ad
+
+        import etw_analyzer.native as native_pkg
+        monkeypatch.setattr(native_pkg, "Symbolizer", _FakeSymbolizer, raising=False)
+
+        # Both DCStart and Load reference the same base → registered once.
+        same = _make_image_dcstart(rows=2)
+        trace = TraceData(
+            trace_id="t", etl_path=tmp_path / "x.etl",
+            export_dir=tmp_path, raw_csv={},
+        )
+        trace.raw_csv["Image/DCStart"] = same
+        trace.raw_csv["Image/Load"] = same.copy()
+        ad.build_symbolizer_from_csharp_images(trace)
+        assert len(trace.symbolizer.modules) == 2  # 2 unique, not 4
+
+    def test_returns_false_when_no_image_rows(self, tmp_path: Path, monkeypatch):
+        from etw_analyzer.trace_state import TraceData
+        from etw_analyzer.native import aggregation_worker_adapters as ad
+
+        import etw_analyzer.native as native_pkg
+        monkeypatch.setattr(native_pkg, "Symbolizer", _FakeSymbolizer, raising=False)
+
+        trace = TraceData(
+            trace_id="t", etl_path=tmp_path / "x.etl",
+            export_dir=tmp_path, raw_csv={},
+        )
+        ok = ad.build_symbolizer_from_csharp_images(trace)
+        assert ok is False
+        assert trace.symbolizer is None
+
+    def test_known_address_resolves_to_known_module(self, tmp_path: Path, monkeypatch):
+        """Symbolizer-test for stacks: bulk_resolve maps an address inside
+        a registered module range to that module's name."""
+        from etw_analyzer.trace_state import TraceData
+        from etw_analyzer.native import aggregation_worker_adapters as ad
+
+        import etw_analyzer.native as native_pkg
+        monkeypatch.setattr(native_pkg, "Symbolizer", _FakeSymbolizer, raising=False)
+
+        trace = TraceData(
+            trace_id="t", etl_path=tmp_path / "x.etl",
+            export_dir=tmp_path, raw_csv={},
+        )
+        # One module at base 0xFFFFF800_AABB0000, size 0x80_000 covers
+        # addresses 0xFFFFF800_AABB0000 .. 0xFFFFF800_AAB30000.
+        trace.raw_csv["Image/DCStart"] = pd.DataFrame([{
+            "TimeStampQpc": 0, "CPU": 0, "PID": 4,
+            "ImageBase": 0xFFFFF800_AABB0000,
+            "ImageSize": 0x80_000,
+            "TimeDateStamp": 0,
+            "FileName": "\\SystemRoot\\drivers\\hotmod.sys",
+        }])
+        ad.build_symbolizer_from_csharp_images(trace)
+        # Address inside the module's range.
+        addr = 0xFFFFF800_AABB1234
+        labels = trace.symbolizer.bulk_resolve([addr])
+        assert "hotmod.sys" in labels[addr]
+
+
+# ---- Integration: stacks + stacks_callers ------------------------------
+
+
+class TestPhaseBStacks:
+    def test_stacks_produced_with_csharp_image_symbolizer(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        """Real path: image_dcstart present → symbolizer built → stacks produced."""
+        # Make the native import resolve to our fake.
+        import etw_analyzer.native as native_pkg
+        monkeypatch.setattr(native_pkg, "Symbolizer", _FakeSymbolizer, raising=False)
+
+        etl = _make_etl(tmp_path)
+        staging = tmp_path / "staging"
+        # SampledProfile stacks reference 0xFF00_0000+; image base in
+        # _make_image_dcstart is 0xFFFFF800_AABB0000 (different range).
+        # Add an image that DOES cover the stack addresses so the
+        # symbolizer resolves them to something other than "unknown".
+        _seed_phase_b_staging(
+            staging, etl,
+            sampled_rows=30, cpu_count=4,
+            include_image=True,
+        )
+        # Patch in an image covering the stack address range.
+        cover = pd.DataFrame([{
+            "EventSequence": 0,
+            "TimeStampQpc": 0,
+            "CPU": 0,
+            "PID": 4,
+            "ImageBase": 0xFF00_0000,
+            "ImageSize": 0x100_0000,
+            "TimeDateStamp": 0,
+            "FileName": "\\SystemRoot\\drivers\\stacks_mod.sys",
+        }])
+        cover.to_parquet(staging / "image_load.parquet", index=False)
+
+        # Also need to update the manifest to include image_load.
+        manifest = native_cache.read_manifest(staging)
+        datasets = list(manifest.datasets)
+        datasets.append(native_cache.CacheDataset(
+            name="image_load", kind="parquet", path="image_load.parquet",
+            row_count=1, materialize_on_load=True,
+        ))
+        new_manifest = native_cache.CacheManifest.materialized_small(
+            etl, datasets, producer="csharp",
+        )
+        native_cache.write_manifest(staging, new_manifest)
+
+        result = aggregation_worker.run_aggregation_worker(
+            staging, etl, trace_id="trace_stacks_phaseb",
+        )
+        assert result.ok is True, f"{result.message} / {result.warnings}"
+        parquet = staging / "stacks.parquet"
+        assert parquet.exists()
+        df = pd.read_parquet(parquet)
+        assert {"Module", "Function", "Inclusive", "Exclusive"}.issubset(df.columns)
+        assert len(df) > 0
+        # At least one module entry must be our injected stacks_mod.sys.
+        modules = set(df["Module"].astype(str).str.lower())
+        assert "stacks_mod.sys" in modules
+
+    def test_stacks_callers_produced_with_csharp_image_symbolizer(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        import etw_analyzer.native as native_pkg
+        monkeypatch.setattr(native_pkg, "Symbolizer", _FakeSymbolizer, raising=False)
+
+        etl = _make_etl(tmp_path)
+        staging = tmp_path / "staging"
+        _seed_phase_b_staging(
+            staging, etl, sampled_rows=30, cpu_count=4, include_image=True,
+        )
+        cover = pd.DataFrame([{
+            "EventSequence": 0, "TimeStampQpc": 0, "CPU": 0, "PID": 4,
+            "ImageBase": 0xFF00_0000, "ImageSize": 0x100_0000,
+            "TimeDateStamp": 0,
+            "FileName": "\\SystemRoot\\drivers\\stacks_mod.sys",
+        }])
+        cover.to_parquet(staging / "image_load.parquet", index=False)
+        manifest = native_cache.read_manifest(staging)
+        datasets = list(manifest.datasets)
+        datasets.append(native_cache.CacheDataset(
+            name="image_load", kind="parquet", path="image_load.parquet",
+            row_count=1, materialize_on_load=True,
+        ))
+        native_cache.write_manifest(
+            staging,
+            native_cache.CacheManifest.materialized_small(
+                etl, datasets, producer="csharp",
+            ),
+        )
+        aggregation_worker.run_aggregation_worker(
+            staging, etl, trace_id="trace_callers_phaseb",
+        )
+        parquet = staging / "stacks_callers.parquet"
+        assert parquet.exists()
+        df = pd.read_parquet(parquet)
+        assert "Direction" in df.columns
+        assert "self" in set(df["Direction"])
