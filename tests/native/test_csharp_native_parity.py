@@ -62,17 +62,13 @@ _EXACT_DATASETS: tuple[str, ...] = (
     "process_info",
 )
 _TOLERANT_DATASETS: dict[str, float] = {
-    # cpu_sampling: observed -23% drift on the real fixture (csharp=78
-    # native=102). Both pipelines run the SAME Python aggregator on
-    # different upstream sources -- native consumes raw SampledProfile
-    # events in-process; csharp reads SampledProfile parquet emitted by
-    # the sidecar. The drift suggests the sidecar attributes a handful
-    # of low-weight samples differently (likely "Unknown" module
-    # fallback vs resolved module) before aggregation. Not P2 scope to
-    # investigate; widened tolerance keeps the harness useful as a
-    # future regression detector for OTHER datasets while preserving
-    # cpu_sampling as a smoke check.
-    "cpu_sampling": 0.30,
+    # cpu_sampling: same Python aggregator runs in both pipelines; tolerance
+    # absorbs at-most a handful of rows that vary between "Unknown" /
+    # resolved-module attribution on the kernel-space sample fraction.
+    # See manager-log/sampledprofile-attribution-finding.md for the bug
+    # that caused this to drift to -23% before being fixed by the
+    # sampled_profile + thread column adapters.
+    "cpu_sampling": 0.05,
     "dpc_isr": 0.05,
     "cpu_timeline": 0.05,
     "stacks": 0.10,
