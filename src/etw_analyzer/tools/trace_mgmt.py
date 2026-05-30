@@ -86,16 +86,20 @@ def load_trace(
                          non-default timeout values require mode="xperf".
         force: Delete cached exports and re-run xperf. Default: False.
         mode: Pipeline used to load the trace.
-              ``"auto"`` (default — Phase N5) probes the in-process
-              ``OpenTraceW`` consumer and uses it when available, silently
-              falling back to ``xperf.exe`` if the native bindings can't
-              load. ``"native"`` forces the in-process consumer and
-              raises if it's unavailable. ``"xperf"`` forces the legacy
-              text-based ``xperf -a dumper`` extraction. The
-              ``WPR_MCP_MODE`` environment variable overrides this arg
-              when the arg is left at its default. The native pipeline is
-              a fast path for a curated event/aggregation subset, not full
-              ``xperf`` parity; use ``mode="xperf"`` for broadest
+              ``"auto"`` (default — Phase N5) walks the documented
+              fallback chain ``csharp → native → xperf``: the C# sidecar
+              when the ``WPR_MCP_CSHARP_SIDECAR`` env var is set (or
+              ``wpr-mcp-extract.exe`` is on PATH), then the in-process
+              ``OpenTraceW`` consumer when its bindings load, then the
+              legacy text-based ``xperf -a dumper`` as the universal
+              opt-out. ``"csharp"`` forces the C# sidecar and raises if
+              the binary is unfindable (naming the env var override).
+              ``"native"`` forces the in-process consumer and raises if
+              it's unavailable. ``"xperf"`` forces the legacy pipeline.
+              The ``WPR_MCP_MODE`` environment variable overrides this
+              arg when the arg is left at its default. The native and
+              csharp pipelines are fast paths for a curated event /
+              aggregation subset; use ``mode="xperf"`` for broadest
               coverage.
     """
     path = Path(etl_path)
@@ -111,11 +115,13 @@ def load_trace(
     # silently falling back to xperf, so they know to flip to
     # ``mode="xperf"`` or ``mode="auto"``.
     from etw_analyzer.native.config import (
+        _csharp_was_forced,
         _native_was_forced,
         apply_native_size_guardrail,
         resolve_mode,
     )
     try:
+        csharp_was_forced = _csharp_was_forced(mode)
         native_was_forced = _native_was_forced(mode)
         resolved_mode = resolve_mode(mode, etl_path=path)
         resolved_mode, guardrail_notice = apply_native_size_guardrail(
@@ -148,12 +154,12 @@ def load_trace(
         import shutil
         shutil.rmtree(export_dir)
 
-    # Native mode skips xperf entirely. Without xperf installed we still
-    # try the cache and the native pipeline; if neither works we fall
-    # through to the "xperf.exe not found" error at the bottom of this
-    # block.
+    # Native mode skips xperf entirely. csharp mode also skips xperf — the
+    # sidecar does the decode. Without xperf installed we still try the cache
+    # and the alternative pipelines; if neither works we fall through to the
+    # "xperf.exe not found" error at the bottom of this block.
     xperf = find_xperf()
-    if xperf is None and resolved_mode != "native":
+    if xperf is None and resolved_mode not in ("native", "csharp"):
         prefix = f"{guardrail_notice}\n\n" if guardrail_notice else ""
         return prefix + (
             "xperf.exe not found. Install Windows Performance Toolkit "
@@ -173,6 +179,76 @@ def load_trace(
             load_notices,
             from_cache=True,
         )
+
+    if resolved_mode == "csharp":
+        worker_result = _load_csharp_with_worker(
+            path,
+            export_dir,
+            sym_path,
+        )
+        if worker_result.ok:
+            cached = _load_from_cache(export_dir, path, mode="csharp")
+            if cached is not None:
+                return _register_cached_trace(
+                    path,
+                    export_dir,
+                    sym_path,
+                    "csharp",
+                    cached,
+                    load_notices,
+                    from_cache=False,
+                )
+            worker_result.message = (
+                "csharp sidecar completed but the promoted cache could not be loaded"
+            )
+            try:
+                import shutil
+                shutil.rmtree(export_dir)
+            except Exception:
+                pass
+
+        if csharp_was_forced:
+            return _native_worker_load_failed(worker_result)
+
+        # Auto-resolved csharp failed; fall back along the documented
+        # chain csharp → native → xperf. Drop to native first when its
+        # worker is enabled, otherwise straight to xperf.
+        if _native_worker_enabled():
+            load_notices.append(
+                "C# sidecar failed; falling back to mode='native': "
+                f"{worker_result.message}"
+            )
+            resolved_mode = "native"
+            cached = _load_from_cache(export_dir, path, mode="native")
+            if cached is not None:
+                return _register_cached_trace(
+                    path,
+                    export_dir,
+                    sym_path,
+                    "native",
+                    cached,
+                    load_notices,
+                    from_cache=True,
+                )
+        elif xperf is not None:
+            load_notices.append(
+                "C# sidecar failed; falling back to mode='xperf': "
+                f"{worker_result.message}"
+            )
+            resolved_mode = "xperf"
+            cached = _load_from_cache(export_dir, path, mode="xperf")
+            if cached is not None:
+                return _register_cached_trace(
+                    path,
+                    export_dir,
+                    sym_path,
+                    "xperf",
+                    cached,
+                    load_notices,
+                    from_cache=True,
+                )
+        else:
+            return _native_worker_load_failed(worker_result)
 
     if resolved_mode == "native" and _native_worker_enabled():
         worker_result = _load_native_with_worker(
@@ -362,7 +438,7 @@ def _register_cached_trace(
             dumper_stems=frozenset(),
         )
     streaming_store = (
-        resolved_mode == "native"
+        resolved_mode in ("native", "csharp")
         and trace.event_store is not None
         and _is_streaming_event_store_cache(export_dir)
     )
@@ -373,7 +449,9 @@ def _register_cached_trace(
                 "Native streaming event-store cache loaded; some low-risk "
                 "aggregate datasets are not present: " + ", ".join(missing)
             )
-    else:
+    elif resolved_mode != "csharp":
+        # csharp caches were already populated by the sidecar +
+        # aggregation_worker; no background xperf dumper pass is needed.
         _start_background_dumper(trace)
     if resolved_mode == "native" and not streaming_store:
         trace.wait_for_dumper()
@@ -395,7 +473,7 @@ def _open_native_event_store_from_cache(
 ):
     """Open the optional chunked event store referenced by a native v2 cache."""
 
-    if mode != "native":
+    if mode not in ("native", "csharp"):
         return None
     manifest_data = _read_cache_manifest(export_dir)
     if manifest_data is None or not _is_native_v2_manifest(manifest_data):
@@ -462,6 +540,29 @@ def _load_native_with_worker(
     from etw_analyzer.native.worker_supervisor import run_native_worker_extraction
 
     return run_native_worker_extraction(
+        etl_path=path,
+        export_dir=export_dir,
+        trace_id=make_trace_id(path),
+        symbol_path=sym_path,
+        requested_event_classes=_DUMPER_EVENT_CLASSES.keys(),
+    )
+
+
+def _load_csharp_with_worker(
+    path: Path,
+    export_dir: Path,
+    sym_path: str | None,
+):
+    """Dispatch to the C# sidecar via worker_supervisor.run_csharp_worker_extraction.
+
+    Returns a ``NativeWorkerResult`` whose ``ok`` field signals success.
+    The supervisor handles staging, validation, aggregation, and atomic
+    promotion. On failure the staging directory is preserved for debugging
+    per the spike contract.
+    """
+    from etw_analyzer.native.worker_supervisor import run_csharp_worker_extraction
+
+    return run_csharp_worker_extraction(
         etl_path=path,
         export_dir=export_dir,
         trace_id=make_trace_id(path),
@@ -1265,11 +1366,14 @@ _CACHE_SCHEMA_VERSION = 1
 
 # Datasets that MUST be present (and load successfully) for a cache to be
 # considered usable. Xperf needs cpu_sampling as the historical floor. Native
-# can have traces with no sampled-profile rows, so native completeness is
-# tracked by the per-event parquet set in the manifest instead.
+# and csharp can have traces with no sampled-profile rows, so completeness is
+# tracked by the per-event parquet set in the manifest instead. csharp shares
+# the native cache shape (the producer field on the v3 manifest carries the
+# distinction).
 _CACHE_REQUIRED_DATASETS_BY_MODE = {
     "xperf": frozenset({"cpu_sampling"}),
     "native": frozenset(),
+    "csharp": frozenset(),
 }
 
 # Legacy exports may have written .csv instead of .parquet for the original
@@ -1339,7 +1443,7 @@ def _is_native_v2_manifest(manifest: dict) -> bool:
 
 
 def _required_dumper_stems_for_mode(mode: str) -> frozenset[str]:
-    if mode == "native":
+    if mode in ("native", "csharp"):
         return frozenset(stem for _, stem in _DUMPER_EVENT_CLASSES.values())
     return frozenset()
 
@@ -1706,7 +1810,14 @@ def _load_from_cache(
 
     manifest = _read_cache_manifest(export_dir)
     if manifest is not None and _is_native_v2_manifest(manifest):
-        return _load_native_v2_from_cache(export_dir, etl_path, mode, manifest)
+        # csharp and native share the on-disk cache shape (csharp writes
+        # mode="native" into the manifest). When the caller asks for
+        # mode="csharp", validate against the manifest's intrinsic mode
+        # but keep the requested mode visible to the rest of the loader.
+        manifest_mode = "native" if mode == "csharp" else mode
+        return _load_native_v2_from_cache(
+            export_dir, etl_path, manifest_mode, manifest
+        )
 
     legacy_xperf = manifest is None
     if manifest is None:

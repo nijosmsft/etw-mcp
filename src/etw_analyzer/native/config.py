@@ -300,6 +300,20 @@ def _native_was_forced(arg_mode: Optional[str]) -> bool:
     return False
 
 
+def _csharp_was_forced(arg_mode: Optional[str]) -> bool:
+    if arg_mode:
+        normalized_arg = normalize_mode(arg_mode)
+        if normalized_arg == "csharp":
+            return True
+        if normalized_arg != "auto":
+            return False
+
+    env_mode = os.environ.get("WPR_MCP_MODE")
+    if env_mode:
+        return normalize_mode(env_mode) == "csharp"
+    return False
+
+
 def apply_native_size_guardrail(
     arg_mode: Optional[str],
     resolved_mode: str,
