@@ -127,20 +127,12 @@ refactor planned for v0.2.0 of the sidecar.
 
 ## Known issues / caveats
 
-1. **`mtime_ns` epoch mismatch.** The sidecar writes
-   `LastWriteTimeUtc.Ticks * 100`; Python's `st_mtime_ns` uses the Unix
-   epoch. They will never match. The cache loader uses
-   `EtlIdentity.matches_loose()` (size + name) for csharp-producer
-   manifests as a workaround until the sidecar is fixed. Operators should
-   force-recreate the cache if they edit an ETL in place with the same
-   size (rare).
-
-2. **Symbol resolution is Python-side.** The sidecar emits `Image/Load`
+1. **Symbol resolution is Python-side.** The sidecar emits `Image/Load`
    + `Image/DCStart` rows but does not symbolicate. After cache promote,
    `etw_analyzer.native.symbolizer` runs in-process. If symbols are slow
    or missing, that's a Python-path issue, not a sidecar issue.
 
-3. **Streaming RSS > budget.** Per the production status doc, the
+2. **Streaming RSS > budget.** Per the production status doc, the
    sidecar buffers per-class rows before chunked write. Target of 1 GB
    RSS requires a future refactor in C# (`EventCollector` →
    `System.Threading.Channels<T>`).

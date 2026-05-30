@@ -192,10 +192,57 @@ def test_v3_csharp_cache_readable_under_xperf_mode_reload(tmp_path: Path):
     assert cached_native is not None
 
 
-# ---------------------------------------------------------------------------
-# Opt-in real-fixture end-to-end. Only runs when the sidecar binary is
-# locatable AND a fixture path is provided via env.
-# ---------------------------------------------------------------------------
+def test_v3_csharp_manifest_with_unix_epoch_mtime_validates_strict(tmp_path: Path):
+    """Regression for D1: csharp manifests with Unix-epoch mtime_ns must
+    pass the strict three-field identity check, not the deprecated loose
+    fall-back.
+
+    The C# sidecar emits `(LastWriteTimeUtc - UnixEpoch).Ticks * 100` as
+    of P1b, matching Python's `os.stat().st_mtime_ns` exactly. The Python
+    `matches_loose()` shim is gone — any csharp-produced manifest must
+    now round-trip through `validate_manifest` against the same ETL via
+    the same code path as native and xperf producers.
+    """
+
+    etl = _make_etl(tmp_path)
+    cache_dir = tmp_path / ".etw-export-sample"
+    _write_minimal_native_cache(cache_dir, etl, producer="csharp", schema_version=3)
+
+    loaded = native_cache.read_manifest(cache_dir)
+    assert loaded is not None
+    assert loaded.producer == "csharp"
+    # The strict identity match is the only path now.
+    assert loaded.etl.matches(etl) is True
+
+    # A producer="csharp" manifest must validate under the strict check.
+    native_cache.validate_manifest(loaded, cache_dir, etl, mode="native")
+
+    # And the helper class no longer exposes the loose fall-back at all.
+    assert not hasattr(native_cache.EtlIdentity, "matches_loose")
+
+
+def test_v3_csharp_manifest_with_stale_mtime_is_rejected(tmp_path: Path):
+    """A csharp-produced cache whose mtime_ns no longer matches the
+    on-disk ETL must be rejected — the loose-match workaround is gone
+    so this case is now an error, not a silent cache hit."""
+
+    etl = _make_etl(tmp_path)
+    cache_dir = tmp_path / ".etw-export-stale"
+    _write_minimal_native_cache(cache_dir, etl, producer="csharp", schema_version=3)
+
+    # Bump mtime by re-touching the ETL — bytes unchanged, identity changed.
+    import os
+    stat = etl.stat()
+    new_mtime_ns = stat.st_mtime_ns + 1_000_000_000  # +1s
+    os.utime(etl, ns=(stat.st_atime_ns, new_mtime_ns))
+
+    loaded = native_cache.read_manifest(cache_dir)
+    assert loaded is not None
+    with pytest.raises(native_cache.NativeCacheError, match="ETL identity is stale"):
+        native_cache.validate_manifest(loaded, cache_dir, etl, mode="native")
+
+
+
 
 _REAL_FIXTURE_ENV = "WPR_MCP_CSHARP_E2E_FIXTURE"
 _REAL_FIXTURE_DEFAULT = (

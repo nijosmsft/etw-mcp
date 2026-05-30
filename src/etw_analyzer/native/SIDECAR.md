@@ -140,15 +140,6 @@ then re-invoke `load_trace(…, force=True)`.
 
 ## Known limitations
 
-* **`mtime_ns` encoding** — the C# emitter writes
-  `LastWriteTimeUtc.Ticks * 100` (.NET ns since year 0001) while Python's
-  `st_mtime_ns` is ns since the Unix epoch. The two will never match.
-  Until the sidecar is fixed, `EtlIdentity.matches_loose()` is used for
-  `producer='csharp'` manifests — identity check is `name + size`, not
-  `name + size + mtime_ns`. Same-size in-place ETL edits will not
-  invalidate the cache. Accepted POC trade-off; tracked for v0.2.0 of
-  the sidecar.
-
 * **Streaming RSS not yet budget-compliant** — the sidecar buffers per-class
   rows in memory before chunked-writing. Real-fixture run: 4 GB RSS for
   `event-store-streaming`. The 1 GB target needs source-side bounded
