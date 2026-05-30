@@ -198,14 +198,14 @@ function Compare-Materialized {
         }
     }
 
-    # Manifest must exist with schema_version=3 and producer=csharp.
+    # Manifest must exist with schema_version=3 and producer=dotnet.
     $manifestPath = Join-Path $Staging "wpr-mcp-cache-manifest.json"
     if (-not (Test-Path $manifestPath)) { Fail "manifest missing in materialized output" }
     $m = Get-Content $manifestPath -Raw | ConvertFrom-Json
     if ($m.schema_version -ne 3) { Fail "expected schema_version=3, got $($m.schema_version)" }
-    if ($m.producer -ne "csharp") { Fail "expected producer=csharp, got $($m.producer)" }
+    if ($m.producer -ne "dotnet") { Fail "expected producer=dotnet, got $($m.producer)" }
     if ($m.strategy -ne "materialized-small") { Fail "expected strategy=materialized-small, got $($m.strategy)" }
-    Write-Host "  [OK]   manifest schema_version=3 producer=csharp strategy=$($m.strategy)"
+    Write-Host "  [OK]   manifest schema_version=3 producer=dotnet strategy=$($m.strategy)"
 
     return $divergences
 }

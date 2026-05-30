@@ -1,8 +1,8 @@
-"""Csharp-sidecar → native-aggregator schema adapters.
+"""Dotnet-sidecar → native-aggregator schema adapters.
 
-The C# sidecar (``wpr-mcp-extract.exe``) writes per-event-class parquets
+The .NET sidecar (``wpr-mcp-extract.exe``) writes per-event-class parquets
 whose column names follow the layer-2 schema in
-``csharp/docs/event-class-mapping.md`` — notably ``TimeStampQpc`` (raw
+``dotnet/docs/event-class-mapping.md`` — notably ``TimeStampQpc`` (raw
 QPC ticks) instead of the legacy ``TimeStamp`` column the in-tree
 native aggregators were written against.
 
@@ -237,7 +237,7 @@ def populate_event_counts_from_manifest(
 
     ``build_tracestats_text`` (aggregators/tracestats.py) falls back to
     ``trace.event_counts`` when no ``ExtractStats`` is present, which is
-    always the case under ``mode="csharp"``. Populating counts here
+    always the case under ``mode="dotnet"``. Populating counts here
     means the existing aggregator emits a meaningful provider-counts
     block without modification.
     """
@@ -346,7 +346,7 @@ __all__ = [
 #
 # The sidecar (Phase B build, 39.9 MB) writes per-opcode parquets for
 # kernel-meta event classes. Column names follow the layer-2 schema
-# documented in csharp/docs/event-class-mapping.md, which intentionally
+# documented in dotnet/docs/event-class-mapping.md, which intentionally
 # differs from the native MOF-handler shape the in-tree aggregators were
 # written against. These adapters do the column-rename / column-synthesis
 # work so the same aggregator code can consume both producers.
@@ -441,7 +441,7 @@ def adapt_csharp_process_dataframe(df: pd.DataFrame | None) -> pd.DataFrame | No
     ``ParentId``, ``SessionId``, ``ImageFileName``, ``CommandLine``,
     ``TimeStamp``. Map PID -> ProcessId, ParentPID -> ParentId, and
     synthesise SessionId=0 (the sidecar does not decode session IDs —
-    documented in csharp/docs/event-class-mapping.md). TimeStampQpc ->
+    documented in dotnet/docs/event-class-mapping.md). TimeStampQpc ->
     TimeStamp is the same rename ``normalize_csharp_dataframe`` does.
 
     Returns the same DataFrame (mutated) for chaining; ``None`` /
@@ -625,11 +625,11 @@ def build_symbolizer_from_csharp_images(trace) -> bool:
         dbghelp, or a unit-test environment), OR
       * neither Image/Load nor Image/DCStart has any rows.
 
-    This is the csharp equivalent of trace_mgmt._build_symbolizer_from_images
+    This is the dotnet equivalent of trace_mgmt._build_symbolizer_from_images
     (which the native path calls during the in-process consumer's
     Image/Load fan-out). Kept here rather than reusing the trace_mgmt
-    helper directly because the csharp path doesn't go through
-    _start_background_dumper and we want a clear chain of csharp-
+    helper directly because the dotnet path doesn't go through
+    _start_background_dumper and we want a clear chain of dotnet-
     specific helpers in this module.
     """
 

@@ -56,7 +56,7 @@ def test_emit_includes_event_and_named_fields(caplog: pytest.LogCaptureFixture):
     caplog.set_level(logging.INFO, logger=telemetry.LOGGER_NAME)
     telemetry.emit(
         telemetry.EVENT_LOAD_START,
-        mode="csharp",
+        mode="dotnet",
         trace_id="trace_abc",
         etl_size_mb=1024.5,
     )
@@ -64,7 +64,7 @@ def test_emit_includes_event_and_named_fields(caplog: pytest.LogCaptureFixture):
     assert len(records) == 1
     msg = records[0]
     assert msg.startswith("event=load.start ")
-    assert "mode=csharp" in msg
+    assert "mode=dotnet" in msg
     assert "trace_id=trace_abc" in msg
     assert "etl_size_mb=1024.500" in msg
 
@@ -73,7 +73,7 @@ def test_emit_with_orders_mode_and_trace_id_first(caplog: pytest.LogCaptureFixtu
     caplog.set_level(logging.INFO, logger=telemetry.LOGGER_NAME)
     telemetry.emit_with(
         telemetry.EVENT_CSHARP_RESULT,
-        mode="csharp",
+        mode="dotnet",
         trace_id="trace_xyz",
         peak_rss_mb=2300.4,
         events_per_second=1_250_000,
@@ -82,8 +82,8 @@ def test_emit_with_orders_mode_and_trace_id_first(caplog: pytest.LogCaptureFixtu
     # The output uses dict ordering for the remaining fields, but
     # ``mode`` and ``trace_id`` must come first.
     tokens = msg.split(" ")
-    assert tokens[0] == "event=csharp.result"
-    assert tokens[1] == "mode=csharp"
+    assert tokens[0] == "event=dotnet.result"
+    assert tokens[1] == "mode=dotnet"
     assert tokens[2] == "trace_id=trace_xyz"
 
 
@@ -99,7 +99,7 @@ def test_emit_with_omits_optional_anchors(caplog: pytest.LogCaptureFixture):
 
 def test_emit_silenced_when_logger_below_info(caplog: pytest.LogCaptureFixture):
     caplog.set_level(logging.WARNING, logger=telemetry.LOGGER_NAME)
-    telemetry.emit(telemetry.EVENT_LOAD_START, mode="csharp")
+    telemetry.emit(telemetry.EVENT_LOAD_START, mode="dotnet")
     assert _records(caplog) == []
 
 
@@ -188,14 +188,14 @@ def test_csharp_phase_telemetry_via_mocked_supervisor(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ):
-    """End-to-end-ish telemetry coverage for the csharp pipeline using the
+    """End-to-end-ish telemetry coverage for the dotnet pipeline using the
     mocked-sidecar pattern from ``test_csharp_worker_supervisor.py``.
 
     Runs ``run_csharp_worker_extraction`` with a fake process_runner +
     aggregation_runner, then asserts the full event sequence:
 
-        csharp.spawn → csharp.child_exit → csharp.result → csharp.cache_validate
-        → csharp.aggregation_start → csharp.aggregation_done → csharp.cache_promote
+        dotnet.spawn → dotnet.child_exit → dotnet.result → dotnet.cache_validate
+        → dotnet.aggregation_start → dotnet.aggregation_done → dotnet.cache_promote
     """
 
     import importlib
@@ -297,22 +297,22 @@ def test_csharp_phase_telemetry_via_mocked_supervisor(
 
     # Spot-check field content.
     records = _records(caplog)
-    spawn = next(r for r in records if r.startswith("event=csharp.spawn "))
-    assert "mode=csharp" in spawn
+    spawn = next(r for r in records if r.startswith("event=dotnet.spawn "))
+    assert "mode=dotnet" in spawn
     assert "trace_id=trace_telemetry" in spawn
 
-    result_line = next(r for r in records if r.startswith("event=csharp.result "))
+    result_line = next(r for r in records if r.startswith("event=dotnet.result "))
     assert "events_per_second=250000" in result_line
     assert "peak_rss_mb=1234.500" in result_line
     assert "sidecar_wall_seconds=12.340" in result_line
 
     validate_line = next(
-        r for r in records if r.startswith("event=csharp.cache_validate ")
+        r for r in records if r.startswith("event=dotnet.cache_validate ")
     )
     assert "ok=true" in validate_line
-    assert "producer=csharp" in validate_line
+    assert "producer=dotnet" in validate_line
 
     promote = next(
-        r for r in records if r.startswith("event=csharp.cache_promote ")
+        r for r in records if r.startswith("event=dotnet.cache_promote ")
     )
     assert "ok=true" in promote

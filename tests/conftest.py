@@ -28,7 +28,7 @@ _RUN_OPTIONS = {
     "network": ("--run-network", "run tests that require network access"),
     "benchmark": ("--run-benchmark", "run benchmark/performance tests"),
     "live": ("--run-live", "run tests against live systems or processes"),
-    "parity": ("--run-parity", "run csharp vs native cross-producer parity tests against the real fixture"),
+    "parity": ("--run-parity", "run dotnet vs native cross-producer parity tests against the real fixture"),
 }
 
 

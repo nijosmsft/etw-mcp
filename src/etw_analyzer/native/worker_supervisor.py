@@ -790,7 +790,7 @@ __all__ = [
 
 
 # ---------------------------------------------------------------------------
-# C# sidecar invocation — Track B of the hybrid migration. The protocol is
+# .NET sidecar invocation — Track B of the hybrid migration. The protocol is
 # spike-contract.md v1: one --request <path> argument, stdout reserved for
 # JSONL ({heartbeat,progress,result}), exit code 0 for success / 1 for
 # structured failure / 2 for crash. We REUSE the existing _reader_thread,
@@ -818,7 +818,7 @@ def build_csharp_request(
 ) -> dict[str, Any]:
     """Build the request JSON consumed by ``wpr-mcp-extract.exe``.
 
-    Matches the schema in ``csharp/src/Request.cs`` exactly. The version
+    Matches the schema in ``dotnet/src/Request.cs`` exactly. The version
     field is locked to 1 per ``spike-contract.md`` §3.1.
     """
 
@@ -858,7 +858,7 @@ def run_csharp_worker_extraction(
     process_runner: Callable[..., NativeWorkerResult] | None = None,
     aggregation_runner: Callable[..., Any] | None = None,
 ) -> NativeWorkerResult:
-    """Run the C# sidecar into staging, run aggregators, then promote.
+    """Run the .NET sidecar into staging, run aggregators, then promote.
 
     Pipeline:
 
@@ -880,21 +880,21 @@ def run_csharp_worker_extraction(
     resolved_sidecar = sidecar_path or find_csharp_sidecar()
     if resolved_sidecar is None:
         raise ValueError(
-            f"C# sidecar binary {CSHARP_SIDECAR_EXE} could not be located. "
+            f".NET sidecar binary {CSHARP_SIDECAR_EXE} could not be located. "
             f"Set {CSHARP_SIDECAR_ENV} to the absolute path of the built "
-            "binary, publish it under csharp/publish/win-x64/, or add it "
+            "binary, publish it under dotnet/publish/win-x64/, or add it "
             "to PATH."
         )
     if not resolved_sidecar.is_file():
         raise ValueError(
-            f"C# sidecar path {resolved_sidecar} is not a file. "
+            f".NET sidecar path {resolved_sidecar} is not a file. "
             f"Check {CSHARP_SIDECAR_ENV}."
         )
 
     etl_path = etl_path.resolve()
     export_dir = export_dir.resolve()
     staging_dir = export_dir.parent / (
-        f"{export_dir.name}.csharp-{trace_id}-{uuid.uuid4().hex}"
+        f"{export_dir.name}.dotnet-{trace_id}-{uuid.uuid4().hex}"
     )
     request_path = staging_dir / "request.json"
     runner = process_runner or run_csharp_process
@@ -918,7 +918,7 @@ def run_csharp_worker_extraction(
 
         _telemetry.emit_with(
             _telemetry.EVENT_CSHARP_SPAWN,
-            mode="csharp",
+            mode="dotnet",
             trace_id=trace_id,
             sidecar_path=resolved_sidecar,
             staging_dir=staging_dir,
@@ -941,7 +941,7 @@ def run_csharp_worker_extraction(
         _perf = _result_payload.get("performance") or {}
         _telemetry.emit_with(
             _telemetry.EVENT_CSHARP_CHILD_EXIT,
-            mode="csharp",
+            mode="dotnet",
             trace_id=trace_id,
             ok=sidecar_result.ok,
             returncode=sidecar_result.returncode,
@@ -951,7 +951,7 @@ def run_csharp_worker_extraction(
         if sidecar_result.ok and _perf:
             _telemetry.emit_with(
                 _telemetry.EVENT_CSHARP_RESULT,
-                mode="csharp",
+                mode="dotnet",
                 trace_id=trace_id,
                 sidecar_wall_seconds=_perf.get("wall_seconds"),
                 events_per_second=_perf.get("events_per_second"),
@@ -968,7 +968,7 @@ def run_csharp_worker_extraction(
             manifest = native_cache.read_manifest(staging_dir)
             if manifest is None:
                 raise native_cache.NativeCacheError(
-                    "csharp sidecar did not write a cache manifest"
+                    "dotnet sidecar did not write a cache manifest"
                 )
             native_cache.validate_manifest(
                 manifest,
@@ -979,14 +979,14 @@ def run_csharp_worker_extraction(
         except Exception as exc:
             _telemetry.emit_with(
                 _telemetry.EVENT_CSHARP_CACHE_VALIDATE,
-                mode="csharp",
+                mode="dotnet",
                 trace_id=trace_id,
                 ok=False,
                 error=str(exc),
             )
             return NativeWorkerResult(
                 ok=False,
-                message=f"csharp sidecar produced an invalid cache: {exc}",
+                message=f"dotnet sidecar produced an invalid cache: {exc}",
                 failure_kind="invalid-cache",
                 request_path=request_path,
                 staging_dir=staging_dir,
@@ -998,7 +998,7 @@ def run_csharp_worker_extraction(
             )
         _telemetry.emit_with(
             _telemetry.EVENT_CSHARP_CACHE_VALIDATE,
-            mode="csharp",
+            mode="dotnet",
             trace_id=trace_id,
             ok=True,
             datasets=len(manifest.datasets),
@@ -1010,7 +1010,7 @@ def run_csharp_worker_extraction(
         agg_run = aggregation_runner or _default_aggregation_runner
         _telemetry.emit_with(
             _telemetry.EVENT_CSHARP_AGGREGATION_START,
-            mode="csharp",
+            mode="dotnet",
             trace_id=trace_id,
             staging_dir=staging_dir,
         )
@@ -1020,7 +1020,7 @@ def run_csharp_worker_extraction(
         except Exception as exc:
             _telemetry.emit_with(
                 _telemetry.EVENT_CSHARP_AGGREGATION_DONE,
-                mode="csharp",
+                mode="dotnet",
                 trace_id=trace_id,
                 ok=False,
                 error=str(exc),
@@ -1041,7 +1041,7 @@ def run_csharp_worker_extraction(
         if not agg_result.ok:
             _telemetry.emit_with(
                 _telemetry.EVENT_CSHARP_AGGREGATION_DONE,
-                mode="csharp",
+                mode="dotnet",
                 trace_id=trace_id,
                 ok=False,
                 error=agg_result.message,
@@ -1061,7 +1061,7 @@ def run_csharp_worker_extraction(
             )
         _telemetry.emit_with(
             _telemetry.EVENT_CSHARP_AGGREGATION_DONE,
-            mode="csharp",
+            mode="dotnet",
             trace_id=trace_id,
             ok=True,
             datasets_written=len(agg_result.datasets_written),
@@ -1074,14 +1074,14 @@ def run_csharp_worker_extraction(
         except Exception as exc:
             _telemetry.emit_with(
                 _telemetry.EVENT_CSHARP_CACHE_PROMOTE,
-                mode="csharp",
+                mode="dotnet",
                 trace_id=trace_id,
                 ok=False,
                 error=str(exc),
             )
             return NativeWorkerResult(
                 ok=False,
-                message=f"csharp cache promotion failed: {exc}",
+                message=f"dotnet cache promotion failed: {exc}",
                 failure_kind="promotion",
                 request_path=request_path,
                 staging_dir=staging_dir,
@@ -1094,13 +1094,13 @@ def run_csharp_worker_extraction(
 
         sidecar_result.export_dir = export_dir
         sidecar_result.message = (
-            f"csharp sidecar completed: {agg_result.message}"
+            f"dotnet sidecar completed: {agg_result.message}"
         )
         if agg_result.warnings:
             sidecar_result.aggregation_warnings = list(agg_result.warnings)
         _telemetry.emit_with(
             _telemetry.EVENT_CSHARP_CACHE_PROMOTE,
-            mode="csharp",
+            mode="dotnet",
             trace_id=trace_id,
             ok=True,
             export_dir=export_dir,
@@ -1135,7 +1135,7 @@ def _default_aggregation_runner(
         staging_dir,
         etl_path,
         trace_id,
-        producer="csharp",
+        producer="dotnet",
     )
 
 
@@ -1147,10 +1147,10 @@ def run_csharp_process(
     stale_heartbeat_seconds: float | None = None,
     popen_factory: Callable[..., subprocess.Popen] = subprocess.Popen,
 ) -> NativeWorkerResult:
-    """Launch and supervise the C# sidecar subprocess.
+    """Launch and supervise the .NET sidecar subprocess.
 
     Reuses the same heartbeat-watchdog + bounded-tail logic as
-    :func:`run_worker_process`. The C# protocol is byte-compatible: each
+    :func:`run_worker_process`. The .NET protocol is byte-compatible: each
     stdout line is a JSON object with ``type`` in
     ``{heartbeat, progress, result}``; the ``result`` line is the source
     of truth for ok/failure.
@@ -1193,7 +1193,7 @@ def run_csharp_process(
     except Exception as exc:
         return NativeWorkerResult(
             ok=False,
-            message=f"failed to launch csharp sidecar: {exc}",
+            message=f"failed to launch dotnet sidecar: {exc}",
             failure_kind="launch",
             request_path=request_path,
         )
@@ -1202,13 +1202,13 @@ def run_csharp_process(
         target=_reader_thread,
         args=("stdout", proc.stdout, events),
         daemon=True,
-        name="csharp-sidecar-stdout",
+        name="dotnet-sidecar-stdout",
     )
     stderr_thread = threading.Thread(
         target=_reader_thread,
         args=("stderr", proc.stderr, events),
         daemon=True,
-        name="csharp-sidecar-stderr",
+        name="dotnet-sidecar-stderr",
     )
     stdout_thread.start()
     stderr_thread.start()
@@ -1245,14 +1245,14 @@ def run_csharp_process(
             if now - start > timeout:
                 failure_kind = "timeout"
                 failure_message = (
-                    f"csharp sidecar exceeded wall-clock timeout of {timeout:.1f}s"
+                    f"dotnet sidecar exceeded wall-clock timeout of {timeout:.1f}s"
                 )
                 _terminate_process(proc)
                 break
             if now - last_heartbeat > stale:
                 failure_kind = "stale-heartbeat"
                 failure_message = (
-                    f"csharp sidecar produced no heartbeat for {stale:.1f}s"
+                    f"dotnet sidecar produced no heartbeat for {stale:.1f}s"
                 )
                 _terminate_process(proc)
                 break
@@ -1305,21 +1305,21 @@ def run_csharp_process(
     if result_payload and result_payload.get("ok") is True:
         return NativeWorkerResult(
             ok=True,
-            message="csharp sidecar completed",
+            message="dotnet sidecar completed",
             **common,
         )
     if result_payload and result_payload.get("ok") is False:
         kind = str(result_payload.get("failure_kind") or "worker-error")
         return NativeWorkerResult(
             ok=False,
-            message=str(result_payload.get("error") or "csharp sidecar failed"),
+            message=str(result_payload.get("error") or "dotnet sidecar failed"),
             failure_kind=kind,
             **common,
         )
     return NativeWorkerResult(
         ok=False,
         message=(
-            f"csharp sidecar exited with code {returncode} without emitting "
+            f"dotnet sidecar exited with code {returncode} without emitting "
             "a result record"
         ),
         failure_kind="no-result",

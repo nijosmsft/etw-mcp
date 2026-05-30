@@ -1,4 +1,4 @@
-"""Structured load telemetry for the native + csharp trace-load pipeline.
+"""Structured load telemetry for the native + dotnet trace-load pipeline.
 
 The goal of this module is operational visibility: when load_trace runs,
 operators (and the test harness) should be able to see which mode was
@@ -12,7 +12,7 @@ Format
 Every event is a single log line at ``INFO`` level on the logger
 ``etw_analyzer.native.telemetry``:
 
-    event=<name> mode=<csharp|native|xperf|auto> trace_id=<id> key=value ...
+    event=<name> mode=<dotnet|native|xperf|auto> trace_id=<id> key=value ...
 
 Keys are ``snake_case``; values are formatted via :func:`format_value` so
 floats stay readable (``%.3f``), paths render as ``str(path)``, and
@@ -52,13 +52,13 @@ EVENT_LOAD_CACHE_MISS = "load.cache_miss"
 EVENT_LOAD_DISPATCH = "load.dispatch"
 EVENT_LOAD_COMPLETE = "load.complete"
 EVENT_LOAD_FAILED = "load.failed"
-EVENT_CSHARP_SPAWN = "csharp.spawn"
-EVENT_CSHARP_RESULT = "csharp.result"
-EVENT_CSHARP_CHILD_EXIT = "csharp.child_exit"
-EVENT_CSHARP_CACHE_VALIDATE = "csharp.cache_validate"
-EVENT_CSHARP_AGGREGATION_START = "csharp.aggregation_start"
-EVENT_CSHARP_AGGREGATION_DONE = "csharp.aggregation_done"
-EVENT_CSHARP_CACHE_PROMOTE = "csharp.cache_promote"
+EVENT_CSHARP_SPAWN = "dotnet.spawn"
+EVENT_CSHARP_RESULT = "dotnet.result"
+EVENT_CSHARP_CHILD_EXIT = "dotnet.child_exit"
+EVENT_CSHARP_CACHE_VALIDATE = "dotnet.cache_validate"
+EVENT_CSHARP_AGGREGATION_START = "dotnet.aggregation_start"
+EVENT_CSHARP_AGGREGATION_DONE = "dotnet.aggregation_done"
+EVENT_CSHARP_CACHE_PROMOTE = "dotnet.cache_promote"
 EVENT_NATIVE_SPAWN = "native.spawn"
 EVENT_NATIVE_CHILD_EXIT = "native.child_exit"
 

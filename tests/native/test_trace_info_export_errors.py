@@ -39,7 +39,7 @@ def _synthetic_trace(tmp_path: Path, errors: list[str]) -> TraceData:
         etl_path=etl,
         export_dir=export_dir,
         symbol_path=None,
-        mode="csharp",
+        mode="dotnet",
         raw_csv={"sampled_profile": pd.DataFrame({"CPU": [0], "Weight": [1]})},
         export_errors=list(errors),
     )
@@ -123,7 +123,7 @@ def test_csharp_dispatch_merges_aggregation_warnings_into_export_errors(tmp_path
 
     worker_result = NativeWorkerResult(
         ok=True,
-        message="csharp sidecar completed: ok",
+        message="dotnet sidecar completed: ok",
         export_dir=export_dir,
         aggregation_warnings=[
             "aggregator missed Foo events",
@@ -133,13 +133,13 @@ def test_csharp_dispatch_merges_aggregation_warnings_into_export_errors(tmp_path
 
     clear_traces()
     try:
-        with patch("etw_analyzer.native.config.resolve_mode", return_value="csharp"), \
+        with patch("etw_analyzer.native.config.resolve_mode", return_value="dotnet"), \
              patch.object(trace_mgmt, "_load_csharp_with_worker", return_value=worker_result), \
              patch.object(trace_mgmt, "_load_from_cache", side_effect=[None, cached]), \
              patch.object(trace_mgmt, "_open_native_event_store_from_cache", return_value=None), \
              patch.object(trace_mgmt, "_start_background_dumper", return_value=None), \
              patch.object(trace_mgmt, "_refresh_stack_cache_from_html", return_value=None):
-            out = trace_mgmt.load_trace(str(etl), mode="csharp")
+            out = trace_mgmt.load_trace(str(etl), mode="dotnet")
 
         # The load summary should already show the H2 section with both warnings.
         assert "## Export errors (2)" in out, out
@@ -171,20 +171,20 @@ def test_csharp_dispatch_no_aggregation_warnings_no_section(tmp_path: Path):
 
     worker_result = NativeWorkerResult(
         ok=True,
-        message="csharp sidecar completed: ok",
+        message="dotnet sidecar completed: ok",
         export_dir=export_dir,
         aggregation_warnings=[],
     )
 
     clear_traces()
     try:
-        with patch("etw_analyzer.native.config.resolve_mode", return_value="csharp"), \
+        with patch("etw_analyzer.native.config.resolve_mode", return_value="dotnet"), \
              patch.object(trace_mgmt, "_load_csharp_with_worker", return_value=worker_result), \
              patch.object(trace_mgmt, "_load_from_cache", side_effect=[None, cached]), \
              patch.object(trace_mgmt, "_open_native_event_store_from_cache", return_value=None), \
              patch.object(trace_mgmt, "_start_background_dumper", return_value=None), \
              patch.object(trace_mgmt, "_refresh_stack_cache_from_html", return_value=None):
-            out = trace_mgmt.load_trace(str(etl), mode="csharp")
+            out = trace_mgmt.load_trace(str(etl), mode="dotnet")
         assert "## Export errors" not in out, out
     finally:
         clear_traces()

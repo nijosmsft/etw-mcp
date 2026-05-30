@@ -113,15 +113,15 @@ def test_v2_manifest_loads_with_default_native_producer(tmp_path: Path):
 
 
 def test_v3_csharp_manifest_loads_and_downstream_tools_work(tmp_path: Path):
-    """A producer='csharp' cache must hydrate via the standard loader path."""
+    """A producer='dotnet' cache must hydrate via the standard loader path."""
 
     etl = _make_etl(tmp_path)
     cache_dir = tmp_path / ".etw-export-sample"
-    _write_minimal_native_cache(cache_dir, etl, producer="csharp", schema_version=3)
+    _write_minimal_native_cache(cache_dir, etl, producer="dotnet", schema_version=3)
 
     loaded = native_cache.read_manifest(cache_dir)
     assert loaded is not None
-    assert loaded.producer == "csharp"
+    assert loaded.producer == "dotnet"
     assert loaded.schema_version == 3
 
     # Validate the cache is well-formed (raises on path escape, missing
@@ -144,7 +144,7 @@ def test_v3_native_manifest_loads_identically_to_csharp(tmp_path: Path):
     csharp_dir = tmp_path / ".etw-export-csharp"
     native_dir = tmp_path / ".etw-export-native"
 
-    _write_minimal_native_cache(csharp_dir, etl, producer="csharp")
+    _write_minimal_native_cache(csharp_dir, etl, producer="dotnet")
     _write_minimal_native_cache(native_dir, etl, producer="native")
 
     csharp_loaded = trace_mgmt._load_from_cache(csharp_dir, etl, mode="native")
@@ -176,7 +176,7 @@ def test_v3_csharp_cache_readable_under_xperf_mode_reload(tmp_path: Path):
 
     etl = _make_etl(tmp_path)
     cache_dir = tmp_path / ".etw-export-sample"
-    _write_minimal_native_cache(cache_dir, etl, producer="csharp")
+    _write_minimal_native_cache(cache_dir, etl, producer="dotnet")
 
     # When the trace is loaded under mode='xperf', the native v3 manifest
     # is intentionally bypassed because xperf and native carry different
@@ -206,15 +206,15 @@ def test_v3_csharp_manifest_with_unix_epoch_mtime_validates_strict(tmp_path: Pat
 
     etl = _make_etl(tmp_path)
     cache_dir = tmp_path / ".etw-export-sample"
-    _write_minimal_native_cache(cache_dir, etl, producer="csharp", schema_version=3)
+    _write_minimal_native_cache(cache_dir, etl, producer="dotnet", schema_version=3)
 
     loaded = native_cache.read_manifest(cache_dir)
     assert loaded is not None
-    assert loaded.producer == "csharp"
+    assert loaded.producer == "dotnet"
     # The strict identity match is the only path now.
     assert loaded.etl.matches(etl) is True
 
-    # A producer="csharp" manifest must validate under the strict check.
+    # A producer="dotnet" manifest must validate under the strict check.
     native_cache.validate_manifest(loaded, cache_dir, etl, mode="native")
 
     # And the helper class no longer exposes the loose fall-back at all.
@@ -228,7 +228,7 @@ def test_v3_csharp_manifest_with_stale_mtime_is_rejected(tmp_path: Path):
 
     etl = _make_etl(tmp_path)
     cache_dir = tmp_path / ".etw-export-stale"
-    _write_minimal_native_cache(cache_dir, etl, producer="csharp", schema_version=3)
+    _write_minimal_native_cache(cache_dir, etl, producer="dotnet", schema_version=3)
 
     # Bump mtime by re-touching the ETL — bytes unchanged, identity changed.
     import os
@@ -278,12 +278,12 @@ def test_csharp_e2e_against_real_fixture_rehydrates_from_cache(tmp_path: Path):
     """
 
     if os.name != "nt":
-        pytest.skip("csharp sidecar is Windows-only")
+        pytest.skip("dotnet sidecar is Windows-only")
 
     from etw_analyzer.native.config import find_csharp_sidecar
 
     if find_csharp_sidecar() is None:
-        pytest.skip("C# sidecar binary not locatable")
+        pytest.skip(".NET sidecar binary not locatable")
 
     fixture = _resolve_real_fixture()
     assert fixture is not None
@@ -308,7 +308,7 @@ def test_csharp_e2e_against_real_fixture_rehydrates_from_cache(tmp_path: Path):
 
     manifest = native_cache.read_manifest(export_dir)
     assert manifest is not None
-    assert manifest.producer == "csharp"
+    assert manifest.producer == "dotnet"
     assert manifest.schema_version == 3
 
     # Hydrate from cache and verify cpu_sampling is non-empty.

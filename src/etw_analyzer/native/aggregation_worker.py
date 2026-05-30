@@ -14,7 +14,7 @@ Architectural split (per ``rust-hybrid-migration-plan.md`` §4 and
                        Still used for ``mode="native"`` (no sidecar).
 * ``aggregation_worker.py`` (this file) — runs aggregators *only*, against
                        a pre-existing staging dir produced by the sidecar.
-                       Used for ``mode="csharp"``.
+                       Used for ``mode="dotnet"``.
 
 The contract is intentionally narrow:
 
@@ -48,7 +48,7 @@ from etw_analyzer.trace_state import TraceData
 LOGGER = logging.getLogger(__name__)
 
 
-# Sidecar parquet stems (per csharp/src/Program.cs) → (TraceData attribute,
+# Sidecar parquet stems (per dotnet/src/Program.cs) → (TraceData attribute,
 # canonical event-class name from trace_mgmt._DUMPER_EVENT_CLASSES). Kept
 # locally so aggregation_worker doesn't import trace_mgmt at module top —
 # trace_mgmt imports the whole tool surface and is heavyweight.
@@ -78,7 +78,7 @@ _SIDECAR_STEM_TO_ATTR: dict[str, tuple[str, str]] = {
     "quic_packet_recv":  ("quic_packet_recv_df",  "Quic/PacketRecv"),
     "quic_packet_send":  ("quic_packet_send_df",  "Quic/PacketSend"),
     "quic_ack_recv":     ("quic_ack_recv_df",     "Quic/AckReceived"),
-    # Phase B (csharp sidecar): per-opcode kernel-meta parquets. Stems
+    # Phase B (dotnet sidecar): per-opcode kernel-meta parquets. Stems
     # mirror trace_mgmt._DUMPER_EVENT_CLASSES so _rewrite_manifest
     # creates dumper-parquet placeholders for classes the sidecar
     # skipped (zero-event classes). Adapters in this module promote the
@@ -139,7 +139,7 @@ def run_aggregation_worker(
     etl_path: Path,
     trace_id: str,
     *,
-    producer: str = "csharp",
+    producer: str = "dotnet",
 ) -> AggregationResult:
     """Run the Python aggregators against a sidecar staging directory.
 
@@ -155,7 +155,7 @@ def run_aggregation_worker(
         Echoed back for symmetry with the rest of the worker protocol.
     producer:
         Producer name to stamp on the rewritten manifest. Defaults to
-        ``"csharp"`` because that's the only sidecar that exists today,
+        ``"dotnet"`` because that's the only sidecar that exists today,
         but kept parameterized for future Rust / other producers.
 
     Returns
@@ -246,14 +246,14 @@ def run_aggregation_worker(
             )
         # Seed event_counts from the manifest so build_tracestats_text
         # has provider-equivalent rows to render even though we have no
-        # ExtractStats under csharp mode.
+        # ExtractStats under dotnet mode.
         csharp_adapters.populate_event_counts_from_manifest(
             trace, sidecar_manifest
         )
     except Exception as exc:
-        result.warnings.append(f"csharp metadata derivation failed: {exc}")
+        result.warnings.append(f"dotnet metadata derivation failed: {exc}")
         LOGGER.warning(
-            "aggregation_worker: csharp metadata derivation failed: %s",
+            "aggregation_worker: dotnet metadata derivation failed: %s",
             exc,
             exc_info=True,
         )
@@ -490,7 +490,7 @@ def _load_phase_b_images(
     ``build_symbolizer_from_csharp_images`` so the stacks aggregators
     can resolve addresses. Missing parquets are silent no-ops; a
     failed symbolizer build (no native bindings, no rows) is also
-    silent — the existing csharp test path already gracefully falls
+    silent — the existing dotnet test path already gracefully falls
     through when no symbolizer is available.
     """
 
@@ -507,7 +507,7 @@ def _load_phase_b_images(
     try:
         adapters.build_symbolizer_from_csharp_images(trace)
     except Exception as exc:
-        warnings.append(f"csharp symbolizer build failed: {exc}")
+        warnings.append(f"dotnet symbolizer build failed: {exc}")
 
 
 def _load_phase_b_eventtrace_header(
@@ -617,13 +617,13 @@ def _build_trace_from_staging(
         except Exception as exc:
             warnings.append(f"failed to read sysconfig.txt: {exc}")
 
-    # Normalize csharp-sidecar column names so the native aggregators
+    # Normalize dotnet-sidecar column names so the native aggregators
     # (which were written against the in-process worker's ``TimeStamp``
-    # column) see the layout they expect. No-op for non-csharp inputs.
+    # column) see the layout they expect. No-op for non-dotnet inputs.
     try:
         csharp_adapters.normalize_csharp_trace(trace)
     except Exception as exc:
-        warnings.append(f"csharp column normalization failed: {exc}")
+        warnings.append(f"dotnet column normalization failed: {exc}")
 
     return trace
 
@@ -812,7 +812,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--staging-dir", required=True, type=Path)
     parser.add_argument("--etl", required=True, type=Path)
     parser.add_argument("--trace-id", required=True)
-    parser.add_argument("--producer", default="csharp")
+    parser.add_argument("--producer", default="dotnet")
     args = parser.parse_args(argv)
 
     result = run_aggregation_worker(

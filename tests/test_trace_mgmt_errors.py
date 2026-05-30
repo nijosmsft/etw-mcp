@@ -3,7 +3,7 @@
 
 These tests pin the substrings that downstream LLM-driven clients use to
 recover from a failed call. The wording can evolve, but the recovery
-keywords (``list_traces``, ``mode='native'``, ``mode='csharp'``,
+keywords (``list_traces``, ``mode='native'``, ``mode='dotnet'``,
 ``WPR_MCP_MODE``, ``WPR_MCP_CSHARP_SIDECAR``, ``dotnet publish``) MUST
 stay so a client model can pick the next command without round-tripping
 to a human.
@@ -96,7 +96,7 @@ def test_load_trace_xperf_missing_lists_native_and_csharp_alternatives(
     # Both alternative pipelines must be named so the model can pick one.
     assert "mode='native'" in result
     assert "WPR_MCP_MODE=native" in result
-    assert "mode='csharp'" in result
+    assert "mode='dotnet'" in result
     assert "WPR_MCP_CSHARP_SIDECAR" in result
     assert "dotnet publish" in result
 
@@ -148,9 +148,9 @@ def test_native_worker_load_failed_csharp_producer_suggests_rebuild_and_alternat
         invalid_stdout_tail="not-json-blob",
     )
 
-    result = trace_mgmt._native_worker_load_failed(worker_result, producer="csharp")
+    result = trace_mgmt._native_worker_load_failed(worker_result, producer="dotnet")
 
-    assert "C# sidecar ETW worker extraction failed" in result
+    assert ".NET sidecar ETW worker extraction failed" in result
     assert "invalid-stdout: sidecar emitted malformed JSONL" in result
     # Stale-build hint must point at the dotnet publish command and the env var.
     assert "dotnet publish" in result
@@ -170,9 +170,9 @@ def test_native_worker_load_failed_csharp_producer_non_build_failure_omits_rebui
         failure_kind=None,
     )
 
-    result = trace_mgmt._native_worker_load_failed(worker_result, producer="csharp")
+    result = trace_mgmt._native_worker_load_failed(worker_result, producer="dotnet")
 
-    assert "C# sidecar ETW worker extraction failed" in result
+    assert ".NET sidecar ETW worker extraction failed" in result
     assert "cache promotion failed" in result
     assert "dotnet publish" not in result
     # The cross-pipeline fallback hint must still be present.
@@ -213,4 +213,4 @@ def test_resolve_symbols_xperf_missing_explains_relationship_to_load_trace(
     assert "resolve_symbols uses xperf" in result
     # Must tell the user the rest of the server still works without xperf.
     assert "mode='native'" in result
-    assert "mode='csharp'" in result
+    assert "mode='dotnet'" in result

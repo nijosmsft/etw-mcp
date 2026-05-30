@@ -35,7 +35,7 @@ Tolerances (P2 D2):
 
 The test stages two independent copies of the ETL (one per mode) under
 ``tmp_path`` so the side-by-side caches don't collide. The csharp pipeline
-emits ``producer="csharp"`` parquets; the native pipeline emits
+emits ``producer="dotnet"`` parquets; the native pipeline emits
 ``producer="native"``. Both share the v3 manifest schema.
 """
 
@@ -182,7 +182,7 @@ def _assert_within(
     if drift > tolerance:
         errors.append(
             f"{name}: drift {drift * 100:.2f}% exceeds tolerance {tolerance * 100:.0f}%; "
-            f"csharp={c:,} native={n:,}"
+            f"dotnet={c:,} native={n:,}"
         )
 
 
@@ -249,7 +249,7 @@ def test_csharp_vs_native_row_count_parity_real_fixture(
     """
 
     if os.name != "nt":
-        pytest.skip("csharp sidecar is Windows-only")
+        pytest.skip("dotnet sidecar is Windows-only")
 
     from etw_analyzer.native.config import find_csharp_sidecar
 
@@ -278,7 +278,7 @@ def test_csharp_vs_native_row_count_parity_real_fixture(
     # this run only (monkeypatch restores it at teardown).
     monkeypatch.setenv("WPR_MCP_NATIVE_ALLOW_LARGE", "1")
 
-    csharp_dir = tmp_path / "csharp"
+    csharp_dir = tmp_path / "dotnet"
     native_dir = tmp_path / "native"
     csharp_etl = _stage_etl_copy(fixture, csharp_dir)
     native_etl = _stage_etl_copy(fixture, native_dir)
@@ -288,7 +288,7 @@ def test_csharp_vs_native_row_count_parity_real_fixture(
     trace_state.clear_traces()
 
     csharp_trace_id, csharp_counts, csharp_errors, csharp_wall, csharp_rss = _load_via(
-        "csharp", csharp_etl
+        "dotnet", csharp_etl
     )
     native_trace_id, native_counts, native_errors, native_wall, native_rss = _load_via(
         "native", native_etl
@@ -296,7 +296,7 @@ def test_csharp_vs_native_row_count_parity_real_fixture(
 
     drift_table = _format_drift_table(csharp_counts, native_counts)
     print("\n=== csharp vs native row-count drift ===")
-    print(f"csharp wall: {csharp_wall:.1f}s   native wall: {native_wall:.1f}s")
+    print(f"dotnet wall: {csharp_wall:.1f}s   native wall: {native_wall:.1f}s")
     print(drift_table)
     if csharp_errors:
         print("\ncsharp export_errors:")
@@ -325,7 +325,7 @@ def test_csharp_vs_native_row_count_parity_real_fixture(
 
     if failures:
         msg = (
-            "csharp/native parity failed:\n"
+            "dotnet/native parity failed:\n"
             + "\n".join(f"  * {f}" for f in failures)
             + "\n\nrow-count drift table:\n"
             + drift_table

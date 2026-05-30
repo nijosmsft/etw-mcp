@@ -6,7 +6,7 @@ var startTime = Stopwatch.StartNew();
 string phase = "reading-request";
 long eventsAtFailure = 0;
 const string ProducerVersion = "0.1.0-spike";
-const string Producer = "csharp";
+const string Producer = "dotnet";
 
 void EmitFailure(string failureKind, string error, string? tracebackTail = null)
 {
@@ -67,7 +67,7 @@ try
 }
 catch (Exception ex)
 {
-    EmitFailure("csharp_exception", ex.Message, ex.StackTrace);
+    EmitFailure("dotnet_exception", ex.Message, ex.StackTrace);
     return 1;
 }
 
@@ -87,7 +87,7 @@ try
 }
 catch (Exception ex)
 {
-    EmitFailure("csharp_exception", ex.Message, ex.StackTrace);
+    EmitFailure("dotnet_exception", ex.Message, ex.StackTrace);
     return 1;
 }
 
@@ -131,12 +131,12 @@ try
 }
 catch (InvalidOperationException ex) when (req.PanicProbe == "open_trace_panic")
 {
-    EmitFailure("csharp_exception", ex.Message, ex.StackTrace);
+    EmitFailure("dotnet_exception", ex.Message, ex.StackTrace);
     return 1;
 }
 catch (Exception ex)
 {
-    EmitFailure("csharp_exception", ex.Message, ex.StackTrace);
+    EmitFailure("dotnet_exception", ex.Message, ex.StackTrace);
     return 1;
 }
 
@@ -171,7 +171,7 @@ try
 catch (Exception ex)
 {
     eventsAtFailure = runner.Collector.EventsDecoded;
-    EmitFailure("csharp_exception", $"{ex.GetType().Name}: {ex.Message}", ex.StackTrace);
+    EmitFailure("dotnet_exception", $"{ex.GetType().Name}: {ex.Message}", ex.StackTrace);
     // Defense in depth: don't leave .tmp files behind.
     try
     {
@@ -369,8 +369,8 @@ catch (Exception ex)
     var kind = phase switch
     {
         "writing-parquet" => "parquet-error",
-        "writing-manifest" => req.PanicProbe == "manifest_write_panic" ? "csharp_exception" : "manifest-error",
-        _ => "csharp_exception",
+        "writing-manifest" => req.PanicProbe == "manifest_write_panic" ? "dotnet_exception" : "manifest-error",
+        _ => "dotnet_exception",
     };
     EmitFailure(kind, $"{ex.GetType().Name}: {ex.Message}", ex.StackTrace);
     return 1;

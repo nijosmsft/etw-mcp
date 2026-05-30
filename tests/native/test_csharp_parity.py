@@ -30,7 +30,7 @@ from etw_analyzer.native import cache as native_cache
 
 
 def _make_etl(tmp_path: Path) -> Path:
-    etl = tmp_path / "csharp_parity.etl"
+    etl = tmp_path / "dotnet_parity.etl"
     etl.write_bytes(b"synthetic csharp parity etl")
     return etl
 
@@ -144,7 +144,7 @@ def _seed_csharp_staging(
         ),
     ]
     manifest = native_cache.CacheManifest.materialized_small(
-        etl, datasets, producer="csharp",
+        etl, datasets, producer="dotnet",
     )
     native_cache.write_manifest(staging_dir, manifest)
 
@@ -191,7 +191,7 @@ class TestDeriveMetadataFromSidecar:
         )
         trace.dumper_df = _make_sampled_profile(rows=20, cpu_count=8)
         manifest = native_cache.CacheManifest.materialized_small(
-            _seed_etl(tmp_path), [], producer="csharp",
+            _seed_etl(tmp_path), [], producer="dotnet",
         )
         meta = adapters.derive_metadata_from_sidecar(trace, manifest)
         assert meta.cpu_count == 8
@@ -210,7 +210,7 @@ class TestDeriveMetadataFromSidecar:
             "CPU": [0, 1],
         })
         manifest = native_cache.CacheManifest.materialized_small(
-            _seed_etl(tmp_path), [], producer="csharp",
+            _seed_etl(tmp_path), [], producer="dotnet",
         )
         meta = adapters.derive_metadata_from_sidecar(trace, manifest)
         assert meta.duration_seconds == pytest.approx(2.0)
@@ -226,7 +226,7 @@ class TestDeriveMetadataFromSidecar:
             {"TimeStampQpc": [100, 100], "CPU": [0, 0]},
         )
         manifest = native_cache.CacheManifest.materialized_small(
-            _seed_etl(tmp_path), [], producer="csharp",
+            _seed_etl(tmp_path), [], producer="dotnet",
         )
         meta = adapters.derive_metadata_from_sidecar(trace, manifest)
         assert meta.duration_seconds is None
@@ -277,7 +277,7 @@ class TestBuildTraceMetadataDataframe:
             etl=native_cache.EtlIdentity(
                 path="x", name="x", size=1, mtime_ns=0,
             ),
-            datasets=[], producer="csharp",
+            datasets=[], producer="dotnet",
         )
         df = adapters.build_trace_metadata_dataframe(meta, manifest)
         expected_cols = {
@@ -310,7 +310,7 @@ class TestPopulateEventCountsFromManifest:
             ),
         ]
         manifest = native_cache.CacheManifest.materialized_small(
-            _seed_etl(tmp_path), datasets, producer="csharp",
+            _seed_etl(tmp_path), datasets, producer="dotnet",
         )
         adapters.populate_event_counts_from_manifest(trace, manifest)
         assert trace.event_counts["sampled_profile"] == 1234
@@ -331,7 +331,7 @@ class TestPopulateEventCountsFromManifest:
             ),
         ]
         manifest = native_cache.CacheManifest.materialized_small(
-            _seed_etl(tmp_path), datasets, producer="csharp",
+            _seed_etl(tmp_path), datasets, producer="dotnet",
         )
         adapters.populate_event_counts_from_manifest(trace, manifest)
         assert trace.event_counts["sampled_profile"] == 42

@@ -83,7 +83,7 @@ def _seed_sidecar_staging(staging_dir: Path, etl: Path) -> None:
     manifest = native_cache.CacheManifest.materialized_small(
         etl,
         datasets,
-        producer="csharp",
+        producer="dotnet",
     )
     native_cache.write_manifest(staging_dir, manifest)
 
@@ -103,7 +103,7 @@ def test_run_aggregation_worker_against_csharp_staging(tmp_path: Path):
     loaded = native_cache.read_manifest(staging)
     assert loaded is not None
     assert loaded.schema_version == 3
-    assert loaded.producer == "csharp"
+    assert loaded.producer == "dotnet"
     assert loaded.complete is True
     # The sidecar-original datasets must still be there.
     names = {d.name for d in loaded.datasets}
@@ -163,7 +163,7 @@ def test_run_aggregation_worker_missing_manifest(tmp_path: Path):
 
 
 def test_run_aggregation_worker_preserves_csharp_producer_in_rewrite(tmp_path: Path):
-    """The rewritten manifest must keep producer='csharp' when that's input."""
+    """The rewritten manifest must keep producer='dotnet' when that's input."""
 
     etl = _make_etl(tmp_path)
     staging = tmp_path / "staging"
@@ -173,14 +173,14 @@ def test_run_aggregation_worker_preserves_csharp_producer_in_rewrite(tmp_path: P
         staging,
         etl,
         trace_id="trace_producer_check",
-        producer="csharp",
+        producer="dotnet",
     )
     assert result.ok is True
 
     raw = json.loads(
         (staging / native_cache.MANIFEST_FILENAME).read_text("utf-8")
     )
-    assert raw["producer"] == "csharp"
+    assert raw["producer"] == "dotnet"
     assert raw["schema_version"] == 3
 
 

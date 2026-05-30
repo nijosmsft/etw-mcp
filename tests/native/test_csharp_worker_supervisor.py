@@ -68,7 +68,7 @@ def _seed_sidecar_outputs(staging_dir: Path, etl: Path) -> None:
                 materialize_on_load=True,
             ),
         ],
-        producer="csharp",
+        producer="dotnet",
     )
     native_cache.write_manifest(staging_dir, manifest)
 
@@ -141,7 +141,7 @@ def test_run_csharp_worker_success_promotes_to_export_dir(
             ok=True,
             message="sidecar fake ok",
             result={"type": "result", "ok": True, "trace_id": trace_id,
-                    "producer": "csharp"},
+                    "producer": "dotnet"},
         )
 
     result = worker_supervisor.run_csharp_worker_extraction(
@@ -159,10 +159,10 @@ def test_run_csharp_worker_success_promotes_to_export_dir(
     # Sidecar staging dir got promoted (so it no longer exists at the
     # original path).
     assert seen["staging"] and not seen["staging"].exists()
-    # Manifest must round-trip with producer='csharp'.
+    # Manifest must round-trip with producer='dotnet'.
     loaded = native_cache.read_manifest(export_dir)
     assert loaded is not None
-    assert loaded.producer == "csharp"
+    assert loaded.producer == "dotnet"
 
 
 def test_run_csharp_worker_sidecar_failure_leaves_staging_for_debug(
@@ -180,7 +180,7 @@ def test_run_csharp_worker_sidecar_failure_leaves_staging_for_debug(
         return worker_supervisor.NativeWorkerResult(
             ok=False,
             message="sidecar crashed",
-            failure_kind="csharp_exception",
+            failure_kind="dotnet_exception",
         )
 
     result = worker_supervisor.run_csharp_worker_extraction(
@@ -193,7 +193,7 @@ def test_run_csharp_worker_sidecar_failure_leaves_staging_for_debug(
         process_runner=fake_runner,
     )
     assert result.ok is False
-    assert result.failure_kind == "csharp_exception"
+    assert result.failure_kind == "dotnet_exception"
     # Per spike-contract §11 phase 0: staging is NOT deleted on failure.
     assert seen["staging"].exists()
     assert not export_dir.exists()
@@ -329,7 +329,7 @@ def test_run_csharp_process_parses_heartbeat_progress_result(tmp_path: Path):
                 '{"type":"heartbeat","time":1.0,"phase":"opening-trace"}\n',
                 '{"type":"progress","time":2.0,"phase":"decoding",'
                 '"events_decoded":42,"stacks_paired":10,"bytes_processed":99}\n',
-                '{"type":"result","time":3.0,"ok":true,"producer":"csharp",'
+                '{"type":"result","time":3.0,"ok":true,"producer":"dotnet",'
                 '"trace_id":"t","staging_dir":"' + str(tmp_path).replace("\\", "\\\\")
                 + '","strategy":"materialized-small","manifest":"x.json",'
                 '"datasets":["sampled_profile"]}\n',
@@ -345,7 +345,7 @@ def test_run_csharp_process_parses_heartbeat_progress_result(tmp_path: Path):
     assert any(p.get("type") == "heartbeat" for p in result.progress)
     assert any(p.get("type") == "progress" for p in result.progress)
     assert result.result is not None
-    assert result.result["producer"] == "csharp"
+    assert result.result["producer"] == "dotnet"
 
 
 def test_run_csharp_process_structured_failure_surfaces_kind(tmp_path: Path):
@@ -356,7 +356,7 @@ def test_run_csharp_process_structured_failure_surfaces_kind(tmp_path: Path):
     def fake_popen(command, **_):
         return _FakeProcess(
             stdout_lines=[
-                '{"type":"result","time":1.0,"ok":false,"producer":"csharp",'
+                '{"type":"result","time":1.0,"ok":false,"producer":"dotnet",'
                 '"failure_kind":"etl-too-large","error":"etl too big",'
                 '"phase_at_failure":"reading-request"}\n',
             ],

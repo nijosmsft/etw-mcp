@@ -9,7 +9,7 @@ The resolution order is documented in the design doc §8.1:
        subset for common analysis).
 
 When ``"auto"`` is requested, the resolved mode is computed by probing
-each backend in preference order: ``"csharp"`` wins when the C# sidecar
+each backend in preference order: ``"dotnet"`` wins when the .NET sidecar
 binary is locatable (see :func:`find_csharp_sidecar`), then ``"native"``
 when the in-process ETW consumer loads, and finally ``"xperf"`` as the
 universally-available fallback. The auto-detect result is cached for the
@@ -20,7 +20,7 @@ providers and aggregations.
 When ``"native"`` is requested explicitly but the consumer is not
 available (e.g. running on a non-Windows host, or ``tdh.dll`` failed
 to load), :func:`resolve_mode` raises ``RuntimeError``. When
-``"csharp"`` is requested explicitly but the sidecar binary is not
+``"dotnet"`` is requested explicitly but the sidecar binary is not
 locatable, :func:`resolve_mode` raises ``ValueError`` naming the
 ``WPR_MCP_CSHARP_SIDECAR`` override. Auto silently falls back along the
 chain in the same situation — the contract is "explicit wins over
@@ -34,7 +34,7 @@ from pathlib import Path
 from typing import Optional
 
 
-VALID_MODES = frozenset({"xperf", "native", "csharp", "auto"})
+VALID_MODES = frozenset({"xperf", "native", "dotnet", "auto"})
 DEFAULT_NATIVE_MAX_ETL_MB = 512.0
 NATIVE_MAX_ETL_MB_ENV = "WPR_MCP_NATIVE_MAX_ETL_MB"
 NATIVE_ALLOW_LARGE_ENV = "WPR_MCP_NATIVE_ALLOW_LARGE"
@@ -43,8 +43,8 @@ CSHARP_SIDECAR_EXE = "wpr-mcp-extract.exe"
 
 
 # Cache the auto-detect result so we don't pay the ``OpenTraceW`` probe
-# or the C# sidecar path lookup more than once per process. Set to
-# ``None`` while undetermined, then ``"csharp"``, ``"native"`` or
+# or the .NET sidecar path lookup more than once per process. Set to
+# ``None`` while undetermined, then ``"dotnet"``, ``"native"`` or
 # ``"xperf"`` once resolved.
 _AUTO_CACHED: Optional[str] = None
 _CSHARP_SIDECAR_CACHED: Optional[Path] = None
@@ -203,11 +203,11 @@ def resolve_mode(
     if candidate == "auto":
         if _AUTO_CACHED is not None:
             return _AUTO_CACHED
-        # Preferred order: csharp → native → xperf. Auto-detect uses the
-        # conservative csharp lookup (env var + PATH only), so a stray
-        # in-tree publish build does not flip the default pipeline.
+        # Preferred order: dotnet → native → xperf. Auto-detect uses the
+        # conservative .NET sidecar lookup (env var + PATH only), so a
+        # stray in-tree publish build does not flip the default pipeline.
         if find_csharp_sidecar(auto_detect=True) is not None:
-            _AUTO_CACHED = "csharp"
+            _AUTO_CACHED = "dotnet"
             return _AUTO_CACHED
         try:
             from .consumer import is_available
@@ -220,17 +220,17 @@ def resolve_mode(
             _AUTO_CACHED = "xperf"
         return _AUTO_CACHED
 
-    if candidate == "csharp":
-        # Explicit csharp request — fail loudly when the binary cannot
+    if candidate == "dotnet":
+        # Explicit dotnet request — fail loudly when the binary cannot
         # be located so the caller knows to install/publish the sidecar
         # rather than silently falling through to a different pipeline.
         if find_csharp_sidecar() is None:
             raise ValueError(
-                "mode='csharp' was requested but the C# sidecar binary "
+                "mode='dotnet' was requested but the .NET sidecar binary "
                 f"({CSHARP_SIDECAR_EXE}) could not be located. Set the "
                 f"{CSHARP_SIDECAR_ENV} environment variable to the absolute "
                 "path of the built binary, publish it under "
-                "csharp/publish/win-x64/ in the repo, or add it to PATH. "
+                "dotnet/publish/win-x64/ in the repo, or add it to PATH. "
                 "Use mode='native' or mode='xperf' to bypass the sidecar."
             )
         return candidate
@@ -303,14 +303,14 @@ def _native_was_forced(arg_mode: Optional[str]) -> bool:
 def _csharp_was_forced(arg_mode: Optional[str]) -> bool:
     if arg_mode:
         normalized_arg = normalize_mode(arg_mode)
-        if normalized_arg == "csharp":
+        if normalized_arg == "dotnet":
             return True
         if normalized_arg != "auto":
             return False
 
     env_mode = os.environ.get("WPR_MCP_MODE")
     if env_mode:
-        return normalize_mode(env_mode) == "csharp"
+        return normalize_mode(env_mode) == "dotnet"
     return False
 
 

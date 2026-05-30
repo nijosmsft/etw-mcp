@@ -58,5 +58,5 @@ markers = [
     "network: tests that require network access. Run with: pytest --run-network",
     "benchmark: tests that measure performance. Run with: pytest --run-benchmark",
     "live: tests that attach to live systems or processes. Run with: pytest --run-live",
-    "parity: csharp-vs-native cross-producer parity tests. Run with: pytest --run-parity",
+    "parity: dotnet-vs-native cross-producer parity tests. Run with: pytest --run-parity",
 ]

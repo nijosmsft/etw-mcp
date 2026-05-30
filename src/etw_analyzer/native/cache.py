@@ -20,7 +20,7 @@ DEFAULT_GENERATION_PATH = "."
 
 # Allowed values for the schema-v3 ``producer`` field. Anything else is
 # treated as a malformed manifest and rejected.
-VALID_PRODUCERS = frozenset({"csharp", "native", "xperf"})
+VALID_PRODUCERS = frozenset({"dotnet", "native", "xperf"})
 DEFAULT_LEGACY_PRODUCER = "native"
 
 
@@ -366,7 +366,7 @@ def validate_manifest(
         )
     if manifest.complete is not True:
         raise NativeCacheError("native cache manifest is incomplete")
-    # All producers (csharp, native, xperf) emit Unix-epoch ``st_mtime_ns``
+    # All producers (dotnet, native, xperf) emit Unix-epoch ``st_mtime_ns``
     # so the identity check is uniform — the strict three-field match
     # catches both content swaps and in-place edits.
     if not manifest.etl.matches(etl_path):

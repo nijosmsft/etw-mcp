@@ -270,7 +270,7 @@ def _seed_phase_b_staging(
         ))
 
     manifest = native_cache.CacheManifest.materialized_small(
-        etl, datasets, producer="csharp",
+        etl, datasets, producer="dotnet",
     )
     native_cache.write_manifest(staging_dir, manifest)
 
@@ -1118,7 +1118,7 @@ class TestPhaseBStacks:
             row_count=1, materialize_on_load=True,
         ))
         new_manifest = native_cache.CacheManifest.materialized_small(
-            etl, datasets, producer="csharp",
+            etl, datasets, producer="dotnet",
         )
         native_cache.write_manifest(staging, new_manifest)
 
@@ -1162,7 +1162,7 @@ class TestPhaseBStacks:
         native_cache.write_manifest(
             staging,
             native_cache.CacheManifest.materialized_small(
-                etl, datasets, producer="csharp",
+                etl, datasets, producer="dotnet",
             ),
         )
         aggregation_worker.run_aggregation_worker(
@@ -1230,7 +1230,7 @@ class TestBuildTraceMetadataDataframeWithHeader:
             schema_version=3, mode="native", strategy="materialized-small",
             complete=True,
             etl=native_cache.EtlIdentity(path="x", name="x", size=1, mtime_ns=0),
-            datasets=[], producer="csharp",
+            datasets=[], producer="dotnet",
         )
         header = _make_eventtrace_header(
             perf_freq=10_000_000, cpu_count=80,
@@ -1255,7 +1255,7 @@ class TestBuildTraceMetadataDataframeWithHeader:
             schema_version=3, mode="native", strategy="materialized-small",
             complete=True,
             etl=native_cache.EtlIdentity(path="x", name="x", size=1, mtime_ns=0),
-            datasets=[], producer="csharp",
+            datasets=[], producer="dotnet",
         )
         df = adapters.build_trace_metadata_dataframe(meta, manifest)
         assert int(df.iloc[0]["StartTime"]) == 0
@@ -1285,7 +1285,7 @@ class TestPhaseBTraceMetadataUpgrade:
         native_cache.write_manifest(
             staging,
             native_cache.CacheManifest.materialized_small(
-                etl, datasets, producer="csharp",
+                etl, datasets, producer="dotnet",
             ),
         )
         result = aggregation_worker.run_aggregation_worker(
@@ -1355,7 +1355,7 @@ class TestPhaseBTraceMetadataUpgrade:
         native_cache.write_manifest(
             staging,
             native_cache.CacheManifest.materialized_small(
-                etl, datasets, producer="csharp",
+                etl, datasets, producer="dotnet",
             ),
         )
 
@@ -1436,7 +1436,7 @@ class TestPhaseBRawCsvParity:
         native_cache.write_manifest(
             staging,
             native_cache.CacheManifest.materialized_small(
-                etl, datasets, producer="csharp",
+                etl, datasets, producer="dotnet",
             ),
         )
 

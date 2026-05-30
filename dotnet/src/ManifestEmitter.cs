@@ -43,7 +43,7 @@ internal static class ManifestEmitter
         {
             schema_version = 3,
             mode = "native",
-            producer = "csharp",
+            producer = "dotnet",
             strategy,
             complete,
             etl = new

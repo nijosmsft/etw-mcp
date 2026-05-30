@@ -4,9 +4,9 @@ Mirrors tests/test_trace_mgmt_worker.py for the native worker. Stubs the
 sidecar supervisor (worker_supervisor.run_csharp_worker_extraction) and
 asserts that load_trace correctly:
 
-* dispatches to the csharp worker when ``mode="csharp"`` (or
-  ``WPR_MCP_MODE=csharp``) is in effect,
-* registers the loaded trace with ``trace.mode == "csharp"`` and the
+* dispatches to the csharp worker when ``mode="dotnet"`` (or
+  ``WPR_MCP_mode=dotnet``) is in effect,
+* registers the loaded trace with ``trace.mode == "dotnet"`` and the
   expected raw_csv contents,
 * falls back along the documented ``csharp → native → xperf`` chain when
   the csharp pipeline fails under auto resolution, and
@@ -65,7 +65,7 @@ def _cpu_sampling(cache: Path, weight: int) -> pd.DataFrame:
 
 
 def _write_csharp_cache(cache: Path, etl: Path, weight: int) -> None:
-    """Write a v3 manifest with producer='csharp' alongside fake parquets.
+    """Write a v3 manifest with producer='dotnet' alongside fake parquets.
 
     The csharp sidecar emits all canonical dumper stems even when empty, so
     we mirror that here. cpu_sampling carries the weight value the assertion
@@ -96,7 +96,7 @@ def _write_csharp_cache(cache: Path, etl: Path, weight: int) -> None:
     manifest = native_cache.CacheManifest.materialized_small(
         etl,
         datasets,
-        producer="csharp",
+        producer="dotnet",
     )
     native_cache.write_manifest(cache, manifest)
 
@@ -136,11 +136,11 @@ def test_load_trace_csharp_worker_success_loads_promoted_cache(
         worker_supervisor, "run_csharp_worker_extraction", fake_worker
     )
 
-    result = trace_mgmt.load_trace(str(etl), mode="csharp")
+    result = trace_mgmt.load_trace(str(etl), mode="dotnet")
 
     trace = get_trace(_trace_id(result))
     assert trace is not None, result
-    assert trace.mode == "csharp"
+    assert trace.mode == "dotnet"
     assert trace.raw_csv["cpu_sampling"]["Weight"].tolist() == [91]
 
 
@@ -183,7 +183,7 @@ def test_load_trace_auto_picks_csharp_when_sidecar_is_configured(
 
     trace = get_trace(_trace_id(result))
     assert trace is not None, result
-    assert trace.mode == "csharp"
+    assert trace.mode == "dotnet"
 
 
 def test_auto_csharp_failure_falls_back_to_native_worker(
@@ -251,7 +251,7 @@ def test_auto_csharp_failure_falls_back_to_native_worker(
 
     result = trace_mgmt.load_trace(str(etl))
 
-    assert "C# sidecar failed; falling back to mode='native'" in result
+    assert ".NET sidecar failed; falling back to mode='native'" in result
     trace = get_trace(_trace_id(result))
     assert trace is not None
     assert trace.mode == "native"
@@ -293,9 +293,9 @@ def test_explicit_csharp_failure_does_not_fallback_or_register(
         lambda *args, **kwargs: pytest.fail("xperf fallback must not run when csharp is forced"),
     )
 
-    result = trace_mgmt.load_trace(str(etl), mode="csharp")
+    result = trace_mgmt.load_trace(str(etl), mode="dotnet")
 
-    assert "C# sidecar ETW worker extraction failed" in result
+    assert ".NET sidecar ETW worker extraction failed" in result
     assert "timeout: synthetic csharp sidecar failure" in result
     assert "bounded stderr" in result
     # Producer-aware fallback hints must name both alternative pipelines so

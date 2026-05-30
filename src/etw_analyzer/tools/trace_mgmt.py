@@ -89,18 +89,18 @@ def load_trace(
         force: Delete cached exports and re-run xperf. Default: False.
         mode: Pipeline used to load the trace.
               ``"auto"`` (default — Phase N5) walks the documented
-              fallback chain ``csharp → native → xperf``: the C# sidecar
+              fallback chain ``dotnet → native → xperf``: the .NET sidecar
               when the ``WPR_MCP_CSHARP_SIDECAR`` env var is set (or
               ``wpr-mcp-extract.exe`` is on PATH), then the in-process
               ``OpenTraceW`` consumer when its bindings load, then the
               legacy text-based ``xperf -a dumper`` as the universal
-              opt-out. ``"csharp"`` forces the C# sidecar and raises if
+              opt-out. ``"dotnet"`` forces the .NET sidecar and raises if
               the binary is unfindable (naming the env var override).
               ``"native"`` forces the in-process consumer and raises if
               it's unavailable. ``"xperf"`` forces the legacy pipeline.
               The ``WPR_MCP_MODE`` environment variable overrides this
               arg when the arg is left at its default. The native and
-              csharp pipelines are fast paths for a curated event /
+              dotnet pipelines are fast paths for a curated event /
               aggregation subset; use ``mode="xperf"`` for broadest
               coverage.
     """
@@ -182,12 +182,12 @@ def load_trace(
         import shutil
         shutil.rmtree(export_dir)
 
-    # Native mode skips xperf entirely. csharp mode also skips xperf — the
+    # Native mode skips xperf entirely. dotnet mode also skips xperf — the
     # sidecar does the decode. Without xperf installed we still try the cache
     # and the alternative pipelines; if neither works we fall through to the
     # "xperf.exe not found" error at the bottom of this block.
     xperf = find_xperf()
-    if xperf is None and resolved_mode not in ("native", "csharp"):
+    if xperf is None and resolved_mode not in ("native", "dotnet"):
         prefix = f"{guardrail_notice}\n\n" if guardrail_notice else ""
         return prefix + (
             "xperf.exe not found. Install Windows Performance Toolkit "
@@ -196,10 +196,10 @@ def load_trace(
             "Alternatives that do not need xperf:\n"
             "  - Pass mode='native' (or set WPR_MCP_MODE=native) to use the "
             "in-process ETW consumer when its bindings load on this host.\n"
-            "  - Build the C# sidecar (cd csharp && dotnet publish -c Release "
+            "  - Build the .NET sidecar (cd dotnet && dotnet publish -c Release "
             "-r win-x64 --self-contained), set WPR_MCP_CSHARP_SIDECAR to the "
-            "published wpr-mcp-extract.exe path, and pass mode='csharp' (or "
-            "set WPR_MCP_MODE=csharp)."
+            "published wpr-mcp-extract.exe path, and pass mode='dotnet' (or "
+            "set WPR_MCP_MODE=dotnet)."
         )
 
     # Check if we can skip re-export (cached parquet/csv files exist and are newer than ETL)
@@ -238,12 +238,12 @@ def load_trace(
         export_dir=export_dir,
     )
 
-    if resolved_mode == "csharp":
+    if resolved_mode == "dotnet":
         _telemetry.emit_with(
             _telemetry.EVENT_LOAD_DISPATCH,
             mode=resolved_mode,
             trace_id=make_trace_id(path),
-            dispatch="csharp_worker",
+            dispatch="dotnet_worker",
         )
         worker_result = _load_csharp_with_worker(
             path,
@@ -251,7 +251,7 @@ def load_trace(
             sym_path,
         )
         if worker_result.ok:
-            cached = _load_from_cache(export_dir, path, mode="csharp")
+            cached = _load_from_cache(export_dir, path, mode="dotnet")
             if cached is not None:
                 if worker_result.aggregation_warnings:
                     load_notices.extend(worker_result.aggregation_warnings)
@@ -259,21 +259,21 @@ def load_trace(
                     path,
                     export_dir,
                     sym_path,
-                    "csharp",
+                    "dotnet",
                     cached,
                     load_notices,
                     from_cache=False,
                 )
                 _telemetry.emit_with(
                     _telemetry.EVENT_LOAD_COMPLETE,
-                    mode="csharp",
+                    mode="dotnet",
                     trace_id=make_trace_id(path),
                     wall_seconds=time.monotonic() - _load_start_monotonic,
                     from_cache=False,
                 )
                 return result
             worker_result.message = (
-                "csharp sidecar completed but the promoted cache could not be loaded"
+                "dotnet sidecar completed but the promoted cache could not be loaded"
             )
             try:
                 import shutil
@@ -282,14 +282,14 @@ def load_trace(
                 pass
 
         if csharp_was_forced:
-            return _native_worker_load_failed(worker_result, producer="csharp")
+            return _native_worker_load_failed(worker_result, producer="dotnet")
 
-        # Auto-resolved csharp failed; fall back along the documented
-        # chain csharp → native → xperf. Drop to native first when its
+        # Auto-resolved dotnet failed; fall back along the documented
+        # chain dotnet → native → xperf. Drop to native first when its
         # worker is enabled, otherwise straight to xperf.
         if _native_worker_enabled():
             load_notices.append(
-                "C# sidecar failed; falling back to mode='native': "
+                ".NET sidecar failed; falling back to mode='native': "
                 f"{worker_result.message}"
             )
             resolved_mode = "native"
@@ -306,7 +306,7 @@ def load_trace(
                 )
         elif xperf is not None:
             load_notices.append(
-                "C# sidecar failed; falling back to mode='xperf': "
+                ".NET sidecar failed; falling back to mode='xperf': "
                 f"{worker_result.message}"
             )
             resolved_mode = "xperf"
@@ -322,7 +322,7 @@ def load_trace(
                     from_cache=True,
                 )
         else:
-            return _native_worker_load_failed(worker_result, producer="csharp")
+            return _native_worker_load_failed(worker_result, producer="dotnet")
 
     if resolved_mode == "native" and _native_worker_enabled():
         _telemetry.emit_with(
@@ -540,7 +540,7 @@ def _register_cached_trace(
             dumper_stems=frozenset(),
         )
     streaming_store = (
-        resolved_mode in ("native", "csharp")
+        resolved_mode in ("native", "dotnet")
         and trace.event_store is not None
         and _is_streaming_event_store_cache(export_dir)
     )
@@ -551,8 +551,8 @@ def _register_cached_trace(
                 "Native streaming event-store cache loaded; some low-risk "
                 "aggregate datasets are not present: " + ", ".join(missing)
             )
-    elif resolved_mode != "csharp":
-        # csharp caches were already populated by the sidecar +
+    elif resolved_mode != "dotnet":
+        # dotnet caches were already populated by the sidecar +
         # aggregation_worker; no background xperf dumper pass is needed.
         _start_background_dumper(trace)
     if resolved_mode == "native" and not streaming_store:
@@ -575,7 +575,7 @@ def _open_native_event_store_from_cache(
 ):
     """Open the optional chunked event store referenced by a native v2 cache."""
 
-    if mode not in ("native", "csharp"):
+    if mode not in ("native", "dotnet"):
         return None
     manifest_data = _read_cache_manifest(export_dir)
     if manifest_data is None or not _is_native_v2_manifest(manifest_data):
@@ -691,8 +691,8 @@ def _native_worker_load_failed(worker_result, *, producer: str = "native") -> st
     if invalid_tail:
         detail = f"{detail}\n\nInvalid worker stdout tail:\n{invalid_tail[-2000:]}"
 
-    if producer == "csharp":
-        # The csharp sidecar can fail for build-incompatibility reasons that
+    if producer == "dotnet":
+        # The dotnet sidecar can fail for build-incompatibility reasons that
         # mode='native' / mode='xperf' will not hit. Surface the rebuild hint
         # alongside the standard fallback suggestion so callers do not stay
         # stuck on a stale binary.
@@ -700,13 +700,13 @@ def _native_worker_load_failed(worker_result, *, producer: str = "native") -> st
         if failure_kind in {"invalid-stdout", "invalid-jsonl", "exit-code"}:
             rebuild_hint = (
                 "\n\nThe sidecar binary may be a stale build. Rebuild with "
-                "`cd csharp && dotnet publish -c Release -r win-x64 "
+                "`cd dotnet && dotnet publish -c Release -r win-x64 "
                 "--self-contained` and retry. If WPR_MCP_CSHARP_SIDECAR "
                 "points at an old install, update it to the newly-published "
                 "wpr-mcp-extract.exe."
             )
         return (
-            "C# sidecar ETW worker extraction failed: "
+            ".NET sidecar ETW worker extraction failed: "
             f"{detail}{rebuild_hint}\n\n"
             "No trace was loaded. Use mode='native' or mode='xperf' to "
             "bypass the sidecar (the cache is shared, so a successful run "
@@ -813,7 +813,7 @@ _DUMPER_EVENT_CLASSES: dict[str, tuple[str, str]] = {
     "Quic/PacketRecv":        ("quic_packet_recv_df",  "quic_packet_recv"),
     "Quic/PacketSend":        ("quic_packet_send_df",  "quic_packet_send"),
     "Quic/AckReceived":       ("quic_ack_recv_df",     "quic_ack_recv"),
-    # Phase B (csharp sidecar): per-opcode kernel-meta event classes.
+    # Phase B (dotnet sidecar): per-opcode kernel-meta event classes.
     # Names and stem mappings come verbatim from Track P1's handoff in
     # ``manager-log/phase-b-sidecar-status.md`` ("Stem-name additions to
     # _DUMPER_EVENT_CLASSES"). The sidecar consumes this dict via
@@ -1514,9 +1514,9 @@ _PARQUET_EXCLUDED = frozenset({
     "quic_packet_recv",
     "quic_packet_send",
     "quic_ack_recv",
-    # Phase B csharp-sidecar per-opcode kernel-meta parquets. Loaded into
+    # Phase B dotnet-sidecar per-opcode kernel-meta parquets. Loaded into
     # dedicated trace.<class>_df attributes via _DUMPER_EVENT_CLASSES, then
-    # adapted into raw_csv under canonical event-class names by the csharp
+    # adapted into raw_csv under canonical event-class names by the dotnet
     # aggregation worker. The glob skip avoids a duplicate stem entry in
     # raw_csv that would shadow the adapter-normalized canonical keys.
     "perfinfo_dpc",
@@ -1548,14 +1548,14 @@ _CACHE_SCHEMA_VERSION = 1
 
 # Datasets that MUST be present (and load successfully) for a cache to be
 # considered usable. Xperf needs cpu_sampling as the historical floor. Native
-# and csharp can have traces with no sampled-profile rows, so completeness is
-# tracked by the per-event parquet set in the manifest instead. csharp shares
+# and dotnet can have traces with no sampled-profile rows, so completeness is
+# tracked by the per-event parquet set in the manifest instead. dotnet shares
 # the native cache shape (the producer field on the v3 manifest carries the
 # distinction).
 _CACHE_REQUIRED_DATASETS_BY_MODE = {
     "xperf": frozenset({"cpu_sampling"}),
     "native": frozenset(),
-    "csharp": frozenset(),
+    "dotnet": frozenset(),
 }
 
 # Legacy exports may have written .csv instead of .parquet for the original
@@ -1611,7 +1611,7 @@ def _is_native_v2_manifest(manifest: dict) -> bool:
 
     The name predates schema v3 — it now matches any schema version listed
     in :data:`etw_analyzer.native.cache.SUPPORTED_SCHEMA_VERSIONS`. Both
-    v2 (legacy) and v3 (csharp/native producer split) caches qualify; the
+    v2 (legacy) and v3 (dotnet/native producer split) caches qualify; the
     cache loader does the producer-specific translation downstream.
     """
 
@@ -1625,7 +1625,7 @@ def _is_native_v2_manifest(manifest: dict) -> bool:
 
 
 def _required_dumper_stems_for_mode(mode: str) -> frozenset[str]:
-    if mode in ("native", "csharp"):
+    if mode in ("native", "dotnet"):
         return frozenset(stem for _, stem in _DUMPER_EVENT_CLASSES.values())
     return frozenset()
 
@@ -1992,11 +1992,11 @@ def _load_from_cache(
 
     manifest = _read_cache_manifest(export_dir)
     if manifest is not None and _is_native_v2_manifest(manifest):
-        # csharp and native share the on-disk cache shape (csharp writes
+        # dotnet and native share the on-disk cache shape (dotnet writes
         # mode="native" into the manifest). When the caller asks for
-        # mode="csharp", validate against the manifest's intrinsic mode
+        # mode="dotnet", validate against the manifest's intrinsic mode
         # but keep the requested mode visible to the rest of the loader.
-        manifest_mode = "native" if mode == "csharp" else mode
+        manifest_mode = "native" if mode == "dotnet" else mode
         return _load_native_v2_from_cache(
             export_dir, etl_path, manifest_mode, manifest
         )
@@ -2516,7 +2516,7 @@ def _resolve_symbols_impl(trace_id: str, modules: str | None) -> str:
             "SDK/ADK) or add it to PATH.\n\n"
             "Expected at: C:\\Program Files (x86)\\Windows Kits\\10\\Windows Performance Toolkit\\xperf.exe\n\n"
             "Note: load_trace itself can run under mode='native' or "
-            "mode='csharp' without xperf, but symbol resolution still "
+            "mode='dotnet' without xperf, but symbol resolution still "
             "requires xperf today."
         )
 

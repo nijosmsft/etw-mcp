@@ -125,12 +125,12 @@ def test_manifest_writer_accepts_csharp_producer(tmp_path: Path):
                 materialize_on_load=True,
             )
         ],
-        producer="csharp",
+        producer="dotnet",
     )
     native_cache.write_manifest(export_dir, manifest)
     loaded = native_cache.read_manifest(export_dir)
     assert loaded is not None
-    assert loaded.producer == "csharp"
+    assert loaded.producer == "dotnet"
     assert loaded.schema_version == 3
 
 

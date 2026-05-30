@@ -1,5 +1,5 @@
 """Tests for ``etw_analyzer.native.config`` mode resolution including the
-new ``mode="csharp"`` path landed for Track B of the hybrid migration."""
+new ``mode="dotnet"`` path landed for Track B of the hybrid migration."""
 
 from __future__ import annotations
 
@@ -31,14 +31,14 @@ def _clear_caches(monkeypatch):
 
 
 def test_csharp_in_valid_modes():
-    assert "csharp" in config.VALID_MODES
+    assert "dotnet" in config.VALID_MODES
     # The other modes must still be accepted.
     assert {"native", "xperf", "auto"}.issubset(config.VALID_MODES)
 
 
 def test_normalize_mode_accepts_csharp():
-    assert config.normalize_mode("csharp") == "csharp"
-    assert config.normalize_mode("CSHARP") == "csharp"
+    assert config.normalize_mode("dotnet") == "dotnet"
+    assert config.normalize_mode("dotnet") == "dotnet"
 
 
 def test_normalize_mode_rejects_unknown_mode():
@@ -85,7 +85,7 @@ def test_resolve_mode_csharp_explicit_with_binary(tmp_path, monkeypatch):
     sidecar = _make_fake_sidecar(tmp_path)
     monkeypatch.setenv(config.CSHARP_SIDECAR_ENV, str(sidecar))
     config.reset_csharp_cache()
-    assert config.resolve_mode("csharp") == "csharp"
+    assert config.resolve_mode("dotnet") == "dotnet"
 
 
 def test_resolve_mode_csharp_explicit_missing_binary_raises(monkeypatch, tmp_path):
@@ -100,7 +100,7 @@ def test_resolve_mode_csharp_explicit_missing_binary_raises(monkeypatch, tmp_pat
         pytest.skip("wpr-mcp-extract.exe is on PATH; cannot test missing binary case")
 
     with pytest.raises(ValueError, match=config.CSHARP_SIDECAR_ENV):
-        config.resolve_mode("csharp")
+        config.resolve_mode("dotnet")
 
 
 def test_resolve_mode_auto_prefers_csharp_when_available(tmp_path, monkeypatch):
@@ -109,7 +109,7 @@ def test_resolve_mode_auto_prefers_csharp_when_available(tmp_path, monkeypatch):
     config.reset_auto_cache()
     # No etl_path needed for the csharp branch — sidecar location is the
     # gating signal.
-    assert config.resolve_mode("auto") == "csharp"
+    assert config.resolve_mode("auto") == "dotnet"
 
 
 def test_resolve_mode_auto_falls_back_to_native_when_csharp_missing(
@@ -127,16 +127,16 @@ def test_resolve_mode_auto_falls_back_to_native_when_csharp_missing(
     # The native vs xperf branch depends on host capability; we only assert
     # that csharp was NOT chosen (the fallback chain advanced past it).
     resolved = config.resolve_mode("auto")
-    assert resolved != "csharp"
+    assert resolved != "dotnet"
     assert resolved in {"native", "xperf"}
 
 
 def test_wpr_mcp_mode_env_csharp_honored(tmp_path, monkeypatch):
     sidecar = _make_fake_sidecar(tmp_path)
     monkeypatch.setenv(config.CSHARP_SIDECAR_ENV, str(sidecar))
-    monkeypatch.setenv("WPR_MCP_MODE", "csharp")
+    monkeypatch.setenv("WPR_MCP_MODE", "dotnet")
     config.reset_auto_cache()
-    assert config.resolve_mode(None) == "csharp"
+    assert config.resolve_mode(None) == "dotnet"
 
 
 def test_wpr_mcp_mode_env_native_honored(monkeypatch):
@@ -152,7 +152,7 @@ def test_wpr_mcp_mode_env_auto_honored(monkeypatch):
     monkeypatch.setenv("WPR_MCP_MODE", "auto")
     config.reset_auto_cache()
     resolved = config.resolve_mode(None)
-    assert resolved in {"csharp", "native", "xperf"}
+    assert resolved in {"dotnet", "native", "xperf"}
 
 
 def test_wpr_mcp_mode_env_xperf_honored(monkeypatch):
@@ -166,7 +166,7 @@ def test_explicit_arg_overrides_env_var(tmp_path, monkeypatch):
 
     sidecar = _make_fake_sidecar(tmp_path)
     monkeypatch.setenv(config.CSHARP_SIDECAR_ENV, str(sidecar))
-    monkeypatch.setenv("WPR_MCP_MODE", "csharp")
+    monkeypatch.setenv("WPR_MCP_MODE", "dotnet")
     config.reset_auto_cache()
     # Explicit xperf wins over env var csharp.
     assert config.resolve_mode("xperf") == "xperf"
