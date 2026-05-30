@@ -19,91 +19,99 @@ internal static class ParquetEmitter
 
     public static async Task<long> WriteAllAsync(EventCollector ec, string stagingDir)
     {
+        // Materialized path — buffers are List<T>-backed, .AsList() returns
+        // the underlying List without copying. Streaming-mode collectors
+        // would throw here; callers must dispatch on EventCollector.IsStreaming.
         long total = 0;
         // Paired (stack) classes.
-        total += await WriteSampledProfileAsync(ec.SampledProfile, Path.Combine(stagingDir, "sampled_profile.parquet"));
-        total += await WriteCSwitchAsync(ec.CSwitch, Path.Combine(stagingDir, "cswitch_events.parquet"));
-        total += await WriteReadyThreadAsync(ec.ReadyThread, Path.Combine(stagingDir, "readythread.parquet"));
+        total += await WriteSampledProfileAsync(ec.SampledProfile.AsList(), Path.Combine(stagingDir, "sampled_profile.parquet"));
+        total += await WriteCSwitchAsync(ec.CSwitch.AsList(), Path.Combine(stagingDir, "cswitch_events.parquet"));
+        total += await WriteReadyThreadAsync(ec.ReadyThread.AsList(), Path.Combine(stagingDir, "readythread.parquet"));
         // TCP/IP and UDP/IP flow classes — Python expects one parquet per (proto, opcode).
-        total += await WriteTcpipRecvAsync(ec.TcpipRecv, Path.Combine(stagingDir, "tcpip_recv.parquet"));
-        total += await WriteFlowAsync(ec.TcpipSend,        Path.Combine(stagingDir, "tcpip_send.parquet"));
-        total += await WriteFlowAsync(ec.TcpipConnect,     Path.Combine(stagingDir, "tcpip_connect.parquet"));
-        total += await WriteFlowAsync(ec.TcpipAccept,      Path.Combine(stagingDir, "tcpip_accept.parquet"));
-        total += await WriteFlowAsync(ec.TcpipRetransmit,  Path.Combine(stagingDir, "tcpip_retransmit.parquet"));
-        total += await WriteFlowAsync(ec.TcpipDisconnect,  Path.Combine(stagingDir, "tcpip_disconnect.parquet"));
-        total += await WriteFlowAsync(ec.UdpRecv,          Path.Combine(stagingDir, "udp_recv.parquet"));
-        total += await WriteFlowAsync(ec.UdpSend,          Path.Combine(stagingDir, "udp_send.parquet"));
+        total += await WriteTcpipRecvAsync(ec.TcpipRecv.AsList(), Path.Combine(stagingDir, "tcpip_recv.parquet"));
+        total += await WriteFlowAsync(ec.TcpipSend.AsList(),        Path.Combine(stagingDir, "tcpip_send.parquet"));
+        total += await WriteFlowAsync(ec.TcpipConnect.AsList(),     Path.Combine(stagingDir, "tcpip_connect.parquet"));
+        total += await WriteFlowAsync(ec.TcpipAccept.AsList(),      Path.Combine(stagingDir, "tcpip_accept.parquet"));
+        total += await WriteFlowAsync(ec.TcpipRetransmit.AsList(),  Path.Combine(stagingDir, "tcpip_retransmit.parquet"));
+        total += await WriteFlowAsync(ec.TcpipDisconnect.AsList(),  Path.Combine(stagingDir, "tcpip_disconnect.parquet"));
+        total += await WriteFlowAsync(ec.UdpRecv.AsList(),          Path.Combine(stagingDir, "udp_recv.parquet"));
+        total += await WriteFlowAsync(ec.UdpSend.AsList(),          Path.Combine(stagingDir, "udp_send.parquet"));
         // AFD socket-level events.
-        total += await WriteAfdRecvAsync(ec.AfdRecv,       Path.Combine(stagingDir, "afd_recv.parquet"));
-        total += await WriteAfdEventAsync(ec.AfdSend,      Path.Combine(stagingDir, "afd_send.parquet"));
-        total += await WriteAfdEventAsync(ec.AfdConnect,   Path.Combine(stagingDir, "afd_connect.parquet"));
-        total += await WriteAfdEventAsync(ec.AfdAccept,    Path.Combine(stagingDir, "afd_accept.parquet"));
-        total += await WriteAfdEventAsync(ec.AfdClose,     Path.Combine(stagingDir, "afd_close.parquet"));
-        total += await WriteAfdEventAsync(ec.AfdBind,      Path.Combine(stagingDir, "afd_bind.parquet"));
+        total += await WriteAfdRecvAsync(ec.AfdRecv.AsList(),       Path.Combine(stagingDir, "afd_recv.parquet"));
+        total += await WriteAfdEventAsync(ec.AfdSend.AsList(),      Path.Combine(stagingDir, "afd_send.parquet"));
+        total += await WriteAfdEventAsync(ec.AfdConnect.AsList(),   Path.Combine(stagingDir, "afd_connect.parquet"));
+        total += await WriteAfdEventAsync(ec.AfdAccept.AsList(),    Path.Combine(stagingDir, "afd_accept.parquet"));
+        total += await WriteAfdEventAsync(ec.AfdClose.AsList(),     Path.Combine(stagingDir, "afd_close.parquet"));
+        total += await WriteAfdEventAsync(ec.AfdBind.AsList(),      Path.Combine(stagingDir, "afd_bind.parquet"));
         // NDIS.
-        total += await WriteNdisDropsAsync(ec.NdisDrops,   Path.Combine(stagingDir, "ndis_drops.parquet"));
-        total += await WriteNdisPacketCaptureAsync(ec.NdisPacketCapture, Path.Combine(stagingDir, "packet_capture.parquet"));
+        total += await WriteNdisDropsAsync(ec.NdisDrops.AsList(),   Path.Combine(stagingDir, "ndis_drops.parquet"));
+        total += await WriteNdisPacketCaptureAsync(ec.NdisPacketCapture.AsList(), Path.Combine(stagingDir, "packet_capture.parquet"));
         // HTTP.sys.
-        total += await WriteHttpAsync(ec.HttpRecv,         Path.Combine(stagingDir, "http_recv.parquet"));
-        total += await WriteHttpAsync(ec.HttpDeliver,      Path.Combine(stagingDir, "http_deliver.parquet"));
-        total += await WriteHttpAsync(ec.HttpSend,         Path.Combine(stagingDir, "http_send.parquet"));
-        total += await WriteHttpAsync(ec.HttpClose,        Path.Combine(stagingDir, "http_close.parquet"));
+        total += await WriteHttpAsync(ec.HttpRecv.AsList(),         Path.Combine(stagingDir, "http_recv.parquet"));
+        total += await WriteHttpAsync(ec.HttpDeliver.AsList(),      Path.Combine(stagingDir, "http_deliver.parquet"));
+        total += await WriteHttpAsync(ec.HttpSend.AsList(),         Path.Combine(stagingDir, "http_send.parquet"));
+        total += await WriteHttpAsync(ec.HttpClose.AsList(),        Path.Combine(stagingDir, "http_close.parquet"));
         // MsQuic.
-        total += await WriteQuicAsync(ec.QuicConnCreated,  Path.Combine(stagingDir, "quic_conn_created.parquet"));
-        total += await WriteQuicAsync(ec.QuicConnClosed,   Path.Combine(stagingDir, "quic_conn_closed.parquet"));
-        total += await WriteQuicAsync(ec.QuicPacketRecv,   Path.Combine(stagingDir, "quic_packet_recv.parquet"));
-        total += await WriteQuicAsync(ec.QuicPacketSend,   Path.Combine(stagingDir, "quic_packet_send.parquet"));
-        total += await WriteQuicAsync(ec.QuicAckReceived,  Path.Combine(stagingDir, "quic_ack_recv.parquet"));
+        total += await WriteQuicAsync(ec.QuicConnCreated.AsList(),  Path.Combine(stagingDir, "quic_conn_created.parquet"));
+        total += await WriteQuicAsync(ec.QuicConnClosed.AsList(),   Path.Combine(stagingDir, "quic_conn_closed.parquet"));
+        total += await WriteQuicAsync(ec.QuicPacketRecv.AsList(),   Path.Combine(stagingDir, "quic_packet_recv.parquet"));
+        total += await WriteQuicAsync(ec.QuicPacketSend.AsList(),   Path.Combine(stagingDir, "quic_packet_send.parquet"));
+        total += await WriteQuicAsync(ec.QuicAckReceived.AsList(),  Path.Combine(stagingDir, "quic_ack_recv.parquet"));
         // Kernel meta — only emit if collected (request opt-in).
         if (ec.Process.Count > 0)
         {
-            total += await WriteProcessAsync(ec.Process, Path.Combine(stagingDir, "process.parquet"));
+            var processList = ec.Process.AsList();
+            total += await WriteProcessAsync(processList, Path.Combine(stagingDir, "process.parquet"));
             // Phase B per-opcode Process parquets.
-            total += await WriteProcessByKindAsync(ec.Process, "Start",   Path.Combine(stagingDir, "process_start.parquet"));
-            total += await WriteProcessByKindAsync(ec.Process, "End",     Path.Combine(stagingDir, "process_end.parquet"));
-            total += await WriteProcessByKindAsync(ec.Process, "DCStart", Path.Combine(stagingDir, "process_dcstart.parquet"));
-            total += await WriteProcessByKindAsync(ec.Process, "DCEnd",   Path.Combine(stagingDir, "process_dcend.parquet"));
-            total += await WriteProcessByKindAsync(ec.Process, "Defunct", Path.Combine(stagingDir, "process_defunct.parquet"));
+            total += await WriteProcessByKindAsync(processList, "Start",   Path.Combine(stagingDir, "process_start.parquet"));
+            total += await WriteProcessByKindAsync(processList, "End",     Path.Combine(stagingDir, "process_end.parquet"));
+            total += await WriteProcessByKindAsync(processList, "DCStart", Path.Combine(stagingDir, "process_dcstart.parquet"));
+            total += await WriteProcessByKindAsync(processList, "DCEnd",   Path.Combine(stagingDir, "process_dcend.parquet"));
+            total += await WriteProcessByKindAsync(processList, "Defunct", Path.Combine(stagingDir, "process_defunct.parquet"));
         }
         if (ec.Image.Count > 0)
         {
-            total += await WriteImageAsync(ec.Image,     Path.Combine(stagingDir, "image.parquet"));
+            var imageList = ec.Image.AsList();
+            total += await WriteImageAsync(imageList,     Path.Combine(stagingDir, "image.parquet"));
             // Phase B per-opcode Image parquets — power the Python symbolizer build.
-            total += await WriteImageByKindAsync(ec.Image, "Load",    Path.Combine(stagingDir, "image_load.parquet"));
-            total += await WriteImageByKindAsync(ec.Image, "DCStart", Path.Combine(stagingDir, "image_dcstart.parquet"));
+            total += await WriteImageByKindAsync(imageList, "Load",    Path.Combine(stagingDir, "image_load.parquet"));
+            total += await WriteImageByKindAsync(imageList, "DCStart", Path.Combine(stagingDir, "image_dcstart.parquet"));
         }
         if (ec.DiskIo.Count > 0)
         {
-            total += await WriteDiskIoAsync(ec.DiskIo,   Path.Combine(stagingDir, "diskio.parquet"));
+            var diskList = ec.DiskIo.AsList();
+            total += await WriteDiskIoAsync(diskList,   Path.Combine(stagingDir, "diskio.parquet"));
             // Phase B per-opcode DiskIo parquets.
-            total += await WriteDiskIoByKindAsync(ec.DiskIo, "Read",         Path.Combine(stagingDir, "diskio_read.parquet"));
-            total += await WriteDiskIoByKindAsync(ec.DiskIo, "Write",        Path.Combine(stagingDir, "diskio_write.parquet"));
-            total += await WriteDiskIoByKindAsync(ec.DiskIo, "FlushBuffers", Path.Combine(stagingDir, "diskio_flushbuffers.parquet"));
+            total += await WriteDiskIoByKindAsync(diskList, "Read",         Path.Combine(stagingDir, "diskio_read.parquet"));
+            total += await WriteDiskIoByKindAsync(diskList, "Write",        Path.Combine(stagingDir, "diskio_write.parquet"));
+            total += await WriteDiskIoByKindAsync(diskList, "FlushBuffers", Path.Combine(stagingDir, "diskio_flushbuffers.parquet"));
         }
-        if (ec.DpcIsr.Count > 0)   total += await WriteDpcIsrAsync(ec.DpcIsr,   Path.Combine(stagingDir, "dpc_isr.parquet"));
-        // Per-opcode PerfInfo parquets (Phase B). Always emit so Python aggregators
-        // can rely on stable filenames; the writer produces an empty parquet when
-        // the per-Kind filter is empty.
         if (ec.DpcIsr.Count > 0)
         {
-            total += await WriteDpcIsrByKindAsync(ec.DpcIsr, "DPC",         Path.Combine(stagingDir, "perfinfo_dpc.parquet"));
-            total += await WriteDpcIsrByKindAsync(ec.DpcIsr, "ThreadedDPC", Path.Combine(stagingDir, "perfinfo_threaded_dpc.parquet"));
-            total += await WriteDpcIsrByKindAsync(ec.DpcIsr, "TimerDPC",    Path.Combine(stagingDir, "perfinfo_timer_dpc.parquet"));
-            total += await WriteDpcIsrByKindAsync(ec.DpcIsr, "ISR",         Path.Combine(stagingDir, "perfinfo_isr.parquet"));
+            var dpcList = ec.DpcIsr.AsList();
+            total += await WriteDpcIsrAsync(dpcList,   Path.Combine(stagingDir, "dpc_isr.parquet"));
+            // Per-opcode PerfInfo parquets (Phase B). Always emit so Python aggregators
+            // can rely on stable filenames; the writer produces an empty parquet when
+            // the per-Kind filter is empty.
+            total += await WriteDpcIsrByKindAsync(dpcList, "DPC",         Path.Combine(stagingDir, "perfinfo_dpc.parquet"));
+            total += await WriteDpcIsrByKindAsync(dpcList, "ThreadedDPC", Path.Combine(stagingDir, "perfinfo_threaded_dpc.parquet"));
+            total += await WriteDpcIsrByKindAsync(dpcList, "TimerDPC",    Path.Combine(stagingDir, "perfinfo_timer_dpc.parquet"));
+            total += await WriteDpcIsrByKindAsync(dpcList, "ISR",         Path.Combine(stagingDir, "perfinfo_isr.parquet"));
         }
         // Phase B: Thread/* per-opcode parquets.
         if (ec.Thread.Count > 0)
         {
-            total += await WriteThreadByKindAsync(ec.Thread, "Start",   Path.Combine(stagingDir, "thread_start.parquet"));
-            total += await WriteThreadByKindAsync(ec.Thread, "End",     Path.Combine(stagingDir, "thread_end.parquet"));
-            total += await WriteThreadByKindAsync(ec.Thread, "DCStart", Path.Combine(stagingDir, "thread_dcstart.parquet"));
-            total += await WriteThreadByKindAsync(ec.Thread, "DCEnd",   Path.Combine(stagingDir, "thread_dcend.parquet"));
+            var threadList = ec.Thread.AsList();
+            total += await WriteThreadByKindAsync(threadList, "Start",   Path.Combine(stagingDir, "thread_start.parquet"));
+            total += await WriteThreadByKindAsync(threadList, "End",     Path.Combine(stagingDir, "thread_end.parquet"));
+            total += await WriteThreadByKindAsync(threadList, "DCStart", Path.Combine(stagingDir, "thread_dcstart.parquet"));
+            total += await WriteThreadByKindAsync(threadList, "DCEnd",   Path.Combine(stagingDir, "thread_dcend.parquet"));
         }
         // Phase B: EventTrace/Header (one row per ETL).
         if (ec.EventTraceHeader.Count > 0)
-            total += await WriteEventTraceHeaderAsync(ec.EventTraceHeader, Path.Combine(stagingDir, "eventtrace_header.parquet"));
+            total += await WriteEventTraceHeaderAsync(ec.EventTraceHeader.AsList(), Path.Combine(stagingDir, "eventtrace_header.parquet"));
         if (ec.Tracelogging.Count > 0)
-            total += await WriteTraceloggingAsync(ec.Tracelogging, Path.Combine(stagingDir, "tracelogging_events.parquet"));
+            total += await WriteTraceloggingAsync(ec.Tracelogging.AsList(), Path.Combine(stagingDir, "tracelogging_events.parquet"));
         return total;
     }
 

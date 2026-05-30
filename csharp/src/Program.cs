@@ -142,6 +142,25 @@ catch (Exception ex)
 
 // ---- Run the extractor --------------------------------------------------
 var runner = new ExtractRunner(req, emit);
+
+// For event-store-streaming we must allocate the run id and wire the
+// per-class chunk sinks BEFORE ProcessTrace fires any callbacks, so that
+// each Add() goes straight into the bounded-queue rotator instead of
+// accumulating in a flat List<T>. Materialized strategies leave the
+// collector in its default in-memory mode (no behavior change).
+string? streamingRunIdAllocated = null;
+string? streamingGenDir = null;
+if (req.Strategy == "event-store-streaming")
+{
+    streamingRunIdAllocated = Guid.NewGuid().ToString("N");
+    streamingGenDir = Path.Combine(req.StagingDir, "native-store", "generations", streamingRunIdAllocated);
+    var eventsDir = Path.Combine(streamingGenDir, "events");
+    runner.Collector.ConfigureStreaming(
+        eventsDir,
+        chunkSize: EventStoreEmitter.DefaultMaxRowsPerPart,
+        queueCapacity: 2);
+}
+
 try
 {
     phase = "opening-trace";
@@ -179,8 +198,12 @@ try
         // Chunked per-class parquets under
         // <staging>/native-store/generations/<run_id>/events/<class>/part-NNNN.parquet
         // plus native-event-store-manifest.json at the generation root.
+        // The chunk writes happened CONCURRENTLY with ProcessTrace via the
+        // streaming sinks; this call just drains them and writes the manifest.
         var (storeDatasets, runId, genDir, storeBytes) =
-            await EventStoreEmitter.WriteAllAsync(runner.Collector, req.StagingDir, runner.QpcOrigin, runner.PerfFreq);
+            await EventStoreEmitter.WriteAllAsync(
+                runner.Collector, req.StagingDir, runner.QpcOrigin, runner.PerfFreq,
+                streamingRunIdAllocated!, streamingGenDir!);
         streamingRunId = runId;
         parquetBytes = storeBytes;
         long totalRows = storeDatasets.Sum(d => d.RowCount);

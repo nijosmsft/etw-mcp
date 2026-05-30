@@ -737,7 +737,7 @@ internal sealed class ExtractRunner
         Size = data.size,
     };
 
-    private static void AddFlow(List<TcpipRecvRow> dest, NetworkFlowRow src)
+    private static void AddFlow(RowBuffer<TcpipRecvRow> dest, NetworkFlowRow src)
         => dest.Add(new TcpipRecvRow
         {
             EventSequence = src.EventSequence,
@@ -778,7 +778,7 @@ internal sealed class ExtractRunner
 
     // ----- AFD -----
 
-    private void EmitAfd(TraceEvent data, List<AfdRecvRow> dest)
+    private void EmitAfd(TraceEvent data, RowBuffer<AfdRecvRow> dest)
     {
         dest.Add(new AfdRecvRow
         {
@@ -794,7 +794,7 @@ internal sealed class ExtractRunner
         });
     }
 
-    private void EmitAfdEvent(TraceEvent data, List<AfdEventRow> dest)
+    private void EmitAfdEvent(TraceEvent data, RowBuffer<AfdEventRow> dest)
     {
         dest.Add(new AfdEventRow
         {
@@ -847,7 +847,7 @@ internal sealed class ExtractRunner
 
     // ----- HTTP.sys -----
 
-    private void EmitHttp(TraceEvent data, List<HttpRow> dest)
+    private void EmitHttp(TraceEvent data, RowBuffer<HttpRow> dest)
     {
         dest.Add(new HttpRow
         {
@@ -870,7 +870,7 @@ internal sealed class ExtractRunner
 
     // ----- MsQuic -----
 
-    private void EmitQuic(TraceEvent data, List<QuicRow> dest)
+    private void EmitQuic(TraceEvent data, RowBuffer<QuicRow> dest)
     {
         dest.Add(new QuicRow
         {

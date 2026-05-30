@@ -32,155 +32,41 @@ internal static class EventStoreEmitter
     }
 
     /// <summary>
-    /// Emit every non-empty buffer as a chunked dataset. Returns the
-    /// dataset-level summary and the generation directory used.
+    /// Awaits every streaming sink configured on <paramref name="ec"/>,
+    /// then writes the sub-manifest at the generation root. In the new
+    /// streaming-channels model the actual chunked parquet parts are
+    /// written CONCURRENTLY with ProcessTrace by the per-class
+    /// <see cref="StreamingChunkSink{T}"/> background tasks, so this
+    /// method is purely a drain + manifest step.
+    ///
+    /// <paramref name="ec"/> must have been switched into streaming mode
+    /// via <see cref="EventCollector.ConfigureStreaming"/> with the same
+    /// generation directory that <paramref name="generationDir"/> points
+    /// to here (i.e. the caller must allocate the run id up-front, pass
+    /// it to <c>ConfigureStreaming</c> via <c>events/</c> subpath, and
+    /// pass it back in here).
     /// </summary>
     public static async Task<(List<DatasetSummary> datasets, string runId, string generationDir, long totalBytes)>
-        WriteAllAsync(EventCollector ec, string stagingDir, long qpcOrigin, double perfFreq)
+        WriteAllAsync(EventCollector ec, string stagingDir, long qpcOrigin, double perfFreq, string runId, string generationDir)
     {
-        var runId = Guid.NewGuid().ToString("N");
-        var generationDir = Path.Combine(stagingDir, "native-store", "generations", runId);
-        var eventsDir = Path.Combine(generationDir, "events");
-        Directory.CreateDirectory(eventsDir);
+        var summaries = await ec.CompleteAllStreamingAsync().ConfigureAwait(false);
 
-        var summaries = new List<DatasetSummary>();
-        long total = 0;
+        // Match the pre-D2 behaviour: kernel-meta datasets (process / image
+        // / diskio / dpc_isr) only appear in the sub-manifest when they
+        // have rows. The AFD / TCP / UDP / QUIC / HTTP / NDIS / paired
+        // datasets are always included (possibly empty) — also matching
+        // the old EventStoreEmitter.ChunkParquetAsync contract.
+        var kernelMeta = new HashSet<string>(StringComparer.Ordinal)
+            { "process", "image", "diskio", "dpc_isr" };
+        summaries = summaries.Where(s => !(kernelMeta.Contains(s.Name) && s.RowCount == 0)).ToList();
 
-        // Paired (stack) classes.
-        total += await ChunkParquetAsync("sampled_profile", ec.SampledProfile, eventsDir, summaries,
-            r => r.TimeStampQpc, ParquetEmitter.WriteSampledProfileAsync);
-        total += await ChunkParquetAsync("cswitch_events", ec.CSwitch, eventsDir, summaries,
-            r => r.TimeStampQpc, ParquetEmitter.WriteCSwitchAsync);
-        total += await ChunkParquetAsync("readythread", ec.ReadyThread, eventsDir, summaries,
-            r => r.TimeStampQpc, ParquetEmitter.WriteReadyThreadAsync);
+        long total = summaries.Sum(s => s.Parts.Sum(p => p.ByteSize));
 
-        // Network flow classes.
-        total += await ChunkParquetAsync("tcpip_recv", ec.TcpipRecv, eventsDir, summaries,
-            r => r.TimeStampQpc, ParquetEmitter.WriteTcpipRecvAsync);
-        total += await ChunkFlowAsync("tcpip_send",        ec.TcpipSend,        eventsDir, summaries);
-        total += await ChunkFlowAsync("tcpip_connect",     ec.TcpipConnect,     eventsDir, summaries);
-        total += await ChunkFlowAsync("tcpip_accept",      ec.TcpipAccept,      eventsDir, summaries);
-        total += await ChunkFlowAsync("tcpip_retransmit",  ec.TcpipRetransmit,  eventsDir, summaries);
-        total += await ChunkFlowAsync("tcpip_disconnect",  ec.TcpipDisconnect,  eventsDir, summaries);
-        total += await ChunkFlowAsync("udp_recv",          ec.UdpRecv,          eventsDir, summaries);
-        total += await ChunkFlowAsync("udp_send",          ec.UdpSend,          eventsDir, summaries);
-
-        // AFD.
-        total += await ChunkParquetAsync("afd_recv", ec.AfdRecv, eventsDir, summaries,
-            r => r.TimeStampQpc, ParquetEmitter.WriteAfdRecvAsync);
-        total += await ChunkAfdAsync("afd_send",    ec.AfdSend,    eventsDir, summaries);
-        total += await ChunkAfdAsync("afd_connect", ec.AfdConnect, eventsDir, summaries);
-        total += await ChunkAfdAsync("afd_accept",  ec.AfdAccept,  eventsDir, summaries);
-        total += await ChunkAfdAsync("afd_close",   ec.AfdClose,   eventsDir, summaries);
-        total += await ChunkAfdAsync("afd_bind",    ec.AfdBind,    eventsDir, summaries);
-
-        // NDIS.
-        total += await ChunkParquetAsync("ndis_drops", ec.NdisDrops, eventsDir, summaries,
-            r => r.TimeStampQpc, ParquetEmitter.WriteNdisDropsAsync);
-        total += await ChunkParquetAsync("packet_capture", ec.NdisPacketCapture, eventsDir, summaries,
-            r => r.TimeStampQpc, ParquetEmitter.WriteNdisPacketCaptureAsync);
-
-        // HTTP.
-        total += await ChunkHttpAsync("http_recv",    ec.HttpRecv,    eventsDir, summaries);
-        total += await ChunkHttpAsync("http_deliver", ec.HttpDeliver, eventsDir, summaries);
-        total += await ChunkHttpAsync("http_send",    ec.HttpSend,    eventsDir, summaries);
-        total += await ChunkHttpAsync("http_close",   ec.HttpClose,   eventsDir, summaries);
-
-        // MsQuic.
-        total += await ChunkQuicAsync("quic_conn_created", ec.QuicConnCreated, eventsDir, summaries);
-        total += await ChunkQuicAsync("quic_conn_closed",  ec.QuicConnClosed,  eventsDir, summaries);
-        total += await ChunkQuicAsync("quic_packet_recv",  ec.QuicPacketRecv,  eventsDir, summaries);
-        total += await ChunkQuicAsync("quic_packet_send",  ec.QuicPacketSend,  eventsDir, summaries);
-        total += await ChunkQuicAsync("quic_ack_recv",     ec.QuicAckReceived, eventsDir, summaries);
-
-        // Kernel meta.
-        if (ec.Process.Count > 0)
-            total += await ChunkParquetAsync("process", ec.Process, eventsDir, summaries,
-                r => r.TimeStampQpc, ParquetEmitter.WriteProcessAsync);
-        if (ec.Image.Count > 0)
-            total += await ChunkParquetAsync("image", ec.Image, eventsDir, summaries,
-                r => r.TimeStampQpc, ParquetEmitter.WriteImageAsync);
-        if (ec.DiskIo.Count > 0)
-            total += await ChunkParquetAsync("diskio", ec.DiskIo, eventsDir, summaries,
-                r => r.TimeStampQpc, ParquetEmitter.WriteDiskIoAsync);
-        if (ec.DpcIsr.Count > 0)
-            total += await ChunkParquetAsync("dpc_isr", ec.DpcIsr, eventsDir, summaries,
-                r => r.TimeStampQpc, ParquetEmitter.WriteDpcIsrAsync);
-
-        // Sub-manifest at the generation root.
         var manifestPath = Path.Combine(generationDir, "native-event-store-manifest.json");
         WriteSubManifest(manifestPath, runId, qpcOrigin, perfFreq, summaries);
         total += new FileInfo(manifestPath).Length;
-
         return (summaries, runId, generationDir, total);
     }
-
-    // ----- chunk-rotation helpers -----
-
-    /// <summary>
-    /// Slice a row buffer into part-NNNN.parquet files honoring the row/byte
-    /// caps. The caller-supplied <paramref name="writer"/> writes one slice
-    /// to one path; we measure file size to enforce the byte cap on the
-    /// *next* rotation decision.
-    /// </summary>
-    private static async Task<long> ChunkParquetAsync<T>(
-        string name,
-        List<T> rows,
-        string eventsDir,
-        List<DatasetSummary> summaries,
-        Func<T, long> qpcSelector,
-        Func<List<T>, string, Task<long>> writer)
-    {
-        var summary = new DatasetSummary { Name = name, RowCount = rows.Count };
-        summaries.Add(summary);
-        if (rows.Count == 0) return 0;
-
-        var dir = Path.Combine(eventsDir, name);
-        Directory.CreateDirectory(dir);
-
-        long totalBytes = 0;
-        int partIndex = 0;
-        int cursor = 0;
-        long? overallMin = null, overallMax = null;
-        while (cursor < rows.Count)
-        {
-            int take = Math.Min(DefaultMaxRowsPerPart, rows.Count - cursor);
-            var slice = rows.GetRange(cursor, take);
-            long minQpc = qpcSelector(slice[0]);
-            long maxQpc = qpcSelector(slice[^1]);
-            for (int i = 1; i < slice.Count; i++)
-            {
-                var v = qpcSelector(slice[i]);
-                if (v < minQpc) minQpc = v;
-                if (v > maxQpc) maxQpc = v;
-            }
-            var partRel = $"events/{name}/part-{partIndex:D4}.parquet";
-            var partPath = Path.Combine(eventsDir, "..", partRel);
-            partPath = Path.GetFullPath(partPath);
-            long bytes = await writer(slice, partPath);
-            totalBytes += bytes;
-            summary.Parts.Add(new PartInfo(partRel, slice.Count, minQpc, maxQpc, bytes));
-            overallMin = overallMin.HasValue ? Math.Min(overallMin.Value, minQpc) : minQpc;
-            overallMax = overallMax.HasValue ? Math.Max(overallMax.Value, maxQpc) : maxQpc;
-            cursor += take;
-            partIndex++;
-        }
-        summary.MinQpc = overallMin;
-        summary.MaxQpc = overallMax;
-        return totalBytes;
-    }
-
-    private static Task<long> ChunkFlowAsync(string name, List<NetworkFlowRow> rows, string eventsDir, List<DatasetSummary> summaries)
-        => ChunkParquetAsync(name, rows, eventsDir, summaries, r => r.TimeStampQpc, ParquetEmitter.WriteFlowAsync);
-
-    private static Task<long> ChunkAfdAsync(string name, List<AfdEventRow> rows, string eventsDir, List<DatasetSummary> summaries)
-        => ChunkParquetAsync(name, rows, eventsDir, summaries, r => r.TimeStampQpc, ParquetEmitter.WriteAfdEventAsync);
-
-    private static Task<long> ChunkHttpAsync(string name, List<HttpRow> rows, string eventsDir, List<DatasetSummary> summaries)
-        => ChunkParquetAsync(name, rows, eventsDir, summaries, r => r.TimeStampQpc, ParquetEmitter.WriteHttpAsync);
-
-    private static Task<long> ChunkQuicAsync(string name, List<QuicRow> rows, string eventsDir, List<DatasetSummary> summaries)
-        => ChunkParquetAsync(name, rows, eventsDir, summaries, r => r.TimeStampQpc, ParquetEmitter.WriteQuicAsync);
 
     private static void WriteSubManifest(string path, string runId, long qpcOrigin, double perfFreq, List<DatasetSummary> summaries)
     {

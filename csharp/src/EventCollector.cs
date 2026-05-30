@@ -63,60 +63,72 @@ internal sealed class PendingStackBuffer
 /// Holds row buffers for every event class and the pending stack pairing
 /// state. Counters mutate from the single TraceEvent callback thread, so
 /// no locking is required.
+///
+/// The per-class buffers are <see cref="RowBuffer{T}"/> wrappers so the
+/// ETW callbacks have a uniform <c>.Add(row)</c> surface regardless of
+/// strategy. In <c>materialized-small</c> mode each buffer is backed by a
+/// <see cref="List{T}"/> and the post-Process parquet emitter writes the
+/// full list at the end (unchanged behaviour). In <c>event-store-streaming</c>
+/// mode the buffer is backed by a <see cref="StreamingChunkSink{T}"/> that
+/// rotates batches into a bounded queue consumed by a background writer,
+/// bounding live memory regardless of trace size.
+///
+/// Call <see cref="ConfigureStreaming"/> before <see cref="ExtractRunner.Run"/>
+/// to switch into streaming mode; otherwise materialized mode is implicit.
 /// </summary>
 internal sealed class EventCollector
 {
     // Kernel + paired classes
-    public readonly List<SampledProfileRow> SampledProfile = new(capacity: 1 << 16);
-    public readonly List<CSwitchRow> CSwitch = new(capacity: 1 << 17);
-    public readonly List<ReadyThreadRow> ReadyThread = new(capacity: 1 << 16);
+    public RowBuffer<SampledProfileRow> SampledProfile { get; private set; } = new(capacity: 1 << 16);
+    public RowBuffer<CSwitchRow> CSwitch { get; private set; } = new(capacity: 1 << 17);
+    public RowBuffer<ReadyThreadRow> ReadyThread { get; private set; } = new(capacity: 1 << 16);
 
     // TCP/UDP flow buffers — share the NetworkFlowRow shape per Python's
     // _DUMPER_EVENT_CLASSES contract.
-    public readonly List<TcpipRecvRow> TcpipRecv = new();
-    public readonly List<NetworkFlowRow> TcpipSend = new();
-    public readonly List<NetworkFlowRow> TcpipConnect = new();
-    public readonly List<NetworkFlowRow> TcpipAccept = new();
-    public readonly List<NetworkFlowRow> TcpipRetransmit = new();
-    public readonly List<NetworkFlowRow> TcpipDisconnect = new();
-    public readonly List<NetworkFlowRow> UdpRecv = new();
-    public readonly List<NetworkFlowRow> UdpSend = new();
+    public RowBuffer<TcpipRecvRow> TcpipRecv { get; private set; } = new();
+    public RowBuffer<NetworkFlowRow> TcpipSend { get; private set; } = new();
+    public RowBuffer<NetworkFlowRow> TcpipConnect { get; private set; } = new();
+    public RowBuffer<NetworkFlowRow> TcpipAccept { get; private set; } = new();
+    public RowBuffer<NetworkFlowRow> TcpipRetransmit { get; private set; } = new();
+    public RowBuffer<NetworkFlowRow> TcpipDisconnect { get; private set; } = new();
+    public RowBuffer<NetworkFlowRow> UdpRecv { get; private set; } = new();
+    public RowBuffer<NetworkFlowRow> UdpSend { get; private set; } = new();
 
     // AFD (Winsock) — share the AfdEventRow shape.
-    public readonly List<AfdRecvRow> AfdRecv = new();
-    public readonly List<AfdEventRow> AfdSend = new();
-    public readonly List<AfdEventRow> AfdConnect = new();
-    public readonly List<AfdEventRow> AfdAccept = new();
-    public readonly List<AfdEventRow> AfdClose = new();
-    public readonly List<AfdEventRow> AfdBind = new();
+    public RowBuffer<AfdRecvRow> AfdRecv { get; private set; } = new();
+    public RowBuffer<AfdEventRow> AfdSend { get; private set; } = new();
+    public RowBuffer<AfdEventRow> AfdConnect { get; private set; } = new();
+    public RowBuffer<AfdEventRow> AfdAccept { get; private set; } = new();
+    public RowBuffer<AfdEventRow> AfdClose { get; private set; } = new();
+    public RowBuffer<AfdEventRow> AfdBind { get; private set; } = new();
 
     // NDIS
-    public readonly List<NdisDropRow> NdisDrops = new();
-    public readonly List<NdisPacketCaptureRow> NdisPacketCapture = new();
+    public RowBuffer<NdisDropRow> NdisDrops { get; private set; } = new();
+    public RowBuffer<NdisPacketCaptureRow> NdisPacketCapture { get; private set; } = new();
 
     // HTTP.sys lifecycle
-    public readonly List<HttpRow> HttpRecv = new();
-    public readonly List<HttpRow> HttpDeliver = new();
-    public readonly List<HttpRow> HttpSend = new();
-    public readonly List<HttpRow> HttpClose = new();
+    public RowBuffer<HttpRow> HttpRecv { get; private set; } = new();
+    public RowBuffer<HttpRow> HttpDeliver { get; private set; } = new();
+    public RowBuffer<HttpRow> HttpSend { get; private set; } = new();
+    public RowBuffer<HttpRow> HttpClose { get; private set; } = new();
 
     // MsQuic
-    public readonly List<QuicRow> QuicConnCreated = new();
-    public readonly List<QuicRow> QuicConnClosed = new();
-    public readonly List<QuicRow> QuicPacketRecv = new();
-    public readonly List<QuicRow> QuicPacketSend = new();
-    public readonly List<QuicRow> QuicAckReceived = new();
+    public RowBuffer<QuicRow> QuicConnCreated { get; private set; } = new();
+    public RowBuffer<QuicRow> QuicConnClosed { get; private set; } = new();
+    public RowBuffer<QuicRow> QuicPacketRecv { get; private set; } = new();
+    public RowBuffer<QuicRow> QuicPacketSend { get; private set; } = new();
+    public RowBuffer<QuicRow> QuicAckReceived { get; private set; } = new();
 
     // Kernel meta classes
-    public readonly List<ProcessRow> Process = new();
-    public readonly List<ImageRow> Image = new();
-    public readonly List<DiskIoRow> DiskIo = new();
-    public readonly List<DpcIsrRow> DpcIsr = new();
-    public readonly List<ThreadRow> Thread = new();
-    public readonly List<EventTraceHeaderRow> EventTraceHeader = new();
+    public RowBuffer<ProcessRow> Process { get; private set; } = new();
+    public RowBuffer<ImageRow> Image { get; private set; } = new();
+    public RowBuffer<DiskIoRow> DiskIo { get; private set; } = new();
+    public RowBuffer<DpcIsrRow> DpcIsr { get; private set; } = new();
+    public RowBuffer<ThreadRow> Thread { get; private set; } = new();
+    public RowBuffer<EventTraceHeaderRow> EventTraceHeader { get; private set; } = new();
 
     // Generic self-describing TraceLogging passthrough.
-    public readonly List<TraceloggingRow> Tracelogging = new();
+    public RowBuffer<TraceloggingRow> Tracelogging { get; private set; } = new();
 
     public readonly PendingStackBuffer Pending = new();
 
@@ -128,4 +140,105 @@ internal sealed class EventCollector
     public long CallbackExceptions;
 
     public ulong NextSeq() => EventSequence++;
+
+    /// <summary>True iff <see cref="ConfigureStreaming"/> has been called.</summary>
+    public bool IsStreaming { get; private set; }
+
+    /// <summary>
+    /// Streaming-mode sinks. Empty list in materialized mode. Populated by
+    /// <see cref="ConfigureStreaming"/> in order matching the per-class
+    /// dataset enumeration; <see cref="CompleteAllStreamingAsync"/> awaits
+    /// them and returns the summaries.
+    /// </summary>
+    private readonly List<Func<Task<EventStoreEmitter.DatasetSummary>>> _streamingCompleters = new();
+
+    /// <summary>
+    /// Switch every per-class buffer into streaming mode. Must be called
+    /// BEFORE ETW callbacks start firing (i.e. before
+    /// <see cref="ExtractRunner.Run"/>). The chunk size and queue capacity
+    /// mirror <see cref="EventStoreEmitter.DefaultMaxRowsPerPart"/> and
+    /// match Python's <c>sinks.DEFAULT_MAX_ROWS_PER_PART</c>.
+    /// </summary>
+    public void ConfigureStreaming(string eventsDir, int chunkSize, int queueCapacity)
+    {
+        if (IsStreaming) throw new InvalidOperationException("already configured");
+        IsStreaming = true;
+        Directory.CreateDirectory(eventsDir);
+
+        // ---- helpers ----
+        RowBuffer<TR> Wire<TR>(
+            string name,
+            Func<TR, long> qpc,
+            Func<List<TR>, string, Task<long>> writer)
+        {
+            var sink = new StreamingChunkSink<TR>(name, eventsDir, chunkSize, queueCapacity, writer, qpc);
+            _streamingCompleters.Add(sink.CompleteAsync);
+            return new RowBuffer<TR>(sink);
+        }
+
+        // ---- paired (stackable) classes ----
+        SampledProfile = Wire<SampledProfileRow>("sampled_profile", r => r.TimeStampQpc, ParquetEmitter.WriteSampledProfileAsync);
+        CSwitch        = Wire<CSwitchRow>      ("cswitch_events",  r => r.TimeStampQpc, ParquetEmitter.WriteCSwitchAsync);
+        ReadyThread    = Wire<ReadyThreadRow>  ("readythread",     r => r.TimeStampQpc, ParquetEmitter.WriteReadyThreadAsync);
+
+        // ---- TCP/UDP flow ----
+        TcpipRecv       = Wire<TcpipRecvRow>   ("tcpip_recv",       r => r.TimeStampQpc, ParquetEmitter.WriteTcpipRecvAsync);
+        TcpipSend       = Wire<NetworkFlowRow> ("tcpip_send",       r => r.TimeStampQpc, ParquetEmitter.WriteFlowAsync);
+        TcpipConnect    = Wire<NetworkFlowRow> ("tcpip_connect",    r => r.TimeStampQpc, ParquetEmitter.WriteFlowAsync);
+        TcpipAccept     = Wire<NetworkFlowRow> ("tcpip_accept",     r => r.TimeStampQpc, ParquetEmitter.WriteFlowAsync);
+        TcpipRetransmit = Wire<NetworkFlowRow> ("tcpip_retransmit", r => r.TimeStampQpc, ParquetEmitter.WriteFlowAsync);
+        TcpipDisconnect = Wire<NetworkFlowRow> ("tcpip_disconnect", r => r.TimeStampQpc, ParquetEmitter.WriteFlowAsync);
+        UdpRecv         = Wire<NetworkFlowRow> ("udp_recv",         r => r.TimeStampQpc, ParquetEmitter.WriteFlowAsync);
+        UdpSend         = Wire<NetworkFlowRow> ("udp_send",         r => r.TimeStampQpc, ParquetEmitter.WriteFlowAsync);
+
+        // ---- AFD ----
+        AfdRecv    = Wire<AfdRecvRow>  ("afd_recv",    r => r.TimeStampQpc, ParquetEmitter.WriteAfdRecvAsync);
+        AfdSend    = Wire<AfdEventRow> ("afd_send",    r => r.TimeStampQpc, ParquetEmitter.WriteAfdEventAsync);
+        AfdConnect = Wire<AfdEventRow> ("afd_connect", r => r.TimeStampQpc, ParquetEmitter.WriteAfdEventAsync);
+        AfdAccept  = Wire<AfdEventRow> ("afd_accept",  r => r.TimeStampQpc, ParquetEmitter.WriteAfdEventAsync);
+        AfdClose   = Wire<AfdEventRow> ("afd_close",   r => r.TimeStampQpc, ParquetEmitter.WriteAfdEventAsync);
+        AfdBind    = Wire<AfdEventRow> ("afd_bind",    r => r.TimeStampQpc, ParquetEmitter.WriteAfdEventAsync);
+
+        // ---- NDIS ----
+        NdisDrops         = Wire<NdisDropRow>          ("ndis_drops",     r => r.TimeStampQpc, ParquetEmitter.WriteNdisDropsAsync);
+        NdisPacketCapture = Wire<NdisPacketCaptureRow> ("packet_capture", r => r.TimeStampQpc, ParquetEmitter.WriteNdisPacketCaptureAsync);
+
+        // ---- HTTP.sys ----
+        HttpRecv    = Wire<HttpRow>("http_recv",    r => r.TimeStampQpc, ParquetEmitter.WriteHttpAsync);
+        HttpDeliver = Wire<HttpRow>("http_deliver", r => r.TimeStampQpc, ParquetEmitter.WriteHttpAsync);
+        HttpSend    = Wire<HttpRow>("http_send",    r => r.TimeStampQpc, ParquetEmitter.WriteHttpAsync);
+        HttpClose   = Wire<HttpRow>("http_close",   r => r.TimeStampQpc, ParquetEmitter.WriteHttpAsync);
+
+        // ---- MsQuic ----
+        QuicConnCreated = Wire<QuicRow>("quic_conn_created", r => r.TimeStampQpc, ParquetEmitter.WriteQuicAsync);
+        QuicConnClosed  = Wire<QuicRow>("quic_conn_closed",  r => r.TimeStampQpc, ParquetEmitter.WriteQuicAsync);
+        QuicPacketRecv  = Wire<QuicRow>("quic_packet_recv",  r => r.TimeStampQpc, ParquetEmitter.WriteQuicAsync);
+        QuicPacketSend  = Wire<QuicRow>("quic_packet_send",  r => r.TimeStampQpc, ParquetEmitter.WriteQuicAsync);
+        QuicAckReceived = Wire<QuicRow>("quic_ack_recv",     r => r.TimeStampQpc, ParquetEmitter.WriteQuicAsync);
+
+        // ---- kernel meta ----
+        // Match the original EventStoreEmitter.WriteAllAsync set: Process,
+        // Image, DiskIo, DpcIsr are streamed; Thread/EventTraceHeader/
+        // Tracelogging stay in-memory (Python doesn't ingest them from the
+        // event-store path today, and they're never large anyway).
+        Process = Wire<ProcessRow>("process", r => r.TimeStampQpc, ParquetEmitter.WriteProcessAsync);
+        Image   = Wire<ImageRow>  ("image",   r => r.TimeStampQpc, ParquetEmitter.WriteImageAsync);
+        DiskIo  = Wire<DiskIoRow> ("diskio",  r => r.TimeStampQpc, ParquetEmitter.WriteDiskIoAsync);
+        DpcIsr  = Wire<DpcIsrRow> ("dpc_isr", r => r.TimeStampQpc, ParquetEmitter.WriteDpcIsrAsync);
+        // Thread / EventTraceHeader / Tracelogging keep their default
+        // in-memory backends so this method is the SOLE switch.
+    }
+
+    /// <summary>
+    /// In streaming mode, drain every chunk sink and return the per-class
+    /// dataset summaries. In materialized mode returns an empty list.
+    /// Safe to call exactly once after <see cref="ExtractRunner.Run"/>.
+    /// </summary>
+    public async Task<List<EventStoreEmitter.DatasetSummary>> CompleteAllStreamingAsync()
+    {
+        var summaries = new List<EventStoreEmitter.DatasetSummary>(_streamingCompleters.Count);
+        foreach (var completer in _streamingCompleters)
+            summaries.Add(await completer().ConfigureAwait(false));
+        return summaries;
+    }
 }
