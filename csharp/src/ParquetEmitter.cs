@@ -64,7 +64,7 @@ internal static class ParquetEmitter
         return total;
     }
 
-    private static async Task<long> WriteTraceloggingAsync(List<TraceloggingRow> rows, string path)
+    internal static async Task<long> WriteTraceloggingAsync(List<TraceloggingRow> rows, string path)
     {
         var fQpc = Df<long>("TimeStampQpc", false);
         var fGuid = DfStr("ProviderGuid");
@@ -114,7 +114,7 @@ internal static class ParquetEmitter
     private static ListField StackField() =>
         new("Stack", new DataField<ulong>(ListItemName, (bool?)true));
 
-    private static async Task<long> WriteRowGroupAsync(string path, ParquetSchema schema, Func<ParquetRowGroupWriter, Task> body)
+    internal static async Task<long> WriteRowGroupAsync(string path, ParquetSchema schema, Func<ParquetRowGroupWriter, Task> body)
     {
         // Atomic write via .tmp suffix to satisfy contract §9 (no .tmp at exit).
         var tmp = path + ".tmp";
@@ -163,7 +163,7 @@ internal static class ParquetEmitter
 
     // ----- per-class writers --------------------------------------------
 
-    private static async Task<long> WriteSampledProfileAsync(List<SampledProfileRow> rows, string path)
+    internal static async Task<long> WriteSampledProfileAsync(List<SampledProfileRow> rows, string path)
     {
         var fEventSeq = Df<ulong>("EventSequence", false);
         var fQpc = Df<long>("TimeStampQpc", false);
@@ -198,7 +198,7 @@ internal static class ParquetEmitter
         });
     }
 
-    private static async Task<long> WriteCSwitchAsync(List<CSwitchRow> rows, string path)
+    internal static async Task<long> WriteCSwitchAsync(List<CSwitchRow> rows, string path)
     {
         var fEventSeq = Df<ulong>("EventSequence", false);
         var fQpc = Df<long>("TimeStampQpc", false);
@@ -231,7 +231,7 @@ internal static class ParquetEmitter
         });
     }
 
-    private static async Task<long> WriteReadyThreadAsync(List<ReadyThreadRow> rows, string path)
+    internal static async Task<long> WriteReadyThreadAsync(List<ReadyThreadRow> rows, string path)
     {
         var fEventSeq = Df<ulong>("EventSequence", false);
         var fQpc = Df<long>("TimeStampQpc", false);
@@ -264,7 +264,7 @@ internal static class ParquetEmitter
         });
     }
 
-    private static async Task<long> WriteTcpipRecvAsync(List<TcpipRecvRow> rows, string path)
+    internal static async Task<long> WriteTcpipRecvAsync(List<TcpipRecvRow> rows, string path)
     {
         var fEventSeq = Df<ulong>("EventSequence", false);
         var fQpc = Df<long>("TimeStampQpc", false);
@@ -305,7 +305,7 @@ internal static class ParquetEmitter
         });
     }
 
-    private static async Task<long> WriteAfdRecvAsync(List<AfdRecvRow> rows, string path)
+    internal static async Task<long> WriteAfdRecvAsync(List<AfdRecvRow> rows, string path)
     {
         var fEventSeq = Df<ulong>("EventSequence", false);
         var fQpc = Df<long>("TimeStampQpc", false);
@@ -337,7 +337,7 @@ internal static class ParquetEmitter
         });
     }
 
-    private static async Task<long> WriteNdisDropsAsync(List<NdisDropRow> rows, string path)
+    internal static async Task<long> WriteNdisDropsAsync(List<NdisDropRow> rows, string path)
     {
         var fEventSeq = Df<ulong>("EventSequence", false);
         var fQpc = Df<long>("TimeStampQpc", false);
@@ -371,7 +371,7 @@ internal static class ParquetEmitter
 
     // ----- generic flow writer (reused for tcpip_send/connect/accept/retransmit/disconnect, udp_recv/send) -----
 
-    private static async Task<long> WriteFlowAsync(List<NetworkFlowRow> rows, string path)
+    internal static async Task<long> WriteFlowAsync(List<NetworkFlowRow> rows, string path)
     {
         var fEventSeq = Df<ulong>("EventSequence", false);
         var fQpc = Df<long>("TimeStampQpc", false);
@@ -414,7 +414,7 @@ internal static class ParquetEmitter
 
     // ----- generic AFD writer (reused for send/connect/accept/close/bind) -----
 
-    private static async Task<long> WriteAfdEventAsync(List<AfdEventRow> rows, string path)
+    internal static async Task<long> WriteAfdEventAsync(List<AfdEventRow> rows, string path)
     {
         var fEventSeq = Df<ulong>("EventSequence", false);
         var fQpc = Df<long>("TimeStampQpc", false);
@@ -448,7 +448,7 @@ internal static class ParquetEmitter
 
     // ----- NDIS PacketCapture -----
 
-    private static async Task<long> WriteNdisPacketCaptureAsync(List<NdisPacketCaptureRow> rows, string path)
+    internal static async Task<long> WriteNdisPacketCaptureAsync(List<NdisPacketCaptureRow> rows, string path)
     {
         var fEventSeq = Df<ulong>("EventSequence", false);
         var fQpc = Df<long>("TimeStampQpc", false);
@@ -477,7 +477,7 @@ internal static class ParquetEmitter
 
     // ----- HTTP.sys -----
 
-    private static async Task<long> WriteHttpAsync(List<HttpRow> rows, string path)
+    internal static async Task<long> WriteHttpAsync(List<HttpRow> rows, string path)
     {
         var fEventSeq = Df<ulong>("EventSequence", false);
         var fQpc = Df<long>("TimeStampQpc", false);
@@ -523,7 +523,7 @@ internal static class ParquetEmitter
 
     // ----- MsQuic -----
 
-    private static async Task<long> WriteQuicAsync(List<QuicRow> rows, string path)
+    internal static async Task<long> WriteQuicAsync(List<QuicRow> rows, string path)
     {
         var fEventSeq = Df<ulong>("EventSequence", false);
         var fQpc = Df<long>("TimeStampQpc", false);
@@ -562,7 +562,7 @@ internal static class ParquetEmitter
 
     // ----- Process / Image / DiskIo / DPC-ISR -----
 
-    private static async Task<long> WriteProcessAsync(List<ProcessRow> rows, string path)
+    internal static async Task<long> WriteProcessAsync(List<ProcessRow> rows, string path)
     {
         var fEventSeq = Df<ulong>("EventSequence", false);
         var fQpc = Df<long>("TimeStampQpc", false);
@@ -591,7 +591,7 @@ internal static class ParquetEmitter
         });
     }
 
-    private static async Task<long> WriteImageAsync(List<ImageRow> rows, string path)
+    internal static async Task<long> WriteImageAsync(List<ImageRow> rows, string path)
     {
         var fEventSeq = Df<ulong>("EventSequence", false);
         var fQpc = Df<long>("TimeStampQpc", false);
@@ -622,7 +622,7 @@ internal static class ParquetEmitter
         });
     }
 
-    private static async Task<long> WriteDiskIoAsync(List<DiskIoRow> rows, string path)
+    internal static async Task<long> WriteDiskIoAsync(List<DiskIoRow> rows, string path)
     {
         var fEventSeq = Df<ulong>("EventSequence", false);
         var fQpc = Df<long>("TimeStampQpc", false);
@@ -655,7 +655,7 @@ internal static class ParquetEmitter
         });
     }
 
-    private static async Task<long> WriteDpcIsrAsync(List<DpcIsrRow> rows, string path)
+    internal static async Task<long> WriteDpcIsrAsync(List<DpcIsrRow> rows, string path)
     {
         var fEventSeq = Df<ulong>("EventSequence", false);
         var fQpc = Df<long>("TimeStampQpc", false);

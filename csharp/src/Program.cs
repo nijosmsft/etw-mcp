@@ -148,14 +148,76 @@ long parquetBytes = 0;
 long sysconfigBytes = 0;
 long manifestBytes = 0;
 var datasets = new List<DatasetEntry>();
+string? streamingRunId = null;
 try
 {
     phase = "writing-parquet";
     emit.Heartbeat(phase);
-    parquetBytes = await ParquetEmitter.WriteAllAsync(runner.Collector, req.StagingDir);
+
+    if (req.Strategy == "event-store-streaming")
+    {
+        // Chunked per-class parquets under
+        // <staging>/native-store/generations/<run_id>/events/<class>/part-NNNN.parquet
+        // plus native-event-store-manifest.json at the generation root.
+        var (storeDatasets, runId, genDir, storeBytes) =
+            await EventStoreEmitter.WriteAllAsync(runner.Collector, req.StagingDir, runner.QpcOrigin, runner.PerfFreq);
+        streamingRunId = runId;
+        parquetBytes = storeBytes;
+        long totalRows = storeDatasets.Sum(d => d.RowCount);
+        var relManifest = Path.Combine("native-store", "generations", runId, "native-event-store-manifest.json")
+            .Replace('\\', '/');
+        datasets.Add(new("native_event_store", "native-event-store", relManifest, 1, totalRows, false));
+    }
+    else
+    {
+        parquetBytes = await ParquetEmitter.WriteAllAsync(runner.Collector, req.StagingDir);
+        datasets.AddRange(new[]
+        {
+            new DatasetEntry("sampled_profile",  "parquet", "sampled_profile.parquet",  1, runner.Collector.SampledProfile.Count, true),
+            new DatasetEntry("cswitch_events",   "parquet", "cswitch_events.parquet",   1, runner.Collector.CSwitch.Count,        true),
+            new DatasetEntry("readythread",      "parquet", "readythread.parquet",      1, runner.Collector.ReadyThread.Count,    true),
+            new DatasetEntry("tcpip_recv",       "parquet", "tcpip_recv.parquet",       1, runner.Collector.TcpipRecv.Count,      true),
+            new DatasetEntry("tcpip_send",       "parquet", "tcpip_send.parquet",       1, runner.Collector.TcpipSend.Count,      false),
+            new DatasetEntry("tcpip_connect",    "parquet", "tcpip_connect.parquet",    1, runner.Collector.TcpipConnect.Count,   false),
+            new DatasetEntry("tcpip_accept",     "parquet", "tcpip_accept.parquet",     1, runner.Collector.TcpipAccept.Count,    false),
+            new DatasetEntry("tcpip_retransmit", "parquet", "tcpip_retransmit.parquet", 1, runner.Collector.TcpipRetransmit.Count, false),
+            new DatasetEntry("tcpip_disconnect", "parquet", "tcpip_disconnect.parquet", 1, runner.Collector.TcpipDisconnect.Count, false),
+            new DatasetEntry("udp_recv",         "parquet", "udp_recv.parquet",         1, runner.Collector.UdpRecv.Count,         false),
+            new DatasetEntry("udp_send",         "parquet", "udp_send.parquet",         1, runner.Collector.UdpSend.Count,         false),
+            new DatasetEntry("afd_recv",         "parquet", "afd_recv.parquet",         1, runner.Collector.AfdRecv.Count,         true),
+            new DatasetEntry("afd_send",         "parquet", "afd_send.parquet",         1, runner.Collector.AfdSend.Count,         false),
+            new DatasetEntry("afd_connect",      "parquet", "afd_connect.parquet",      1, runner.Collector.AfdConnect.Count,      false),
+            new DatasetEntry("afd_accept",       "parquet", "afd_accept.parquet",       1, runner.Collector.AfdAccept.Count,       false),
+            new DatasetEntry("afd_close",        "parquet", "afd_close.parquet",        1, runner.Collector.AfdClose.Count,        false),
+            new DatasetEntry("afd_bind",         "parquet", "afd_bind.parquet",         1, runner.Collector.AfdBind.Count,         false),
+            new DatasetEntry("ndis_drops",       "parquet", "ndis_drops.parquet",       1, runner.Collector.NdisDrops.Count,       true),
+            new DatasetEntry("packet_capture",   "parquet", "packet_capture.parquet",   1, runner.Collector.NdisPacketCapture.Count, false),
+            new DatasetEntry("http_recv",        "parquet", "http_recv.parquet",        1, runner.Collector.HttpRecv.Count,        false),
+            new DatasetEntry("http_deliver",     "parquet", "http_deliver.parquet",     1, runner.Collector.HttpDeliver.Count,     false),
+            new DatasetEntry("http_send",        "parquet", "http_send.parquet",        1, runner.Collector.HttpSend.Count,        false),
+            new DatasetEntry("http_close",       "parquet", "http_close.parquet",       1, runner.Collector.HttpClose.Count,       false),
+            new DatasetEntry("quic_conn_created","parquet", "quic_conn_created.parquet",1, runner.Collector.QuicConnCreated.Count, false),
+            new DatasetEntry("quic_conn_closed", "parquet", "quic_conn_closed.parquet", 1, runner.Collector.QuicConnClosed.Count,  false),
+            new DatasetEntry("quic_packet_recv", "parquet", "quic_packet_recv.parquet", 1, runner.Collector.QuicPacketRecv.Count,  false),
+            new DatasetEntry("quic_packet_send", "parquet", "quic_packet_send.parquet", 1, runner.Collector.QuicPacketSend.Count,  false),
+            new DatasetEntry("quic_ack_recv",    "parquet", "quic_ack_recv.parquet",    1, runner.Collector.QuicAckReceived.Count, false),
+        });
+        if (runner.Collector.Process.Count > 0)
+            datasets.Add(new("process", "parquet", "process.parquet", 1, runner.Collector.Process.Count, true));
+        if (runner.Collector.Image.Count > 0)
+            datasets.Add(new("image", "parquet", "image.parquet", 1, runner.Collector.Image.Count, true));
+        if (runner.Collector.DiskIo.Count > 0)
+            datasets.Add(new("diskio", "parquet", "diskio.parquet", 1, runner.Collector.DiskIo.Count, true));
+        if (runner.Collector.DpcIsr.Count > 0)
+            datasets.Add(new("dpc_isr", "parquet", "dpc_isr.parquet", 1, runner.Collector.DpcIsr.Count, true));
+        if (req.IncludeTracelogging && runner.Collector.Tracelogging.Count > 0)
+            datasets.Add(new("tracelogging_events", "parquet", "tracelogging_events.parquet", 1, runner.Collector.Tracelogging.Count, true));
+    }
 
     phase = "writing-parquet";
     sysconfigBytes = runner.Sysconfig.WriteFile(req.StagingDir);
+    // sysconfig.txt lives at the staging-dir root in both strategies (contract §9.2).
+    datasets.Add(new("sysconfig", "text", "sysconfig.txt", 1, 1, true));
 
     phase = "writing-manifest";
     emit.Heartbeat(phase);
@@ -164,50 +226,8 @@ try
     if (req.PanicProbe == "manifest_write_panic")
         throw new InvalidOperationException("panic_probe=manifest_write_panic triggered");
 
-    datasets.AddRange(new[]
-    {
-        new DatasetEntry("sampled_profile",  "parquet", "sampled_profile.parquet",  1, runner.Collector.SampledProfile.Count, true),
-        new DatasetEntry("cswitch_events",   "parquet", "cswitch_events.parquet",   1, runner.Collector.CSwitch.Count,        true),
-        new DatasetEntry("readythread",      "parquet", "readythread.parquet",      1, runner.Collector.ReadyThread.Count,    true),
-        new DatasetEntry("tcpip_recv",       "parquet", "tcpip_recv.parquet",       1, runner.Collector.TcpipRecv.Count,      true),
-        new DatasetEntry("tcpip_send",       "parquet", "tcpip_send.parquet",       1, runner.Collector.TcpipSend.Count,      false),
-        new DatasetEntry("tcpip_connect",    "parquet", "tcpip_connect.parquet",    1, runner.Collector.TcpipConnect.Count,   false),
-        new DatasetEntry("tcpip_accept",     "parquet", "tcpip_accept.parquet",     1, runner.Collector.TcpipAccept.Count,    false),
-        new DatasetEntry("tcpip_retransmit", "parquet", "tcpip_retransmit.parquet", 1, runner.Collector.TcpipRetransmit.Count, false),
-        new DatasetEntry("tcpip_disconnect", "parquet", "tcpip_disconnect.parquet", 1, runner.Collector.TcpipDisconnect.Count, false),
-        new DatasetEntry("udp_recv",         "parquet", "udp_recv.parquet",         1, runner.Collector.UdpRecv.Count,         false),
-        new DatasetEntry("udp_send",         "parquet", "udp_send.parquet",         1, runner.Collector.UdpSend.Count,         false),
-        new DatasetEntry("afd_recv",         "parquet", "afd_recv.parquet",         1, runner.Collector.AfdRecv.Count,         true),
-        new DatasetEntry("afd_send",         "parquet", "afd_send.parquet",         1, runner.Collector.AfdSend.Count,         false),
-        new DatasetEntry("afd_connect",      "parquet", "afd_connect.parquet",      1, runner.Collector.AfdConnect.Count,      false),
-        new DatasetEntry("afd_accept",       "parquet", "afd_accept.parquet",       1, runner.Collector.AfdAccept.Count,       false),
-        new DatasetEntry("afd_close",        "parquet", "afd_close.parquet",        1, runner.Collector.AfdClose.Count,        false),
-        new DatasetEntry("afd_bind",         "parquet", "afd_bind.parquet",         1, runner.Collector.AfdBind.Count,         false),
-        new DatasetEntry("ndis_drops",       "parquet", "ndis_drops.parquet",       1, runner.Collector.NdisDrops.Count,       true),
-        new DatasetEntry("packet_capture",   "parquet", "packet_capture.parquet",   1, runner.Collector.NdisPacketCapture.Count, false),
-        new DatasetEntry("http_recv",        "parquet", "http_recv.parquet",        1, runner.Collector.HttpRecv.Count,        false),
-        new DatasetEntry("http_deliver",     "parquet", "http_deliver.parquet",     1, runner.Collector.HttpDeliver.Count,     false),
-        new DatasetEntry("http_send",        "parquet", "http_send.parquet",        1, runner.Collector.HttpSend.Count,        false),
-        new DatasetEntry("http_close",       "parquet", "http_close.parquet",       1, runner.Collector.HttpClose.Count,       false),
-        new DatasetEntry("quic_conn_created","parquet", "quic_conn_created.parquet",1, runner.Collector.QuicConnCreated.Count, false),
-        new DatasetEntry("quic_conn_closed", "parquet", "quic_conn_closed.parquet", 1, runner.Collector.QuicConnClosed.Count,  false),
-        new DatasetEntry("quic_packet_recv", "parquet", "quic_packet_recv.parquet", 1, runner.Collector.QuicPacketRecv.Count,  false),
-        new DatasetEntry("quic_packet_send", "parquet", "quic_packet_send.parquet", 1, runner.Collector.QuicPacketSend.Count,  false),
-        new DatasetEntry("quic_ack_recv",    "parquet", "quic_ack_recv.parquet",    1, runner.Collector.QuicAckReceived.Count, false),
-        new DatasetEntry("sysconfig",        "text",    "sysconfig.txt",            1, 1,                                       true),
-    });
-    if (runner.Collector.Process.Count > 0)
-        datasets.Add(new("process", "parquet", "process.parquet", 1, runner.Collector.Process.Count, true));
-    if (runner.Collector.Image.Count > 0)
-        datasets.Add(new("image", "parquet", "image.parquet", 1, runner.Collector.Image.Count, true));
-    if (runner.Collector.DiskIo.Count > 0)
-        datasets.Add(new("diskio", "parquet", "diskio.parquet", 1, runner.Collector.DiskIo.Count, true));
-    if (runner.Collector.DpcIsr.Count > 0)
-        datasets.Add(new("dpc_isr", "parquet", "dpc_isr.parquet", 1, runner.Collector.DpcIsr.Count, true));
-    if (req.IncludeTracelogging && runner.Collector.Tracelogging.Count > 0)
-        datasets.Add(new("tracelogging_events", "parquet", "tracelogging_events.parquet", 1, runner.Collector.Tracelogging.Count, true));
     manifestBytes = ManifestEmitter.WriteCacheManifest(req.StagingDir, req.EtlPath, req.Strategy, datasets,
-        complete: true, runId: null, qpcOrigin: runner.QpcOrigin, perfFreq: runner.PerfFreq);
+        complete: true, runId: streamingRunId, qpcOrigin: runner.QpcOrigin, perfFreq: runner.PerfFreq);
 }
 catch (Exception ex)
 {
