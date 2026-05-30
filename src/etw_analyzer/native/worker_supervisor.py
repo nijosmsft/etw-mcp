@@ -78,6 +78,7 @@ class NativeWorkerResult:
     result: dict[str, Any] | None = None
     job_isolated: bool = False
     job_memory_limit_bytes: int | None = None
+    aggregation_warnings: list[str] = field(default_factory=list)
 
 
 class NativeWorkerSupervisorError(RuntimeError):
@@ -1095,6 +1096,8 @@ def run_csharp_worker_extraction(
         sidecar_result.message = (
             f"csharp sidecar completed: {agg_result.message}"
         )
+        if agg_result.warnings:
+            sidecar_result.aggregation_warnings = list(agg_result.warnings)
         _telemetry.emit_with(
             _telemetry.EVENT_CSHARP_CACHE_PROMOTE,
             mode="csharp",

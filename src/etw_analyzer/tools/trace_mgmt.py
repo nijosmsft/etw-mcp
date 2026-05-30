@@ -234,6 +234,8 @@ def load_trace(
         if worker_result.ok:
             cached = _load_from_cache(export_dir, path, mode="csharp")
             if cached is not None:
+                if worker_result.aggregation_warnings:
+                    load_notices.extend(worker_result.aggregation_warnings)
                 result = _register_cached_trace(
                     path,
                     export_dir,
@@ -2213,7 +2215,7 @@ def _format_load_summary(trace: TraceData) -> str:
 
     if trace.export_errors:
         lines.append("")
-        lines.append("**Export warnings:**")
+        lines.append(f"## Export errors ({len(trace.export_errors)})")
         for err in trace.export_errors:
             lines.append(f"- {err}")
 
