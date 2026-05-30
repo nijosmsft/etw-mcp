@@ -40,6 +40,7 @@ from typing import Any
 import pandas as pd
 
 from etw_analyzer.native import cache as native_cache
+from etw_analyzer.native import aggregation_worker_adapters as csharp_adapters
 from etw_analyzer.trace_state import TraceData
 
 
@@ -83,10 +84,16 @@ _SIDECAR_STEM_TO_ATTR: dict[str, tuple[str, str]] = {
 # but are still useful to downstream aggregators. They land in ``raw_csv``
 # under the canonical event-class name so the existing aggregators find them.
 _SIDECAR_AUX_STEMS: dict[str, str] = {
-    "process":  "Process/DCStart",
-    "image":    "Image/DCStart",
-    "diskio":   "DiskIo/Read",
-    "dpc_isr":  "PerfInfo/DPC",
+    "process":    "Process/DCStart",
+    "image":      "Image/DCStart",
+    "diskio":     "DiskIo/Read",
+    "dpc_isr":    "PerfInfo/DPC",
+    # ReadyThread events feed both the cpu_timeline and the lock-contention
+    # aggregators. The sidecar emits an empty parquet today (the test
+    # fixture had no ReadyThread events) but the schema is correct; map
+    # it under the canonical native event-class name so any consumer that
+    # looks in raw_csv finds the (possibly empty) DataFrame.
+    "readythread": "ReadyThread",
 }
 
 
@@ -183,6 +190,38 @@ def run_aggregation_worker(
             ok=False,
             message=f"failed to import trace_mgmt: {exc}",
             staging_dir=staging_dir,
+        )
+
+    # Derive header-equivalent metadata from the sidecar parquets +
+    # manifest BEFORE the aggregators run, so cpu_timeline /
+    # trace_metadata / tracestats have what they need.
+    try:
+        derived = csharp_adapters.derive_metadata_from_sidecar(
+            trace, sidecar_manifest
+        )
+        csharp_adapters.apply_metadata_to_trace(trace, derived)
+        # Pre-populate the trace_metadata DataFrame so the existing
+        # ``_native_metadata_dataframe`` path (which only kicks in when
+        # ``_native_extract_stats`` is populated) can be skipped — the
+        # sidecar produces neither logfile_metadata nor extract_stats.
+        if "trace_metadata" not in trace.raw_csv:
+            trace.raw_csv["trace_metadata"] = (
+                csharp_adapters.build_trace_metadata_dataframe(
+                    derived, sidecar_manifest
+                )
+            )
+        # Seed event_counts from the manifest so build_tracestats_text
+        # has provider-equivalent rows to render even though we have no
+        # ExtractStats under csharp mode.
+        csharp_adapters.populate_event_counts_from_manifest(
+            trace, sidecar_manifest
+        )
+    except Exception as exc:
+        result.warnings.append(f"csharp metadata derivation failed: {exc}")
+        LOGGER.warning(
+            "aggregation_worker: csharp metadata derivation failed: %s",
+            exc,
+            exc_info=True,
         )
 
     try:
@@ -308,6 +347,14 @@ def _build_trace_from_staging(
         except Exception as exc:
             warnings.append(f"failed to read sysconfig.txt: {exc}")
 
+    # Normalize csharp-sidecar column names so the native aggregators
+    # (which were written against the in-process worker's ``TimeStamp``
+    # column) see the layout they expect. No-op for non-csharp inputs.
+    try:
+        csharp_adapters.normalize_csharp_trace(trace)
+    except Exception as exc:
+        warnings.append(f"csharp column normalization failed: {exc}")
+
     return trace
 
 
@@ -327,6 +374,15 @@ def _persist_aggregator_outputs(
     skip_keys = {canonical for _, canonical in _SIDECAR_STEM_TO_ATTR.values()}
     skip_keys.update(_SIDECAR_AUX_STEMS.values())
     skip_keys.add("sysconfig")  # Already a text dataset.
+    # Aggregator outputs that are written as `.txt` files by
+    # `_run_native_aggregators._persist_text`. They're also stashed in
+    # ``raw_csv`` as a single-row DataFrame around ``raw_text`` so the
+    # tools surface can return them; persisting them again as parquet
+    # would just duplicate the text on disk.
+    skip_keys.update({
+        "dpc_isr_raw", "cswitch_raw", "tracestats",
+        "process_info", "diskio",
+    })
 
     written: list[str] = []
     for name, df in list(trace.raw_csv.items()):
@@ -424,6 +480,34 @@ def _rewrite_manifest(
             row_count=row_count,
             materialize_on_load=True,
         ))
+
+    # Register text aggregator outputs (dpc_isr_raw, tracestats,
+    # process_info, diskio, sysconfig). These were written to .txt by
+    # `_run_native_aggregators._persist_text` and need explicit
+    # ``kind="text"`` entries so the cache rehydrate path finds them
+    # via _TEXT_DATASETS rather than the dynamic parquet glob.
+    text_outputs = {
+        "dpc_isr_raw":  "dpcisr.txt",
+        "tracestats":   "tracestats.txt",
+        "process_info": "process_info.txt",
+        "diskio":       "diskio.txt",
+        # sysconfig is already registered by the sidecar — skip it
+        # to avoid a duplicate entry, but keep the others.
+    }
+    for name, filename in text_outputs.items():
+        if name in existing_names:
+            continue
+        text_path = staging_dir / filename
+        if not text_path.exists():
+            continue
+        datasets.append(native_cache.CacheDataset(
+            name=name,
+            kind="text",
+            path=filename,
+            row_count=1,
+            materialize_on_load=True,
+        ))
+        existing_names.add(name)
 
     manifest = native_cache.CacheManifest(
         schema_version=native_cache.SCHEMA_VERSION,
