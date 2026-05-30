@@ -245,7 +245,21 @@ try
             datasets.Add(new("process_defunct", "parquet", "process_defunct.parquet", 1, nDefunct, false));
         }
         if (runner.Collector.Image.Count > 0)
+        {
             datasets.Add(new("image", "parquet", "image.parquet", 1, runner.Collector.Image.Count, true));
+            // Phase B per-opcode Image parquets.
+            int iLoad = 0, iDcStart = 0;
+            foreach (var r in runner.Collector.Image)
+            {
+                switch (r.Kind)
+                {
+                    case "Load":    iLoad++;    break;
+                    case "DCStart": iDcStart++; break;
+                }
+            }
+            datasets.Add(new("image_load",    "parquet", "image_load.parquet",    1, iLoad,    false));
+            datasets.Add(new("image_dcstart", "parquet", "image_dcstart.parquet", 1, iDcStart, false));
+        }
         if (runner.Collector.DiskIo.Count > 0)
         {
             datasets.Add(new("diskio", "parquet", "diskio.parquet", 1, runner.Collector.DiskIo.Count, true));

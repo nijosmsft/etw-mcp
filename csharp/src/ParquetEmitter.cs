@@ -65,7 +65,13 @@ internal static class ParquetEmitter
             total += await WriteProcessByKindAsync(ec.Process, "DCEnd",   Path.Combine(stagingDir, "process_dcend.parquet"));
             total += await WriteProcessByKindAsync(ec.Process, "Defunct", Path.Combine(stagingDir, "process_defunct.parquet"));
         }
-        if (ec.Image.Count > 0)    total += await WriteImageAsync(ec.Image,     Path.Combine(stagingDir, "image.parquet"));
+        if (ec.Image.Count > 0)
+        {
+            total += await WriteImageAsync(ec.Image,     Path.Combine(stagingDir, "image.parquet"));
+            // Phase B per-opcode Image parquets — power the Python symbolizer build.
+            total += await WriteImageByKindAsync(ec.Image, "Load",    Path.Combine(stagingDir, "image_load.parquet"));
+            total += await WriteImageByKindAsync(ec.Image, "DCStart", Path.Combine(stagingDir, "image_dcstart.parquet"));
+        }
         if (ec.DiskIo.Count > 0)
         {
             total += await WriteDiskIoAsync(ec.DiskIo,   Path.Combine(stagingDir, "diskio.parquet"));
@@ -685,6 +691,44 @@ internal static class ParquetEmitter
             await rg.WriteColumnAsync(new DataColumn(fQpc, qpc));
             await rg.WriteColumnAsync(new DataColumn(fCpu, cpu));
             await rg.WriteColumnAsync(new DataColumn(fKind, kind));
+            await rg.WriteColumnAsync(new DataColumn(fPid, pid));
+            await rg.WriteColumnAsync(new DataColumn(fBase, bs));
+            await rg.WriteColumnAsync(new DataColumn(fSize, sz));
+            await rg.WriteColumnAsync(new DataColumn(fTds, tds));
+            await rg.WriteColumnAsync(new DataColumn(fName, nm));
+        });
+    }
+
+    /// <summary>
+    /// Per-opcode Image parquet writer — filters by <c>Kind</c>. Schema matches
+    /// <see cref="WriteImageAsync"/> minus the <c>Kind</c> column. Powers the
+    /// Python symbolizer build (image_load + image_dcstart together provide the
+    /// full per-process module map).
+    /// </summary>
+    internal static async Task<long> WriteImageByKindAsync(List<ImageRow> rows, string kind, string path)
+    {
+        var fEventSeq = Df<ulong>("EventSequence", false);
+        var fQpc = Df<long>("TimeStampQpc", false);
+        var fCpu = Df<int>("CPU", false);
+        var fPid = Df<long>("PID", false);
+        var fBase = Df<ulong>("ImageBase", false);
+        var fSize = Df<long>("ImageSize", false);
+        var fTds = Df<long>("TimeDateStamp", false);
+        var fName = DfStr("FileName");
+        var schema = new ParquetSchema(fEventSeq, fQpc, fCpu, fPid, fBase, fSize, fTds, fName);
+        var filtered = new List<ImageRow>(rows.Count);
+        for (int i = 0; i < rows.Count; i++)
+            if (string.Equals(rows[i].Kind, kind, StringComparison.Ordinal)) filtered.Add(rows[i]);
+        return await WriteRowGroupAsync(path, schema, async rg =>
+        {
+            int n = filtered.Count;
+            var es = new ulong[n]; var qpc = new long[n]; var cpu = new int[n];
+            var pid = new long[n]; var bs = new ulong[n];
+            var sz = new long[n]; var tds = new long[n]; var nm = new string?[n];
+            for (int i = 0; i < n; i++) { var r = filtered[i]; es[i] = r.EventSequence; qpc[i] = r.TimeStampQpc; cpu[i] = r.Cpu; pid[i] = r.Pid; bs[i] = r.ImageBase; sz[i] = r.ImageSize; tds[i] = r.TimeDateStamp; nm[i] = r.FileName; }
+            await rg.WriteColumnAsync(new DataColumn(fEventSeq, es));
+            await rg.WriteColumnAsync(new DataColumn(fQpc, qpc));
+            await rg.WriteColumnAsync(new DataColumn(fCpu, cpu));
             await rg.WriteColumnAsync(new DataColumn(fPid, pid));
             await rg.WriteColumnAsync(new DataColumn(fBase, bs));
             await rg.WriteColumnAsync(new DataColumn(fSize, sz));
