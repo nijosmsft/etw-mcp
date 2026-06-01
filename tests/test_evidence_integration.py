@@ -354,6 +354,10 @@ def test_get_entities_rejects_unknown_type(
 def test_get_entities_friendly_when_env_unset(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # This test exercises the env-var gate. Patch _EVIDENCE_AVAILABLE so the
+    # import gate doesn't fire first when evidence-store isn't installed
+    # (the default case on CI / fresh installs).
+    monkeypatch.setattr(evidence_integration, "_EVIDENCE_AVAILABLE", True)
     monkeypatch.delenv(evidence_integration.ENV_VAR, raising=False)
     from etw_analyzer.tools import evidence as evidence_tool
     from etw_analyzer.trace_state import clear_traces, register_trace
