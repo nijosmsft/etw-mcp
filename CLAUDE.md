@@ -24,6 +24,8 @@ src/etw_analyzer/
     system_info.py       ← get_sysconfig, get_process_info, get_diskio_summary, get_trace_stats
     compare.py           ← compare_traces
     summary.py           ← analyze, export_analysis
+    capture_profiles.py  ← list_capture_profiles, get_capture_profile, get_capture_commands, get_capture_instructions
+  profiles/              ← bundled .wprp capture profiles (cpu, cpu_dpc_isr, network, network_minimal, network_packets, xdp_cpumap, quic, ebpf, general) + metadata.py table including the pktmon pseudo-scenario
   parsing/
     wpa_exporter.py      ← xperf subprocess wrapper, all output parsers, export_all_profiles (parallel)
     csv_loader.py        ← BOM/comma-aware CSV → DataFrame normalization
