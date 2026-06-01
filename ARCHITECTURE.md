@@ -8,7 +8,7 @@ and [`CLAUDE.md`](CLAUDE.md) for AI-assistant operating notes.
 
 ## 1. Purpose
 
-`wpr-mcp-server-dotnet-sidecar` is the production tree for an MCP server that
+`etw-mcp` is the production tree for an MCP server that
 loads Windows ETW/WPR `.etl` traces, decodes them into a structured parquet
 cache, and exposes pandas-backed analysis tools (CPU sampling, DPC/ISR, hot
 stacks, network flows, HTTP/QUIC events) over the [Model Context
@@ -26,18 +26,18 @@ or libraries, two are MCP servers.
 
 | Repo | Role | Key entry points |
 |---|---|---|
-| `wpr-mcp-server` (master / production) | Stable production tree of this server (no .NET sidecar, no evidence wiring). | `src/etw_analyzer/server.py`, `README.md` |
-| `wpr-mcp-server-dotnet-sidecar` (this worktree, `feature/dotnet-sidecar`) | Production tree extended with the .NET sidecar (dotnet mode) and evidence-wiring extras. | `src/etw_analyzer/server.py`, `dotnet/`, this `ARCHITECTURE.md` |
+| `etw-mcp` (master / production) | Stable production tree of this server (no .NET sidecar, no evidence wiring). | `src/etw_analyzer/server.py`, `README.md` |
+| `etw-mcp` (this worktree, `feature/dotnet-sidecar`) | Production tree extended with the .NET sidecar (dotnet mode) and evidence-wiring extras. | `src/etw_analyzer/server.py`, `dotnet/`, this `ARCHITECTURE.md` |
 | `wpr-mcp-evidence-store` (library) | Per-machine DuckDB schema + identity helpers (`module_id`, `nic_id`, `machine_id`). No MCP surface; producers and the query MCP both depend on it. | `docs/IDENTITY-SPEC.md`, `docs/PRODUCER-CONTRACT.md` |
 | `wpr-mcp-evidence-query` (MCP, reader) | MCP server that federates across per-machine DuckDB files written by the producers. Headline tool: `correlate_trace_and_dump`. | `src/evidence_query/server.py`, `README.md` |
 | `crash-dump-mcp-server` (MCP, producer-in-design) | Loads `.dmp` files, runs `!analyze`-style workflows. Designed to write the same `module_id`/`nic_id` keys but the wiring branch was rolled back; see `manager-log/VERDICT-dotnet-wiring.md` "Removed scope". | `crash_dump_mcp/server.py`, `README.md` |
 
 ```
             ┌──────────────────────────────┐
-   .etl ─►  │ wpr-mcp-server-dotnet-sidecar│  ──parquet cache──► (instant reload)
+   .etl ─►  │ etw-mcp│  ──parquet cache──► (instant reload)
             │  (ETW writer MCP)            │
             └─────────────┬────────────────┘
-                          │ (optional, WPR_MCP_EVIDENCE_PATH)
+                          │ (optional, ETW_MCP_EVIDENCE_PATH)
                           ▼
                 ┌─────────────────────┐
                 │ wpr-mcp-evidence-   │
@@ -60,7 +60,7 @@ result in a shared parquet cache, then registers a `TraceData` in process. The
 optional evidence hook fires once at the end and is a no-op when not configured.
 
 ```
-            ┌─ dotnet → wpr-mcp-extract.exe (self-contained .NET) ─┐
+            ┌─ dotnet → etw-extract.exe (self-contained .NET) ─┐
 .etl ──►    ├─ native → OpenTraceW + tdh.dll (in-process)         ─┼─► per-event parquets
             └─ xperf  → xperf.exe -a dumper (subprocess pool)     ─┘
                                   │
@@ -81,7 +81,7 @@ optional evidence hook fires once at the end and is a no-op when not configured.
                                                               │
                                                               ▼
                                                   per-machine DuckDB at
-                                                  $WPR_MCP_EVIDENCE_PATH/<machine_id>/
+                                                  $ETW_MCP_EVIDENCE_PATH/<machine_id>/
                                                               │
                                                               ▼
                                                   wpr-mcp-evidence-query
@@ -112,7 +112,7 @@ extra are in `evidence-mcp-poc-plan.md` §1.1:
 |---|---|---|
 | G1 — separate repos for new code | `wpr-mcp-evidence-store` and `wpr-mcp-evidence-query` are new standalone repos. | repo creation, not a code path |
 | G2 — feature branches, never master | worktrees + feature branches; main never touched. | `git log master -1` on this server's parent |
-| G3 — optional dep + double import guard | `evidence-store` lives only in `[project.optional-dependencies] evidence`; integration module does `try: import / except ImportError` AND short-circuits when `WPR_MCP_EVIDENCE_PATH` is unset. | tests in `tests/test_evidence_integration*.py` |
+| G3 — optional dep + double import guard | `evidence-store` lives only in `[project.optional-dependencies] evidence`; integration module does `try: import / except ImportError` AND short-circuits when `ETW_MCP_EVIDENCE_PATH` is unset. | tests in `tests/test_evidence_integration*.py` |
 | G4 — no merge to master during POC | branches stay on `feature/*`; production merge requires a separate human-reviewed PR. | branch state |
 
 The cross-tool identity contract is byte-deterministic so a second producer in
@@ -206,7 +206,7 @@ entity kinds, each keyed by a UUIDv5 derived from a stable identity tuple:
 |---|---|---|
 | `module` | `(image_name_lower, TimeDateStamp, SizeOfImage)` | binary identity; matches across producers regardless of file path |
 | `nic` | `LUID` | network adapter LUID is stable across reboots and rename; friendly name is not |
-| `machine` | `(stable host token)` — see `IDENTITY-SPEC` for the supported derivations | per-machine DB lives at `$WPR_MCP_EVIDENCE_PATH/<machine_id>/evidence.duckdb` |
+| `machine` | `(stable host token)` — see `IDENTITY-SPEC` for the supported derivations | per-machine DB lives at `$ETW_MCP_EVIDENCE_PATH/<machine_id>/evidence.duckdb` |
 
 A producer writes `EvidenceRef` rows pointing at these entities (e.g. "trace
 `trace_0dd889e969b0` saw 1.4M CPU samples in `tcpip.sys` `v10.0.26100.1234`"),
@@ -222,7 +222,7 @@ The contract documents both producers must satisfy:
 This server's integration module is `src/etw_analyzer/evidence_integration.py`
 (behind the optional `evidence` extra). It runs after
 `_run_native_aggregators` and is a no-op when the import fails or
-`WPR_MCP_EVIDENCE_PATH` is unset.
+`ETW_MCP_EVIDENCE_PATH` is unset.
 
 ## 8. Common failure modes
 
@@ -233,16 +233,16 @@ follow this same "what next" pattern.
 
 ```
 load_trace(..., mode="dotnet")
-→ ValueError: mode='dotnet' requested but wpr-mcp-extract.exe was not found.
-  Set WPR_MCP_DOTNET_SIDECAR to the published binary path
-  (e.g. C:\\install\\wpr-mcp-extract.exe), or build it once with
+→ ValueError: mode='dotnet' requested but etw-extract.exe was not found.
+  Set ETW_MCP_DOTNET_SIDECAR to the published binary path
+  (e.g. C:\\install\\etw-extract.exe), or build it once with
   `cd dotnet; dotnet publish -c Release -r win-x64 --self-contained`,
   or use mode='native'/'xperf' instead.
 ```
 
 Fix: build the sidecar (`cd dotnet; dotnet publish -c Release -r win-x64
 --self-contained -o publish\win-x64`) and set
-`WPR_MCP_DOTNET_SIDECAR=...\wpr-mcp-extract.exe`. The auto-detect *intentionally*
+`ETW_MCP_DOTNET_SIDECAR=...\etw-extract.exe`. The auto-detect *intentionally*
 skips the in-tree `dotnet/publish/win-x64/` path so a stray dev build doesn't
 silently change the default pipeline. Explicit `mode="dotnet"` does check that
 path.
@@ -296,9 +296,9 @@ reports which modules failed to resolve and why. The dotnet sidecar does
 load_trace(...)
 → xperf.exe not found. Install Windows Performance Toolkit (part of Windows
   SDK/ADK) or add it to PATH. Expected at: C:\\Program Files (x86)\\Windows
-  Kits\\10\\Windows Performance Toolkit\\xperf.exe — OR set WPR_MCP_MODE=native
+  Kits\\10\\Windows Performance Toolkit\\xperf.exe — OR set ETW_MCP_MODE=native
   / mode=native if the in-process consumer is available, OR build the .NET
-  sidecar and set WPR_MCP_DOTNET_SIDECAR.
+  sidecar and set ETW_MCP_DOTNET_SIDECAR.
 ```
 
 Fix: install the Windows SDK (`winget install Microsoft.WindowsSDK`), or
@@ -334,7 +334,7 @@ shapes. Rebuild the sidecar against the current source tree.
 
 ### In sibling repos (relative paths from this worktree)
 
-* [`../wpr-mcp-server`](../wpr-mcp-server) — production master tree
+* [`../etw-mcp`](../etw-mcp) — production master tree
 * [`../wpr-mcp-evidence-store/README.md`](../wpr-mcp-evidence-store/README.md)
   and `docs/IDENTITY-SPEC.md`, `docs/PRODUCER-CONTRACT.md`
 * [`../wpr-mcp-evidence-query/README.md`](../wpr-mcp-evidence-query/README.md)

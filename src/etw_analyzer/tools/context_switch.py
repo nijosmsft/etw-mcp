@@ -79,7 +79,7 @@ def get_lock_contention(
 
     Requires ReadyThread stacks, either from the xperf on-demand
     ``readythread -stacks`` path or a native event-store loaded with
-    ``WPR_MCP_NATIVE_STREAMING_PROFILE=all``. Native mode is a coverage
+    ``ETW_MCP_NATIVE_STREAMING_PROFILE=all``. Native mode is a coverage
     subset and does not yet implement every xperf CSwitch view.
 
     Args:

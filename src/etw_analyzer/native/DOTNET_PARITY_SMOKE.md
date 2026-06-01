@@ -6,7 +6,7 @@ keys after the Phase A adapter + aggregator hooks land.
 ## Prerequisites
 
 * The C# sidecar binary is built and lives at
-  `C:\git\wpr-mcp-server-dotnet-sidecar\dotnet\publish\win-x64\wpr-mcp-extract.exe`.
+  `C:\git\etw-mcp\dotnet\publish\win-x64\etw-extract.exe`.
 * The test fixture ETL at
   `C:\git\wpr-mcp-poc-staging\cross-mode-smoke\dotnet-mode\spike-fixture.etl`
   still exists (it is the same fixture used by the cross-mode smoke).
@@ -15,12 +15,12 @@ keys after the Phase A adapter + aggregator hooks land.
 ## Procedure
 
 ```powershell
-cd C:\git\wpr-mcp-server-dotnet-sidecar
+cd C:\git\etw-mcp
 
 # Point the auto-detect at the sidecar binary and force dotnet mode.
-$env:WPR_MCP_DOTNET_SIDECAR = "C:\git\wpr-mcp-server-dotnet-sidecar\dotnet\publish\win-x64\wpr-mcp-extract.exe"
-$env:WPR_MCP_MODE = "dotnet"
-$env:WPR_MCP_NATIVE_ALLOW_LARGE = "1"
+$env:ETW_MCP_DOTNET_SIDECAR = "C:\git\etw-mcp\dotnet\publish\win-x64\etw-extract.exe"
+$env:ETW_MCP_MODE = "dotnet"
+$env:ETW_MCP_NATIVE_ALLOW_LARGE = "1"
 
 # Force re-extract so the new Phase A aggregators actually run.
 Remove-Item -Recurse -Force C:\git\wpr-mcp-poc-staging\cross-mode-smoke\dotnet-mode\.etw-export-spike-fixture\

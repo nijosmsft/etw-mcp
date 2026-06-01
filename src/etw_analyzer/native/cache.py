@@ -8,6 +8,12 @@ from pathlib import Path
 from typing import Any
 
 
+# NOTE: The on-disk filename intentionally retains the "wpr-mcp-" prefix
+# even after the v0.4 etw-mcp rename. Renaming it would silently
+# invalidate every user's existing on-disk extracted-parquet cache —
+# their next load_trace would miss the cache and re-extract from scratch.
+# The same string is written by the C# sidecar's ManifestEmitter and
+# read by trace_mgmt.py's _CACHE_MANIFEST_FILENAME constant.
 MANIFEST_FILENAME = "wpr-mcp-cache-manifest.json"
 SCHEMA_VERSION = 3
 LEGACY_SCHEMA_VERSIONS = frozenset({2})

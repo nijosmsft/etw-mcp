@@ -90,15 +90,15 @@ def load_trace(
         mode: Pipeline used to load the trace.
               ``"auto"`` (default — Phase N5) walks the documented
               fallback chain ``dotnet → native → xperf``: the .NET sidecar
-              when the ``WPR_MCP_DOTNET_SIDECAR`` env var is set (or
-              ``wpr-mcp-extract.exe`` is on PATH), then the in-process
+              when the ``ETW_MCP_DOTNET_SIDECAR`` env var is set (or
+              ``etw-extract.exe`` is on PATH), then the in-process
               ``OpenTraceW`` consumer when its bindings load, then the
               legacy text-based ``xperf -a dumper`` as the universal
               opt-out. ``"dotnet"`` forces the .NET sidecar and raises if
               the binary is unfindable (naming the env var override).
               ``"native"`` forces the in-process consumer and raises if
               it's unavailable. ``"xperf"`` forces the legacy pipeline.
-              The ``WPR_MCP_MODE`` environment variable overrides this
+              The ``ETW_MCP_MODE`` environment variable overrides this
               arg when the arg is left at its default. The native and
               dotnet pipelines are fast paths for a curated event /
               aggregation subset; use ``mode="xperf"`` for broadest
@@ -194,12 +194,12 @@ def load_trace(
             "(part of Windows SDK/ADK) or add it to PATH.\n\n"
             "Expected at: C:\\Program Files (x86)\\Windows Kits\\10\\Windows Performance Toolkit\\xperf.exe\n\n"
             "Alternatives that do not need xperf:\n"
-            "  - Pass mode='native' (or set WPR_MCP_MODE=native) to use the "
+            "  - Pass mode='native' (or set ETW_MCP_MODE=native) to use the "
             "in-process ETW consumer when its bindings load on this host.\n"
             "  - Build the .NET sidecar (cd dotnet && dotnet publish -c Release "
-            "-r win-x64 --self-contained), set WPR_MCP_DOTNET_SIDECAR to the "
-            "published wpr-mcp-extract.exe path, and pass mode='dotnet' (or "
-            "set WPR_MCP_MODE=dotnet)."
+            "-r win-x64 --self-contained), set ETW_MCP_DOTNET_SIDECAR to the "
+            "published etw-extract.exe path, and pass mode='dotnet' (or "
+            "set ETW_MCP_MODE=dotnet)."
         )
 
     # Check if we can skip re-export (cached parquet/csv files exist and are newer than ETL)
@@ -701,9 +701,9 @@ def _native_worker_load_failed(worker_result, *, producer: str = "native") -> st
             rebuild_hint = (
                 "\n\nThe sidecar binary may be a stale build. Rebuild with "
                 "`cd dotnet && dotnet publish -c Release -r win-x64 "
-                "--self-contained` and retry. If WPR_MCP_DOTNET_SIDECAR "
+                "--self-contained` and retry. If ETW_MCP_DOTNET_SIDECAR "
                 "points at an old install, update it to the newly-published "
-                "wpr-mcp-extract.exe."
+                "etw-extract.exe."
             )
         return (
             ".NET sidecar ETW worker extraction failed: "
@@ -717,7 +717,7 @@ def _native_worker_load_failed(worker_result, *, producer: str = "native") -> st
         "Native ETW worker extraction failed: "
         f"{detail}\n\n"
         "No trace was loaded. Use mode='xperf' to fall back to the legacy "
-        "xperf pipeline, or unset WPR_MCP_NATIVE_WORKER to retry the "
+        "xperf pipeline, or unset ETW_MCP_NATIVE_WORKER to retry the "
         "in-process native pipeline."
     )
 
@@ -1403,7 +1403,7 @@ def _run_native_aggregators(trace: TraceData) -> None:
 
     # Phase 3 federation hook: register Machine / Module / Process entities
     # in the optional evidence-store. No-op when the library is not
-    # installed OR ``WPR_MCP_EVIDENCE_PATH`` is unset. See
+    # installed OR ``ETW_MCP_EVIDENCE_PATH`` is unset. See
     # ``evidence-mcp-poc-plan.md`` §1.1 G3.
     try:
         from etw_analyzer.evidence_integration import (
@@ -1555,6 +1555,10 @@ _PARQUET_EXCLUDED = frozenset({
 # Cache manifest written after successful exports. Xperf continues to use the
 # v1 flat manifest. Native writes a v2 manifest via etw_analyzer.native.cache,
 # but v1 native manifests remain readable for compatibility.
+#
+# NOTE: The "wpr-mcp-" prefix is intentionally retained after the v0.4
+# etw-mcp rename — see src/etw_analyzer/native/cache.py:MANIFEST_FILENAME
+# for the back-compat rationale.
 _CACHE_MANIFEST_FILENAME = "wpr-mcp-cache-manifest.json"
 _CACHE_SCHEMA_VERSION = 1
 

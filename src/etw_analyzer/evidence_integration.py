@@ -11,10 +11,12 @@ Gating contract (G3 in ``evidence-mcp-poc-plan.md`` §1.1):
    is wrapped in ``try/except ImportError`` so a default
    ``uv sync`` install (without ``--extra evidence``) does NOT pull
    the library and this module still imports cleanly.
-2. Registration is **opt-in** via the ``WPR_MCP_EVIDENCE_PATH``
-   environment variable. When unset, :func:`register_entities_from_trace`
-   is a no-op. With it set, the library writes to
-   ``$WPR_MCP_EVIDENCE_PATH/<machine_id>/evidence.duckdb``.
+2. Registration is **opt-in** via the ``ETW_MCP_EVIDENCE_PATH``
+   environment variable (legacy ``WPR_MCP_EVIDENCE_PATH`` still
+   honored via the env_compat shim with a one-shot DeprecationWarning).
+   When unset, :func:`register_entities_from_trace` is a no-op. With
+   it set, the library writes to
+   ``$ETW_MCP_EVIDENCE_PATH/<machine_id>/evidence.duckdb``.
 3. Any failure inside :func:`register_entities_from_trace` is logged
    and swallowed by the call site — load_trace must never break
    because of evidence wiring.

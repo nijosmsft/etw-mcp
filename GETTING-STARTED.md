@@ -1,6 +1,6 @@
 # Getting Started
 
-Clone-to-first-query walkthrough for `wpr-mcp-server-dotnet-sidecar`. Budget
+Clone-to-first-query walkthrough for `etw-mcp`. Budget
 ~30 minutes the first time. By the end you will have an MCP server running,
 an `.etl` loaded, and answers to the four questions every triage starts with:
 *Where did the CPU go? Which DPCs were slow? Which connections were busy? Why
@@ -42,8 +42,8 @@ fail with actionable errors.
 ## 2. Clone and install
 
 ```powershell
-git clone https://github.com/nijosmsft/wpr-mcp-server-dotnet-sidecar.git
-cd wpr-mcp-server-dotnet-sidecar
+git clone https://github.com/nijosmsft/etw-mcp.git
+cd etw-mcp
 
 # Base install — everything needed to run the MCP server.
 uv sync --group dev
@@ -56,7 +56,7 @@ uv sync --extra evidence
 `uv sync` creates `.venv/` and pins every dependency from `uv.lock`. The
 `--group dev` group adds `pytest` + `pytest-xdist` so you can run the test
 suite. The optional `evidence` extra is silently inert until you set
-`WPR_MCP_EVIDENCE_PATH`.
+`ETW_MCP_EVIDENCE_PATH`.
 
 Smoke-test the install:
 
@@ -79,11 +79,11 @@ cd ..
 
 # Point the server at the binary you just built. Persist this in your shell
 # profile or your MCP client config; the example uses the current session.
-$env:WPR_MCP_DOTNET_SIDECAR = "$PWD\dotnet\publish\win-x64\wpr-mcp-extract.exe"
+$env:ETW_MCP_DOTNET_SIDECAR = "$PWD\dotnet\publish\win-x64\etw-extract.exe"
 ```
 
 The server will now use `dotnet → native → xperf` as its extraction fallback
-chain. Leaving `WPR_MCP_DOTNET_SIDECAR` unset is fine — the chain collapses to
+chain. Leaving `ETW_MCP_DOTNET_SIDECAR` unset is fine — the chain collapses to
 `native → xperf`.
 
 ---
@@ -130,17 +130,17 @@ Edit `claude_desktop_config.json` (Windows path:
     "etw-trace-analyzer": {
       "type": "stdio",
       "command": "uv",
-      "args": ["run", "--project", "C:\\git\\wpr-mcp-server-dotnet-sidecar", "python", "-m", "etw_analyzer.server"],
+      "args": ["run", "--project", "C:\\git\\etw-mcp", "python", "-m", "etw_analyzer.server"],
       "env": {
         "_NT_SYMBOL_PATH": "srv*C:\\symbols*https://msdl.microsoft.com/download/symbols",
-        "WPR_MCP_DOTNET_SIDECAR": "C:\\git\\wpr-mcp-server-dotnet-sidecar\\dotnet\\publish\\win-x64\\wpr-mcp-extract.exe"
+        "ETW_MCP_DOTNET_SIDECAR": "C:\\git\\etw-mcp\\dotnet\\publish\\win-x64\\etw-extract.exe"
       }
     }
   }
 }
 ```
 
-`WPR_MCP_DOTNET_SIDECAR` is optional. Omit it and the server falls back to
+`ETW_MCP_DOTNET_SIDECAR` is optional. Omit it and the server falls back to
 the native consumer (then xperf).
 
 ### VS Code GitHub Copilot
@@ -153,7 +153,7 @@ Add to your MCP config (typically `.vscode/mcp.json` or user settings):
     "etw-trace-analyzer": {
       "type": "stdio",
       "command": "uv",
-      "args": ["run", "--project", "C:\\git\\wpr-mcp-server-dotnet-sidecar", "python", "-m", "etw_analyzer.server"]
+      "args": ["run", "--project", "C:\\git\\etw-mcp", "python", "-m", "etw_analyzer.server"]
     }
   }
 }
@@ -182,8 +182,8 @@ These five tool calls answer the four headline triage questions on any ETL.
 Substitute your own path for the fixture.
 
 ```
-list_traces directory="C:\\git\\wpr-mcp-server-dotnet-sidecar\\tests\\fixtures\\cpu-only-trace"
-load_trace etl_path="C:\\git\\wpr-mcp-server-dotnet-sidecar\\tests\\fixtures\\cpu-only-trace\\cpu-only-trace.etl"
+list_traces directory="C:\\git\\etw-mcp\\tests\\fixtures\\cpu-only-trace"
+load_trace etl_path="C:\\git\\etw-mcp\\tests\\fixtures\\cpu-only-trace\\cpu-only-trace.etl"
 trace_info trace_id="trace_<...>"
 get_sysconfig trace_id="trace_<...>"
 analyze trace_id="trace_<...>"
@@ -297,7 +297,7 @@ To invalidate manually, delete `<etl-parent>\.etw-export-<etl-stem>\`.
 * **.NET sidecar build/run/troubleshoot** — [`dotnet/README.md`](dotnet/README.md)
   and [`src/etw_analyzer/native/SIDECAR.md`](src/etw_analyzer/native/SIDECAR.md).
 * **Evidence federation** — install with `uv sync --extra evidence`, set
-  `WPR_MCP_EVIDENCE_PATH=C:\evidence`, then load any trace; rows appear at
+  `ETW_MCP_EVIDENCE_PATH=C:\evidence`, then load any trace; rows appear at
   `C:\evidence\<machine_id>\evidence.duckdb`. The reader MCP is
   [`wpr-mcp-evidence-query`](../wpr-mcp-evidence-query).
 * **Trouble?** [`ARCHITECTURE.md`](ARCHITECTURE.md) §8 lists the six common
@@ -311,8 +311,8 @@ To invalidate manually, delete `<etl-parent>\.etw-export-<etl-stem>\`.
 
 | Symptom | Likely fix |
 |---|---|
-| `xperf.exe not found` | Install Windows Performance Toolkit (Windows SDK), or set `mode="native"` if your build supports the in-process consumer, or build the sidecar and set `WPR_MCP_DOTNET_SIDECAR`. |
-| `mode='dotnet' requested but wpr-mcp-extract.exe was not found` | Build the sidecar (`cd dotnet; dotnet publish -c Release -r win-x64 --self-contained`) and set `WPR_MCP_DOTNET_SIDECAR` to the published exe path. |
+| `xperf.exe not found` | Install Windows Performance Toolkit (Windows SDK), or set `mode="native"` if your build supports the in-process consumer, or build the sidecar and set `ETW_MCP_DOTNET_SIDECAR`. |
+| `mode='dotnet' requested but etw-extract.exe was not found` | Build the sidecar (`cd dotnet; dotnet publish -c Release -r win-x64 --self-contained`) and set `ETW_MCP_DOTNET_SIDECAR` to the published exe path. |
 | Functions show up as `module+0x...` | `_NT_SYMBOL_PATH` is unset or the symbol cache is unwritable. Set the env var, call `resolve_symbols`. |
 | `Trace ... not found. Call load_trace first.` | The trace was unloaded or the client lost state. Call `list_loaded_traces`, then `load_trace` again. The cache should make this fast. |
 | `another process is writing to .etw-export-...` | A prior load was killed. Delete the `.etw-export-<stem>\` directory next to the ETL and retry. |

@@ -16,7 +16,7 @@
     Keyword hard-coded to 0x7FFFFFFFFFFFFFFF (never all-bits-set, which
     triggers a downlevel WPR bug).
 -->
-<WindowsPerformanceRecorder Version="1.0" Author="wpr-mcp-server" Company="wpr-mcp-server">
+<WindowsPerformanceRecorder Version="1.0" Author="etw-mcp" Company="etw-mcp">
     <Profiles>
         <SystemCollector Id="SystemCollector_NetPkt" Name="NT Kernel Logger">
             <BufferSize Value="4096"/>

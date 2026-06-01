@@ -1,6 +1,6 @@
 """Post-sidecar aggregator runner.
 
-The C# sidecar (``wpr-mcp-extract.exe``) writes ETW Layer-1 (raw decoded
+The C# sidecar (``etw-extract.exe``) writes ETW Layer-1 (raw decoded
 events) and Layer-2 (per-class parquets) into a staging directory. This
 module runs the Python-side aggregators (Layer 3 — ``cpu_sampling``,
 ``dpc_isr``, ``stacks``, ``cpu_timeline``, ``sysconfig``, ``process_info``,

@@ -46,7 +46,7 @@ _NO_HTTP_DATA_MSG = (
     "the HTTP.sys request lifecycle. Standard `xdptrace.wprp` traces do "
     "not include HttpService events. Native event-store caches include "
     "these app-layer classes only with "
-    "`WPR_MCP_NATIVE_STREAMING_PROFILE=all`; the default `summary` profile "
+    "`ETW_MCP_NATIVE_STREAMING_PROFILE=all`; the default `summary` profile "
     "intentionally skips them."
 )
 
@@ -56,7 +56,7 @@ _NO_QUIC_DATA_MSG = (
     "`Microsoft-Quic` provider must be enabled to record QUIC connection "
     "state. Standard `xdptrace.wprp` traces do not include MsQuic events. "
     "Native event-store caches include these app-layer classes only with "
-    "`WPR_MCP_NATIVE_STREAMING_PROFILE=all`; the default `summary` profile "
+    "`ETW_MCP_NATIVE_STREAMING_PROFILE=all`; the default `summary` profile "
     "intentionally skips them."
 )
 
