@@ -89,7 +89,10 @@ Expect the first `load_trace` call to download 200-500 MB of PDBs to C:\symbols 
 ```powershell
 # 1. Install prerequisites — skip any you already have
 winget install astral-sh.uv              # Python package manager
-winget install Microsoft.WindowsSDK      # Recommended — provides xperf for fallback and full analysis coverage
+winget install --id Microsoft.WindowsADK --override "/features OptionId.WindowsPerformanceToolkit /quiet"
+                                         # Recommended — provides xperf for fallback and full analysis coverage.
+                                         # NOTE: do NOT use Microsoft.WindowsSDK — it is not a valid winget package ID.
+                                         # The --override flag installs just the ~150 MB WPT feature instead of the full ~5 GB ADK.
 
 # 2. Verify the latest release wheel starts (Ctrl+C to stop)
 uv run --no-project --with https://github.com/nijosmsft/wpr-mcp-server/releases/download/<release-tag>/<wheel-file>.whl python -m etw_analyzer.server
@@ -127,7 +130,9 @@ Add to your `.mcp.json` (project root or `~/.claude/.mcp.json`):
 
 ### VS Code (GitHub Copilot)
 
-Add to `.vscode/mcp.json`:
+Add to `.vscode/mcp.json` (workspace) or `%APPDATA%\Code\User\mcp.json` (user-scoped):
+
+> **Note: VS Code uses `servers` as the top-level key, NOT `mcpServers`.** Pasting an `mcpServers` block into a VS Code config silently does nothing — the server will not appear in Copilot. Every other MCP client documented here uses `mcpServers`.
 
 ```json
 {
@@ -144,7 +149,49 @@ Add to `.vscode/mcp.json`:
 }
 ```
 
-Replace the release URL with the wheel asset from the release you want to run.
+### Claude Desktop
+
+Add to `%APPDATA%\Claude\claude_desktop_config.json` (top-level key: `mcpServers`):
+
+```json
+{
+  "mcpServers": {
+    "wpr-trace-analyzer": {
+      "type": "stdio",
+      "command": "uv",
+      "args": ["run", "--no-project", "--with", "https://github.com/nijosmsft/wpr-mcp-server/releases/download/<release-tag>/<wheel-file>.whl", "python", "-m", "etw_analyzer.server"],
+      "env": {
+        "_NT_SYMBOL_PATH": "srv*C:\\symbols*https://msdl.microsoft.com/download/symbols"
+      }
+    }
+  }
+}
+```
+
+### GitHub Copilot CLI
+
+Add to `%USERPROFILE%\.copilot\mcp-config.json` (top-level key: `mcpServers`):
+
+```json
+{
+  "mcpServers": {
+    "wpr-trace-analyzer": {
+      "type": "stdio",
+      "command": "uv",
+      "args": ["run", "--no-project", "--with", "https://github.com/nijosmsft/wpr-mcp-server/releases/download/<release-tag>/<wheel-file>.whl", "python", "-m", "etw_analyzer.server"],
+      "env": {
+        "_NT_SYMBOL_PATH": "srv*C:\\symbols*https://msdl.microsoft.com/download/symbols"
+      }
+    }
+  }
+}
+```
+
+### Cursor
+
+Add to `.cursor/mcp.json` (project root) or `%USERPROFILE%\.cursor\mcp.json` (user-scoped). Top-level key: `mcpServers`. The JSON body is identical to the Claude Code example above.
+
+Replace the release URL in every example with the wheel asset from the release you want to run.
 
 ## Usage
 
@@ -361,9 +408,11 @@ The `WPR_MCP_MODE` environment variable overrides the default when `mode=` is le
 
 #### .NET sidecar mode — recommended (fast, default-preferred in `auto`)
 
+> **~9× faster end-to-end than native on a 1 GB ETL: `dotnet` 45 s vs `native` 429 s on the lab fixture.** Same parquet schema, same `trace_id`, identical cache layout — the only difference is wall-clock on the first `load_trace`.
+
 **What it is.** A self-contained .NET 8 binary (`wpr-mcp-extract.exe`, ~40 MB single-file deploy) that decodes ETW Layer-1 events from an ETL into per-class parquet files. The Python server invokes it as a subprocess, streams its JSONL progress, then runs the same Layer-3 aggregators it would for native mode.
 
-**When to use it.** The default choice for everything. ~9× faster end-to-end than native on a 1 GB ETL (45s vs 429s on the lab fixture), correct TraceLogging decode out of the box, and the cache layout is identical to native mode so you don't lock yourself in.
+**When to use it.** The default choice for everything. Correct TraceLogging decode out of the box, and the cache layout is identical to native mode so you don't lock yourself in.
 
 **How to enable it.**
 
