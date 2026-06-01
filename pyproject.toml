@@ -28,27 +28,35 @@ dependencies = [
     "pyarrow>=14.0",
 ]
 
-# Evidence-store federation (POC, gated). Production users running plain
-# ``uv sync`` get zero new behavior. Opt in with
-# ``uv sync --extra evidence`` AND ``WPR_MCP_EVIDENCE_PATH=<dir>``.
+# Evidence-store federation is OFF by default and not installed as a default
+# dep. The integration in src/etw_analyzer/evidence_integration.py is
+# guarded by ``try/except ImportError`` AND the ``WPR_MCP_EVIDENCE_PATH``
+# env var, so an unchanged-env install behaves identically to a v0.1.x
+# install.
 #
-# The ``evidence-store`` package lives in a separate private repo
-# (https://github.com/nijosmsft/evidence-store). It is not on PyPI. To
-# resolve the optional ``evidence`` extra, users must provide their own
-# ``[tool.uv.sources]`` override in a workspace pyproject or via
-# ``--with``. Example:
+# To enable evidence federation (POC):
 #
-#     [tool.uv.sources]
-#     evidence-store = { git = "https://github.com/nijosmsft/evidence-store" }
+#   1. Install the evidence-store library from its repo. It is not on PyPI:
 #
-#     # or pointing at a local checkout
-#     evidence-store = { path = "../evidence-store", editable = true }
+#         uv pip install git+https://github.com/nijosmsft/evidence-store
 #
-# We do NOT ship a default source here so that ``uv sync`` on machines
-# without the sibling repo (CI, fresh user installs) doesn't try to
-# resolve a path that may not exist.
-[project.optional-dependencies]
-evidence = ["evidence-store"]
+#      or, for a local checkout:
+#
+#         uv pip install -e ../evidence-store
+#
+#   2. Set the env var:
+#
+#         $env:WPR_MCP_EVIDENCE_PATH = "C:\evidence"
+#
+# Once both are in place, ``load_trace`` will register entities into the
+# per-machine DuckDB under ``$WPR_MCP_EVIDENCE_PATH``.
+#
+# The optional extras-dep entry was removed in v0.2.0 because the
+# evidence-store repo is currently private; uv cannot resolve an
+# unauthenticated reference at lockfile-generation time. Once
+# evidence-store is published (PyPI or public git URL), the
+# ``[project.optional-dependencies] evidence = [...]`` group + a
+# ``[tool.uv.sources]`` override will be restored.
 
 [project.urls]
 Homepage = "https://github.com/nijosmsft/wpr-mcp-server"
