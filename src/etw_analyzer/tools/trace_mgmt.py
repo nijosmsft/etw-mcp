@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import os
 import json
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 from etw_analyzer.app import mcp
+from etw_analyzer.native import telemetry as _telemetry
 from etw_analyzer.trace_state import (
     TraceData,
     list_loaded_traces as get_loaded_traces,
@@ -86,23 +88,53 @@ def load_trace(
                          non-default timeout values require mode="xperf".
         force: Delete cached exports and re-run xperf. Default: False.
         mode: Pipeline used to load the trace.
-              ``"auto"`` (default — Phase N5) probes the in-process
-              ``OpenTraceW`` consumer and uses it when available, silently
-              falling back to ``xperf.exe`` if the native bindings can't
-              load. ``"native"`` forces the in-process consumer and
-              raises if it's unavailable. ``"xperf"`` forces the legacy
-              text-based ``xperf -a dumper`` extraction. The
-              ``WPR_MCP_MODE`` environment variable overrides this arg
-              when the arg is left at its default. The native pipeline is
-              a fast path for a curated event/aggregation subset, not full
-              ``xperf`` parity; use ``mode="xperf"`` for broadest
+              ``"auto"`` (default — Phase N5) walks the documented
+              fallback chain ``dotnet → native → xperf``: the .NET sidecar
+              when the ``WPR_MCP_DOTNET_SIDECAR`` env var is set (or
+              ``wpr-mcp-extract.exe`` is on PATH), then the in-process
+              ``OpenTraceW`` consumer when its bindings load, then the
+              legacy text-based ``xperf -a dumper`` as the universal
+              opt-out. ``"dotnet"`` forces the .NET sidecar and raises if
+              the binary is unfindable (naming the env var override).
+              ``"native"`` forces the in-process consumer and raises if
+              it's unavailable. ``"xperf"`` forces the legacy pipeline.
+              The ``WPR_MCP_MODE`` environment variable overrides this
+              arg when the arg is left at its default. The native and
+              dotnet pipelines are fast paths for a curated event /
+              aggregation subset; use ``mode="xperf"`` for broadest
               coverage.
     """
     path = Path(etl_path)
     if not path.exists():
-        return f"File not found: {etl_path}"
+        return (
+            f"File not found: {etl_path}\n\n"
+            "Use list_traces(directory=...) to enumerate .etl files in a "
+            "directory, or check the path for typos / drive-letter case. "
+            "load_trace needs an absolute path to an existing .etl file."
+        )
     if not path.suffix.lower() == ".etl":
-        return f"Expected .etl file, got: {path.suffix}"
+        return (
+            f"Expected .etl file, got: {path.suffix or '(no suffix)'}\n\n"
+            f"Path: {etl_path}\n\n"
+            "load_trace only accepts ETW trace files with a .etl extension. "
+            "Use list_traces(directory=...) to find .etl files in a "
+            "directory, or rename the file if you know it is a valid ETW "
+            "trace under a different extension."
+        )
+
+    _load_start_monotonic = time.monotonic()
+    try:
+        etl_size_mb = path.stat().st_size / (1024 * 1024)
+    except OSError:
+        etl_size_mb = None
+    _telemetry.emit_with(
+        _telemetry.EVENT_LOAD_START,
+        mode=mode,
+        trace_id=make_trace_id(path),
+        etl_path=path,
+        etl_size_mb=etl_size_mb,
+        force=force,
+    )
 
     # Resolve the load pipeline. Environment variable overrides the arg
     # when the arg is left at its default. An explicit ``mode="native"``
@@ -111,11 +143,13 @@ def load_trace(
     # silently falling back to xperf, so they know to flip to
     # ``mode="xperf"`` or ``mode="auto"``.
     from etw_analyzer.native.config import (
+        _dotnet_was_forced,
         _native_was_forced,
         apply_native_size_guardrail,
         resolve_mode,
     )
     try:
+        dotnet_was_forced = _dotnet_was_forced(mode)
         native_was_forced = _native_was_forced(mode)
         resolved_mode = resolve_mode(mode, etl_path=path)
         resolved_mode, guardrail_notice = apply_native_size_guardrail(
@@ -148,23 +182,38 @@ def load_trace(
         import shutil
         shutil.rmtree(export_dir)
 
-    # Native mode skips xperf entirely. Without xperf installed we still
-    # try the cache and the native pipeline; if neither works we fall
-    # through to the "xperf.exe not found" error at the bottom of this
-    # block.
+    # Native mode skips xperf entirely. dotnet mode also skips xperf — the
+    # sidecar does the decode. Without xperf installed we still try the cache
+    # and the alternative pipelines; if neither works we fall through to the
+    # "xperf.exe not found" error at the bottom of this block.
     xperf = find_xperf()
-    if xperf is None and resolved_mode != "native":
+    if xperf is None and resolved_mode not in ("native", "dotnet"):
         prefix = f"{guardrail_notice}\n\n" if guardrail_notice else ""
         return prefix + (
             "xperf.exe not found. Install Windows Performance Toolkit "
             "(part of Windows SDK/ADK) or add it to PATH.\n\n"
-            "Expected at: C:\\Program Files (x86)\\Windows Kits\\10\\Windows Performance Toolkit\\xperf.exe"
+            "Expected at: C:\\Program Files (x86)\\Windows Kits\\10\\Windows Performance Toolkit\\xperf.exe\n\n"
+            "Alternatives that do not need xperf:\n"
+            "  - Pass mode='native' (or set WPR_MCP_MODE=native) to use the "
+            "in-process ETW consumer when its bindings load on this host.\n"
+            "  - Build the .NET sidecar (cd dotnet && dotnet publish -c Release "
+            "-r win-x64 --self-contained), set WPR_MCP_DOTNET_SIDECAR to the "
+            "published wpr-mcp-extract.exe path, and pass mode='dotnet' (or "
+            "set WPR_MCP_MODE=dotnet)."
         )
 
     # Check if we can skip re-export (cached parquet/csv files exist and are newer than ETL)
     cached = _load_from_cache(export_dir, path, mode=resolved_mode)
     if cached is not None:
-        return _register_cached_trace(
+        trace_id = make_trace_id(path)
+        _telemetry.emit_with(
+            _telemetry.EVENT_LOAD_CACHE_HIT,
+            mode=resolved_mode,
+            trace_id=trace_id,
+            export_dir=export_dir,
+            datasets=len(cached),
+        )
+        result = _register_cached_trace(
             path,
             export_dir,
             sym_path,
@@ -173,14 +222,77 @@ def load_trace(
             load_notices,
             from_cache=True,
         )
+        _telemetry.emit_with(
+            _telemetry.EVENT_LOAD_COMPLETE,
+            mode=resolved_mode,
+            trace_id=trace_id,
+            wall_seconds=time.monotonic() - _load_start_monotonic,
+            from_cache=True,
+        )
+        return result
 
-    if resolved_mode == "native" and _native_worker_enabled():
-        worker_result = _load_native_with_worker(
+    _telemetry.emit_with(
+        _telemetry.EVENT_LOAD_CACHE_MISS,
+        mode=resolved_mode,
+        trace_id=make_trace_id(path),
+        export_dir=export_dir,
+    )
+
+    if resolved_mode == "dotnet":
+        _telemetry.emit_with(
+            _telemetry.EVENT_LOAD_DISPATCH,
+            mode=resolved_mode,
+            trace_id=make_trace_id(path),
+            dispatch="dotnet_worker",
+        )
+        worker_result = _load_dotnet_with_worker(
             path,
             export_dir,
             sym_path,
         )
         if worker_result.ok:
+            cached = _load_from_cache(export_dir, path, mode="dotnet")
+            if cached is not None:
+                if worker_result.aggregation_warnings:
+                    load_notices.extend(worker_result.aggregation_warnings)
+                result = _register_cached_trace(
+                    path,
+                    export_dir,
+                    sym_path,
+                    "dotnet",
+                    cached,
+                    load_notices,
+                    from_cache=False,
+                )
+                _telemetry.emit_with(
+                    _telemetry.EVENT_LOAD_COMPLETE,
+                    mode="dotnet",
+                    trace_id=make_trace_id(path),
+                    wall_seconds=time.monotonic() - _load_start_monotonic,
+                    from_cache=False,
+                )
+                return result
+            worker_result.message = (
+                "dotnet sidecar completed but the promoted cache could not be loaded"
+            )
+            try:
+                import shutil
+                shutil.rmtree(export_dir)
+            except Exception:
+                pass
+
+        if dotnet_was_forced:
+            return _native_worker_load_failed(worker_result, producer="dotnet")
+
+        # Auto-resolved dotnet failed; fall back along the documented
+        # chain dotnet → native → xperf. Drop to native first when its
+        # worker is enabled, otherwise straight to xperf.
+        if _native_worker_enabled():
+            load_notices.append(
+                ".NET sidecar failed; falling back to mode='native': "
+                f"{worker_result.message}"
+            )
+            resolved_mode = "native"
             cached = _load_from_cache(export_dir, path, mode="native")
             if cached is not None:
                 return _register_cached_trace(
@@ -190,8 +302,60 @@ def load_trace(
                     "native",
                     cached,
                     load_notices,
+                    from_cache=True,
+                )
+        elif xperf is not None:
+            load_notices.append(
+                ".NET sidecar failed; falling back to mode='xperf': "
+                f"{worker_result.message}"
+            )
+            resolved_mode = "xperf"
+            cached = _load_from_cache(export_dir, path, mode="xperf")
+            if cached is not None:
+                return _register_cached_trace(
+                    path,
+                    export_dir,
+                    sym_path,
+                    "xperf",
+                    cached,
+                    load_notices,
+                    from_cache=True,
+                )
+        else:
+            return _native_worker_load_failed(worker_result, producer="dotnet")
+
+    if resolved_mode == "native" and _native_worker_enabled():
+        _telemetry.emit_with(
+            _telemetry.EVENT_LOAD_DISPATCH,
+            mode=resolved_mode,
+            trace_id=make_trace_id(path),
+            dispatch="native_worker",
+        )
+        worker_result = _load_native_with_worker(
+            path,
+            export_dir,
+            sym_path,
+        )
+        if worker_result.ok:
+            cached = _load_from_cache(export_dir, path, mode="native")
+            if cached is not None:
+                result = _register_cached_trace(
+                    path,
+                    export_dir,
+                    sym_path,
+                    "native",
+                    cached,
+                    load_notices,
                     from_cache=False,
                 )
+                _telemetry.emit_with(
+                    _telemetry.EVENT_LOAD_COMPLETE,
+                    mode="native",
+                    trace_id=make_trace_id(path),
+                    wall_seconds=time.monotonic() - _load_start_monotonic,
+                    from_cache=False,
+                )
+                return result
             worker_result.message = (
                 "native worker completed but the promoted cache could not be loaded"
             )
@@ -264,6 +428,13 @@ def load_trace(
         _populate_metadata(trace)
         _write_cache_manifest(trace.export_dir, trace.etl_path, trace.mode, trace.raw_csv)
 
+        _telemetry.emit_with(
+            _telemetry.EVENT_LOAD_COMPLETE,
+            mode="native",
+            trace_id=trace.trace_id,
+            wall_seconds=time.monotonic() - _load_start_monotonic,
+            from_cache=False,
+        )
         return _format_load_summary(trace)
 
     # Build symcache — idempotent, fast when symbols already cached
@@ -320,6 +491,13 @@ def load_trace(
     )
     _start_background_dumper(trace)
 
+    _telemetry.emit_with(
+        _telemetry.EVENT_LOAD_COMPLETE,
+        mode=resolved_mode,
+        trace_id=trace.trace_id,
+        wall_seconds=time.monotonic() - _load_start_monotonic,
+        from_cache=False,
+    )
     return _format_load_summary(trace)
 
 
@@ -362,7 +540,7 @@ def _register_cached_trace(
             dumper_stems=frozenset(),
         )
     streaming_store = (
-        resolved_mode == "native"
+        resolved_mode in ("native", "dotnet")
         and trace.event_store is not None
         and _is_streaming_event_store_cache(export_dir)
     )
@@ -373,7 +551,9 @@ def _register_cached_trace(
                 "Native streaming event-store cache loaded; some low-risk "
                 "aggregate datasets are not present: " + ", ".join(missing)
             )
-    else:
+    elif resolved_mode != "dotnet":
+        # dotnet caches were already populated by the sidecar +
+        # aggregation_worker; no background xperf dumper pass is needed.
         _start_background_dumper(trace)
     if resolved_mode == "native" and not streaming_store:
         trace.wait_for_dumper()
@@ -395,7 +575,7 @@ def _open_native_event_store_from_cache(
 ):
     """Open the optional chunked event store referenced by a native v2 cache."""
 
-    if mode != "native":
+    if mode not in ("native", "dotnet"):
         return None
     manifest_data = _read_cache_manifest(export_dir)
     if manifest_data is None or not _is_native_v2_manifest(manifest_data):
@@ -470,18 +650,69 @@ def _load_native_with_worker(
     )
 
 
-def _native_worker_load_failed(worker_result) -> str:
-    """Return an actionable message for a failed native worker load."""
+def _load_dotnet_with_worker(
+    path: Path,
+    export_dir: Path,
+    sym_path: str | None,
+):
+    """Dispatch to the C# sidecar via worker_supervisor.run_dotnet_worker_extraction.
+
+    Returns a ``NativeWorkerResult`` whose ``ok`` field signals success.
+    The supervisor handles staging, validation, aggregation, and atomic
+    promotion. On failure the staging directory is preserved for debugging
+    per the spike contract.
+    """
+    from etw_analyzer.native.worker_supervisor import run_dotnet_worker_extraction
+
+    return run_dotnet_worker_extraction(
+        etl_path=path,
+        export_dir=export_dir,
+        trace_id=make_trace_id(path),
+        symbol_path=sym_path,
+        requested_event_classes=_DUMPER_EVENT_CLASSES.keys(),
+    )
+
+
+def _native_worker_load_failed(worker_result, *, producer: str = "native") -> str:
+    """Return an actionable message for a failed worker load.
+
+    ``producer`` names which extraction backend produced ``worker_result``
+    so the suggested next steps point at the right alternative(s).
+    """
 
     detail = worker_result.message
-    if getattr(worker_result, "failure_kind", None):
-        detail = f"{worker_result.failure_kind}: {detail}"
+    failure_kind = getattr(worker_result, "failure_kind", None)
+    if failure_kind:
+        detail = f"{failure_kind}: {detail}"
     stderr_tail = getattr(worker_result, "stderr_tail", "")
     if stderr_tail:
         detail = f"{detail}\n\nWorker stderr tail:\n{stderr_tail[-2000:]}"
     invalid_tail = getattr(worker_result, "invalid_stdout_tail", "")
     if invalid_tail:
         detail = f"{detail}\n\nInvalid worker stdout tail:\n{invalid_tail[-2000:]}"
+
+    if producer == "dotnet":
+        # The dotnet sidecar can fail for build-incompatibility reasons that
+        # mode='native' / mode='xperf' will not hit. Surface the rebuild hint
+        # alongside the standard fallback suggestion so callers do not stay
+        # stuck on a stale binary.
+        rebuild_hint = ""
+        if failure_kind in {"invalid-stdout", "invalid-jsonl", "exit-code"}:
+            rebuild_hint = (
+                "\n\nThe sidecar binary may be a stale build. Rebuild with "
+                "`cd dotnet && dotnet publish -c Release -r win-x64 "
+                "--self-contained` and retry. If WPR_MCP_DOTNET_SIDECAR "
+                "points at an old install, update it to the newly-published "
+                "wpr-mcp-extract.exe."
+            )
+        return (
+            ".NET sidecar ETW worker extraction failed: "
+            f"{detail}{rebuild_hint}\n\n"
+            "No trace was loaded. Use mode='native' or mode='xperf' to "
+            "bypass the sidecar (the cache is shared, so a successful run "
+            "under either mode satisfies subsequent loads)."
+        )
+
     return (
         "Native ETW worker extraction failed: "
         f"{detail}\n\n"
@@ -582,6 +813,34 @@ _DUMPER_EVENT_CLASSES: dict[str, tuple[str, str]] = {
     "Quic/PacketRecv":        ("quic_packet_recv_df",  "quic_packet_recv"),
     "Quic/PacketSend":        ("quic_packet_send_df",  "quic_packet_send"),
     "Quic/AckReceived":       ("quic_ack_recv_df",     "quic_ack_recv"),
+    # Phase B (dotnet sidecar): per-opcode kernel-meta event classes.
+    # Names and stem mappings come verbatim from Track P1's handoff in
+    # ``manager-log/phase-b-sidecar-status.md`` ("Stem-name additions to
+    # _DUMPER_EVENT_CLASSES"). The sidecar consumes this dict via
+    # ``requested_event_classes`` to know which event classes to emit
+    # per-opcode parquets for. The native worker has no handlers for
+    # these so the attr fields stay None under mode="native" (the
+    # in-process consumer continues to use the combined parquets from
+    # _SIDECAR_AUX_STEMS instead).
+    "PerfInfo/DPC":          ("perfinfo_dpc_df",          "perfinfo_dpc"),
+    "PerfInfo/ThreadedDPC":  ("perfinfo_threaded_dpc_df", "perfinfo_threaded_dpc"),
+    "PerfInfo/TimerDPC":     ("perfinfo_timer_dpc_df",    "perfinfo_timer_dpc"),
+    "PerfInfo/ISR":          ("perfinfo_isr_df",          "perfinfo_isr"),
+    "Process/Start":         ("process_start_df",         "process_start"),
+    "Process/End":           ("process_end_df",           "process_end"),
+    "Process/DCStart":       ("process_dcstart_df",       "process_dcstart"),
+    "Process/DCEnd":         ("process_dcend_df",         "process_dcend"),
+    "Process/Defunct":       ("process_defunct_df",       "process_defunct"),
+    "Thread/Start":          ("thread_start_df",          "thread_start"),
+    "Thread/End":            ("thread_end_df",            "thread_end"),
+    "Thread/DCStart":        ("thread_dcstart_df",        "thread_dcstart"),
+    "Thread/DCEnd":          ("thread_dcend_df",          "thread_dcend"),
+    "DiskIo/Read":           ("diskio_read_df",           "diskio_read"),
+    "DiskIo/Write":          ("diskio_write_df",          "diskio_write"),
+    "DiskIo/FlushBuffers":   ("diskio_flushbuffers_df",   "diskio_flushbuffers"),
+    "Image/Load":            ("image_load_df",            "image_load"),
+    "Image/DCStart":         ("image_dcstart_df",         "image_dcstart"),
+    "EventTrace/Header":     ("eventtrace_header_df",     "eventtrace_header"),
 }
 
 
@@ -660,7 +919,7 @@ def _start_background_dumper(trace: TraceData) -> None:
     with trace.lock:
         # Already fully populated, or a background thread is already running.
         all_loaded = all(
-            getattr(trace, attr) is not None
+            getattr(trace, attr, None) is not None
             for attr, _ in _DUMPER_EVENT_CLASSES.values()
         )
         if all_loaded or trace._dumper_future is not None:
@@ -673,7 +932,7 @@ def _start_background_dumper(trace: TraceData) -> None:
             if cached_dumper_paths is not None and stem not in cached_dumper_paths:
                 continue
             parquet = _parquet_for(stem)
-            if getattr(trace, attr) is None and parquet.exists():
+            if getattr(trace, attr, None) is None and parquet.exists():
                 try:
                     setattr(trace, attr, pd.read_parquet(parquet))
                 except Exception:
@@ -681,7 +940,7 @@ def _start_background_dumper(trace: TraceData) -> None:
 
         # If everything is cached now, signal ready and return.
         if all(
-            getattr(trace, attr) is not None
+            getattr(trace, attr, None) is not None
             for attr, _ in _DUMPER_EVENT_CLASSES.values()
         ):
             trace._dumper_ready.set()
@@ -696,7 +955,7 @@ def _start_background_dumper(trace: TraceData) -> None:
             wanted: set[str] = {
                 canonical
                 for canonical, (attr, _) in _DUMPER_EVENT_CLASSES.items()
-                if getattr(trace, attr) is None
+                if getattr(trace, attr, None) is None
             }
 
             if not wanted:
@@ -826,7 +1085,7 @@ def _start_background_dumper(trace: TraceData) -> None:
         # Re-check after thread construction — another caller may have
         # raced us in.
         if all(
-            getattr(trace, attr) is not None
+            getattr(trace, attr, None) is not None
             for attr, _ in _DUMPER_EVENT_CLASSES.values()
         ) or trace._dumper_future is not None:
             return
@@ -1255,6 +1514,30 @@ _PARQUET_EXCLUDED = frozenset({
     "quic_packet_recv",
     "quic_packet_send",
     "quic_ack_recv",
+    # Phase B dotnet-sidecar per-opcode kernel-meta parquets. Loaded into
+    # dedicated trace.<class>_df attributes via _DUMPER_EVENT_CLASSES, then
+    # adapted into raw_csv under canonical event-class names by the dotnet
+    # aggregation worker. The glob skip avoids a duplicate stem entry in
+    # raw_csv that would shadow the adapter-normalized canonical keys.
+    "perfinfo_dpc",
+    "perfinfo_threaded_dpc",
+    "perfinfo_timer_dpc",
+    "perfinfo_isr",
+    "process_start",
+    "process_end",
+    "process_dcstart",
+    "process_dcend",
+    "process_defunct",
+    "thread_start",
+    "thread_end",
+    "thread_dcstart",
+    "thread_dcend",
+    "diskio_read",
+    "diskio_write",
+    "diskio_flushbuffers",
+    "image_load",
+    "image_dcstart",
+    "eventtrace_header",
 })
 
 # Cache manifest written after successful exports. Xperf continues to use the
@@ -1265,11 +1548,14 @@ _CACHE_SCHEMA_VERSION = 1
 
 # Datasets that MUST be present (and load successfully) for a cache to be
 # considered usable. Xperf needs cpu_sampling as the historical floor. Native
-# can have traces with no sampled-profile rows, so native completeness is
-# tracked by the per-event parquet set in the manifest instead.
+# and dotnet can have traces with no sampled-profile rows, so completeness is
+# tracked by the per-event parquet set in the manifest instead. dotnet shares
+# the native cache shape (the producer field on the v3 manifest carries the
+# distinction).
 _CACHE_REQUIRED_DATASETS_BY_MODE = {
     "xperf": frozenset({"cpu_sampling"}),
     "native": frozenset(),
+    "dotnet": frozenset(),
 }
 
 # Legacy exports may have written .csv instead of .parquet for the original
@@ -1321,17 +1607,25 @@ def _remove_cache_manifest(export_dir: Path) -> None:
 
 
 def _is_native_v2_manifest(manifest: dict) -> bool:
+    """Return True for native cache manifests we know how to read.
+
+    The name predates schema v3 — it now matches any schema version listed
+    in :data:`etw_analyzer.native.cache.SUPPORTED_SCHEMA_VERSIONS`. Both
+    v2 (legacy) and v3 (dotnet/native producer split) caches qualify; the
+    cache loader does the producer-specific translation downstream.
+    """
+
     if manifest.get("mode") != "native":
         return False
     try:
-        from etw_analyzer.native.cache import SCHEMA_VERSION as native_schema_version
+        from etw_analyzer.native.cache import SUPPORTED_SCHEMA_VERSIONS
     except Exception:
         return False
-    return manifest.get("schema_version") == native_schema_version
+    return manifest.get("schema_version") in SUPPORTED_SCHEMA_VERSIONS
 
 
 def _required_dumper_stems_for_mode(mode: str) -> frozenset[str]:
-    if mode == "native":
+    if mode in ("native", "dotnet"):
         return frozenset(stem for _, stem in _DUMPER_EVENT_CLASSES.values())
     return frozenset()
 
@@ -1698,7 +1992,14 @@ def _load_from_cache(
 
     manifest = _read_cache_manifest(export_dir)
     if manifest is not None and _is_native_v2_manifest(manifest):
-        return _load_native_v2_from_cache(export_dir, etl_path, mode, manifest)
+        # dotnet and native share the on-disk cache shape (dotnet writes
+        # mode="native" into the manifest). When the caller asks for
+        # mode="dotnet", validate against the manifest's intrinsic mode
+        # but keep the requested mode visible to the rest of the loader.
+        manifest_mode = "native" if mode == "dotnet" else mode
+        return _load_native_v2_from_cache(
+            export_dir, etl_path, manifest_mode, manifest
+        )
 
     legacy_xperf = manifest is None
     if manifest is None:
@@ -1961,7 +2262,7 @@ def _format_load_summary(trace: TraceData) -> str:
 
     if trace.export_errors:
         lines.append("")
-        lines.append("**Export warnings:**")
+        lines.append(f"## Export errors ({len(trace.export_errors)})")
         for err in trace.export_errors:
             lines.append(f"- {err}")
 
@@ -2208,7 +2509,16 @@ def _resolve_symbols_impl(trace_id: str, modules: str | None) -> str:
 
     xperf = find_xperf()
     if xperf is None:
-        return "xperf.exe not found."
+        return (
+            "xperf.exe not found.\n\n"
+            "resolve_symbols uses xperf to build the symcache and download "
+            "PDBs. Install Windows Performance Toolkit (part of Windows "
+            "SDK/ADK) or add it to PATH.\n\n"
+            "Expected at: C:\\Program Files (x86)\\Windows Kits\\10\\Windows Performance Toolkit\\xperf.exe\n\n"
+            "Note: load_trace itself can run under mode='native' or "
+            "mode='dotnet' without xperf, but symbol resolution still "
+            "requires xperf today."
+        )
 
     if not sym_path:
         lines.append("**WARNING:** `_NT_SYMBOL_PATH` is not set. Configure it in `.mcp.json` env.")

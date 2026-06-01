@@ -9,18 +9,22 @@ The resolution order is documented in the design doc §8.1:
        subset for common analysis).
 
 When ``"auto"`` is requested, the resolved mode is computed by probing
-the native consumer; on success the native fast path is used, and on
-failure the result is ``"xperf"``. The auto-detect result is cached for
-the lifetime of the process so we don't re-probe on every load. Native
-mode is not full xperf parity: it decodes a curated subset of providers
-and aggregations, while ``mode="xperf"`` remains the broadest-coverage
-fallback.
+each backend in preference order: ``"dotnet"`` wins when the .NET sidecar
+binary is locatable (see :func:`find_dotnet_sidecar`), then ``"native"``
+when the in-process ETW consumer loads, and finally ``"xperf"`` as the
+universally-available fallback. The auto-detect result is cached for the
+lifetime of the process so we don't re-probe on every load. None of the
+non-xperf modes are full xperf parity — they decode curated subsets of
+providers and aggregations.
 
 When ``"native"`` is requested explicitly but the consumer is not
 available (e.g. running on a non-Windows host, or ``tdh.dll`` failed
-to load), :func:`resolve_mode` raises ``RuntimeError``. Auto silently
-falls back to xperf in the same situation — the contract is "explicit
-wins over graceful degradation".
+to load), :func:`resolve_mode` raises ``RuntimeError``. When
+``"dotnet"`` is requested explicitly but the sidecar binary is not
+locatable, :func:`resolve_mode` raises ``ValueError`` naming the
+``WPR_MCP_DOTNET_SIDECAR`` override. Auto silently falls back along the
+chain in the same situation — the contract is "explicit wins over
+graceful degradation".
 """
 
 from __future__ import annotations
@@ -30,17 +34,111 @@ from pathlib import Path
 from typing import Optional
 
 
-VALID_MODES = frozenset({"xperf", "native", "auto"})
+VALID_MODES = frozenset({"xperf", "native", "dotnet", "auto"})
 DEFAULT_NATIVE_MAX_ETL_MB = 512.0
 NATIVE_MAX_ETL_MB_ENV = "WPR_MCP_NATIVE_MAX_ETL_MB"
 NATIVE_ALLOW_LARGE_ENV = "WPR_MCP_NATIVE_ALLOW_LARGE"
+DOTNET_SIDECAR_ENV = "WPR_MCP_DOTNET_SIDECAR"
+DOTNET_SIDECAR_EXE = "wpr-mcp-extract.exe"
 
 
 # Cache the auto-detect result so we don't pay the ``OpenTraceW`` probe
-# more than once per process. Set to ``None`` while undetermined, then
-# either ``"native"`` (auto chose native) or ``"xperf"`` (probe failed
-# and we fell back).
+# or the .NET sidecar path lookup more than once per process. Set to
+# ``None`` while undetermined, then ``"dotnet"``, ``"native"`` or
+# ``"xperf"`` once resolved.
 _AUTO_CACHED: Optional[str] = None
+_DOTNET_SIDECAR_CACHED: Optional[Path] = None
+_DOTNET_SIDECAR_PROBED: bool = False
+
+
+def find_dotnet_sidecar(*, auto_detect: bool = False) -> Path | None:
+    """Locate the C# sidecar binary ``wpr-mcp-extract.exe``.
+
+    Search order:
+
+    1. ``WPR_MCP_DOTNET_SIDECAR`` environment variable — when set, the
+       value MUST point at an existing file or ``None`` is returned.
+       This lets a deployment pin the exact build that gets exercised.
+    2. Relative to the installed package — ``../../dotnet/publish/win-x64/``
+       resolved from this module's directory. Convenient for in-tree
+       development where ``dotnet publish`` lands the binary next to the
+       Python source. **Skipped when ``auto_detect=True``** — auto-mode
+       should not silently flip a developer's existing native pipeline
+       to dotnet just because they happen to have a publish output
+       lying around.
+    3. ``PATH`` lookup — last resort for system-wide installations.
+
+    The result is cached for the lifetime of the process; tests can clear
+    the cache via :func:`reset_dotnet_cache`. Note that the cache key
+    is **independent** of ``auto_detect`` — the first call wins for the
+    process; pass ``auto_detect=True`` only for the auto-fallback chain.
+
+    Parameters
+    ----------
+    auto_detect:
+        When ``True``, used by :func:`resolve_mode` for the auto chain.
+        Skips the in-tree publish probe so a stale dev build doesn't
+        change the default pipeline. When ``False`` (the default,
+        e.g. an explicit ``mode="dotnet"`` request) all three paths
+        are checked.
+    """
+
+    global _DOTNET_SIDECAR_CACHED, _DOTNET_SIDECAR_PROBED
+
+    # When auto-detecting, never consult the cache — the cache may have
+    # been populated by an explicit lookup that included the in-tree
+    # path. Recompute every time with the narrow rules. This is cheap
+    # (an env var read and a ``shutil.which`` call).
+    if not auto_detect and _DOTNET_SIDECAR_PROBED:
+        return _DOTNET_SIDECAR_CACHED
+
+    candidates: list[Path] = []
+    env_only = False
+
+    env_override = os.environ.get(DOTNET_SIDECAR_ENV)
+    if env_override:
+        # When the env var is set, the caller has pinned an exact path.
+        # Don't fall through to in-tree / PATH lookup — that masks
+        # misconfigurations (typo'd path silently picks up the in-tree
+        # build of a different version).
+        candidates.append(Path(env_override))
+        env_only = True
+    elif not auto_detect:
+        # ``config.py`` lives at ``src/etw_analyzer/native/config.py``. The
+        # in-tree publish output is at ``dotnet/publish/win-x64/`` from the
+        # repo root, i.e. three directories up.
+        here = Path(__file__).resolve()
+        repo_root_guess = here.parent.parent.parent.parent
+        candidates.append(
+            repo_root_guess / "dotnet" / "publish" / "win-x64" / DOTNET_SIDECAR_EXE
+        )
+
+    found: Path | None = None
+    for candidate in candidates:
+        if candidate.is_file():
+            found = candidate.resolve()
+            break
+
+    if found is None and not env_only:
+        # PATH lookup. ``shutil.which`` returns ``None`` when missing.
+        import shutil
+
+        which = shutil.which(DOTNET_SIDECAR_EXE)
+        if which:
+            found = Path(which).resolve()
+
+    if not auto_detect:
+        _DOTNET_SIDECAR_CACHED = found
+        _DOTNET_SIDECAR_PROBED = True
+    return found
+
+
+def reset_dotnet_cache() -> None:
+    """Clear the cached C# sidecar lookup. Primarily for tests."""
+
+    global _DOTNET_SIDECAR_CACHED, _DOTNET_SIDECAR_PROBED
+    _DOTNET_SIDECAR_CACHED = None
+    _DOTNET_SIDECAR_PROBED = False
 
 
 def normalize_mode(mode: Optional[str]) -> str:
@@ -105,6 +203,12 @@ def resolve_mode(
     if candidate == "auto":
         if _AUTO_CACHED is not None:
             return _AUTO_CACHED
+        # Preferred order: dotnet → native → xperf. Auto-detect uses the
+        # conservative .NET sidecar lookup (env var + PATH only), so a
+        # stray in-tree publish build does not flip the default pipeline.
+        if find_dotnet_sidecar(auto_detect=True) is not None:
+            _AUTO_CACHED = "dotnet"
+            return _AUTO_CACHED
         try:
             from .consumer import is_available
         except Exception:
@@ -115,6 +219,21 @@ def resolve_mode(
         else:
             _AUTO_CACHED = "xperf"
         return _AUTO_CACHED
+
+    if candidate == "dotnet":
+        # Explicit dotnet request — fail loudly when the binary cannot
+        # be located so the caller knows to install/publish the sidecar
+        # rather than silently falling through to a different pipeline.
+        if find_dotnet_sidecar() is None:
+            raise ValueError(
+                "mode='dotnet' was requested but the .NET sidecar binary "
+                f"({DOTNET_SIDECAR_EXE}) could not be located. Set the "
+                f"{DOTNET_SIDECAR_ENV} environment variable to the absolute "
+                "path of the built binary, publish it under "
+                "dotnet/publish/win-x64/ in the repo, or add it to PATH. "
+                "Use mode='native' or mode='xperf' to bypass the sidecar."
+            )
+        return candidate
 
     if candidate == "native":
         # Explicit native request — fail loudly when the consumer is
@@ -181,6 +300,20 @@ def _native_was_forced(arg_mode: Optional[str]) -> bool:
     return False
 
 
+def _dotnet_was_forced(arg_mode: Optional[str]) -> bool:
+    if arg_mode:
+        normalized_arg = normalize_mode(arg_mode)
+        if normalized_arg == "dotnet":
+            return True
+        if normalized_arg != "auto":
+            return False
+
+    env_mode = os.environ.get("WPR_MCP_MODE")
+    if env_mode:
+        return normalize_mode(env_mode) == "dotnet"
+    return False
+
+
 def apply_native_size_guardrail(
     arg_mode: Optional[str],
     resolved_mode: str,
@@ -224,15 +357,20 @@ def reset_auto_cache() -> None:
 
     global _AUTO_CACHED
     _AUTO_CACHED = None
+    reset_dotnet_cache()
 
 
 __all__ = [
+    "DOTNET_SIDECAR_ENV",
+    "DOTNET_SIDECAR_EXE",
     "VALID_MODES",
     "DEFAULT_NATIVE_MAX_ETL_MB",
     "NATIVE_ALLOW_LARGE_ENV",
     "NATIVE_MAX_ETL_MB_ENV",
     "apply_native_size_guardrail",
+    "find_dotnet_sidecar",
     "normalize_mode",
     "resolve_mode",
     "reset_auto_cache",
+    "reset_dotnet_cache",
 ]

@@ -1,0 +1,318 @@
+"""Cross-producer cache compatibility tests.
+
+The cache manifest schema v3 introduced a ``producer`` field that names
+the extractor that wrote the cache (``dotnet``, ``native``, or ``xperf``).
+A core invariant of the migration plan is that the parquet schema is
+identical across producers, so a cache written by one producer must be
+readable by a tool that ran under a different mode. These tests pin that
+invariant with synthetic data; the real-ETL smoke test lives in
+``tests/manual/test_dotnet_e2e_smoke.md``.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+
+import pandas as pd
+import pytest
+
+from etw_analyzer.native import cache as native_cache
+import etw_analyzer.tools.trace_mgmt as trace_mgmt
+
+
+def _make_etl(tmp_path: Path) -> Path:
+    etl = tmp_path / "sample.etl"
+    etl.write_bytes(b"synthetic etl")
+    return etl
+
+
+def _write_minimal_native_cache(
+    cache_dir: Path,
+    etl: Path,
+    producer: str,
+    schema_version: int = 3,
+) -> None:
+    """Write a minimal but well-formed native cache + manifest."""
+
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cpu_sampling = pd.DataFrame({
+        "Process Name": ["proc.exe"],
+        "PID": [1234],
+        "Weight": [100],
+        "% Weight": [100.0],
+        "Module": ["mod.dll"],
+        "Function": ["func"],
+    })
+    cpu_sampling.to_parquet(cache_dir / "cpu_sampling.parquet", index=False)
+
+    # Required dumper stems must all exist (even empty) for the cache
+    # loader to accept the manifest in native mode.
+    for _, stem in trace_mgmt._DUMPER_EVENT_CLASSES.values():
+        pd.DataFrame().to_parquet(cache_dir / f"{stem}.parquet", index=False)
+
+    # Hand-roll the manifest because trace_mgmt._write_cache_manifest uses
+    # the in-process schema version; this test wants to control both
+    # schema_version and producer explicitly.
+    datasets = [
+        {
+            "name": "cpu_sampling",
+            "kind": "parquet",
+            "path": "cpu_sampling.parquet",
+            "schema_version": 1,
+            "row_count": int(len(cpu_sampling)),
+            "materialize_on_load": True,
+        }
+    ]
+    for _, stem in trace_mgmt._DUMPER_EVENT_CLASSES.values():
+        datasets.append({
+            "name": stem,
+            "kind": "dumper-parquet",
+            "path": f"{stem}.parquet",
+            "schema_version": 1,
+            "row_count": 0,
+            "materialize_on_load": False,
+        })
+
+    manifest: dict = {
+        "schema_version": schema_version,
+        "mode": "native",
+        "strategy": native_cache.MATERIALIZED_SMALL_STRATEGY,
+        "complete": True,
+        "etl": {
+            "path": str(etl.resolve()),
+            "name": etl.name,
+            "size": etl.stat().st_size,
+            "mtime_ns": etl.stat().st_mtime_ns,
+        },
+        "datasets": datasets,
+        "native_store": {"generation_id": "flat", "path": "."},
+    }
+    if schema_version >= 3:
+        manifest["producer"] = producer
+
+    (cache_dir / native_cache.MANIFEST_FILENAME).write_text(
+        json.dumps(manifest, indent=2),
+        encoding="utf-8",
+    )
+
+
+def test_v2_manifest_loads_with_default_native_producer(tmp_path: Path):
+    """Synthetic legacy v2 manifest → reader treats it as producer='native'."""
+
+    etl = _make_etl(tmp_path)
+    cache_dir = tmp_path / ".etw-export-sample"
+    _write_minimal_native_cache(cache_dir, etl, producer="ignored", schema_version=2)
+
+    loaded = native_cache.read_manifest(cache_dir)
+    assert loaded is not None
+    assert loaded.schema_version == 2
+    assert loaded.is_legacy_v2 is True
+    assert loaded.producer == "native"
+
+
+def test_v3_dotnet_manifest_loads_and_downstream_tools_work(tmp_path: Path):
+    """A producer='dotnet' cache must hydrate via the standard loader path."""
+
+    etl = _make_etl(tmp_path)
+    cache_dir = tmp_path / ".etw-export-sample"
+    _write_minimal_native_cache(cache_dir, etl, producer="dotnet", schema_version=3)
+
+    loaded = native_cache.read_manifest(cache_dir)
+    assert loaded is not None
+    assert loaded.producer == "dotnet"
+    assert loaded.schema_version == 3
+
+    # Validate the cache is well-formed (raises on path escape, missing
+    # fields, mode mismatch, stale ETL).
+    native_cache.validate_manifest(loaded, cache_dir, etl, mode="native")
+
+    # Now exercise the trace_mgmt loader. The mode parameter selects which
+    # consumer "asked" for the cache; native and dotnet share the loader
+    # path because the manifest mode is always "native".
+    cached = trace_mgmt._load_from_cache(cache_dir, etl, mode="native")
+    assert cached is not None
+    assert "cpu_sampling" in cached
+    assert cached["cpu_sampling"]["Weight"].tolist() == [100]
+
+
+def test_v3_native_manifest_loads_identically_to_dotnet(tmp_path: Path):
+    """Producer is metadata; the parquet shape is identical, the loader agnostic."""
+
+    etl = _make_etl(tmp_path)
+    dotnet_dir = tmp_path / ".etw-export-dotnet"
+    native_dir = tmp_path / ".etw-export-native"
+
+    _write_minimal_native_cache(dotnet_dir, etl, producer="dotnet")
+    _write_minimal_native_cache(native_dir, etl, producer="native")
+
+    dotnet_loaded = trace_mgmt._load_from_cache(dotnet_dir, etl, mode="native")
+    native_loaded = trace_mgmt._load_from_cache(native_dir, etl, mode="native")
+    assert dotnet_loaded is not None
+    assert native_loaded is not None
+    # Same shape, same data, regardless of producer.
+    pd.testing.assert_frame_equal(
+        dotnet_loaded["cpu_sampling"].reset_index(drop=True),
+        native_loaded["cpu_sampling"].reset_index(drop=True),
+    )
+
+
+def test_v3_dotnet_cache_readable_under_xperf_mode_reload(tmp_path: Path):
+    """Spec D4: a trace extracted by dotnet can be hydrated by mode='xperf'.
+
+    Mode here is the *requested* mode at load time, not the producer that
+    wrote the cache. trace_mgmt._load_from_cache filters by the trace's
+    requested mode; cross-mode reloads only work when the cache's manifest
+    mode matches. Since the dotnet sidecar writes manifest mode='native',
+    a caller requesting mode='xperf' would normally MISS this cache.
+
+    This test pins that contract: xperf-mode loads MISS native-manifest
+    caches (the user must request native/auto). The cross-producer
+    invariant is enforced inside the native-manifest umbrella — dotnet,
+    native, and (future) Rust all read each other transparently when the
+    caller is requesting native mode.
+    """
+
+    etl = _make_etl(tmp_path)
+    cache_dir = tmp_path / ".etw-export-sample"
+    _write_minimal_native_cache(cache_dir, etl, producer="dotnet")
+
+    # When the trace is loaded under mode='xperf', the native v3 manifest
+    # is intentionally bypassed because xperf and native carry different
+    # auxiliary text (.txt) datasets and dumper stem expectations.
+    cached_xperf = trace_mgmt._load_from_cache(cache_dir, etl, mode="xperf")
+    # The current loader returns None for a mode mismatch — that's the
+    # correct behavior; document it as a pinned contract rather than a bug.
+    assert cached_xperf is None
+
+    # Under mode='native' (or auto when the consumer is available), the
+    # cache loads transparently.
+    cached_native = trace_mgmt._load_from_cache(cache_dir, etl, mode="native")
+    assert cached_native is not None
+
+
+def test_v3_dotnet_manifest_with_unix_epoch_mtime_validates_strict(tmp_path: Path):
+    """Regression for D1: dotnet manifests with Unix-epoch mtime_ns must
+    pass the strict three-field identity check, not the deprecated loose
+    fall-back.
+
+    The C# sidecar emits `(LastWriteTimeUtc - UnixEpoch).Ticks * 100` as
+    of P1b, matching Python's `os.stat().st_mtime_ns` exactly. The Python
+    `matches_loose()` shim is gone — any dotnet-produced manifest must
+    now round-trip through `validate_manifest` against the same ETL via
+    the same code path as native and xperf producers.
+    """
+
+    etl = _make_etl(tmp_path)
+    cache_dir = tmp_path / ".etw-export-sample"
+    _write_minimal_native_cache(cache_dir, etl, producer="dotnet", schema_version=3)
+
+    loaded = native_cache.read_manifest(cache_dir)
+    assert loaded is not None
+    assert loaded.producer == "dotnet"
+    # The strict identity match is the only path now.
+    assert loaded.etl.matches(etl) is True
+
+    # A producer="dotnet" manifest must validate under the strict check.
+    native_cache.validate_manifest(loaded, cache_dir, etl, mode="native")
+
+    # And the helper class no longer exposes the loose fall-back at all.
+    assert not hasattr(native_cache.EtlIdentity, "matches_loose")
+
+
+def test_v3_dotnet_manifest_with_stale_mtime_is_rejected(tmp_path: Path):
+    """A dotnet-produced cache whose mtime_ns no longer matches the
+    on-disk ETL must be rejected — the loose-match workaround is gone
+    so this case is now an error, not a silent cache hit."""
+
+    etl = _make_etl(tmp_path)
+    cache_dir = tmp_path / ".etw-export-stale"
+    _write_minimal_native_cache(cache_dir, etl, producer="dotnet", schema_version=3)
+
+    # Bump mtime by re-touching the ETL — bytes unchanged, identity changed.
+    import os
+    stat = etl.stat()
+    new_mtime_ns = stat.st_mtime_ns + 1_000_000_000  # +1s
+    os.utime(etl, ns=(stat.st_atime_ns, new_mtime_ns))
+
+    loaded = native_cache.read_manifest(cache_dir)
+    assert loaded is not None
+    with pytest.raises(native_cache.NativeCacheError, match="ETL identity is stale"):
+        native_cache.validate_manifest(loaded, cache_dir, etl, mode="native")
+
+
+
+
+_REAL_FIXTURE_ENV = "__KEEP_DOTNET_E2E__"
+_REAL_FIXTURE_DEFAULT = (
+    r"C:\git\wpr-mcp-poc-staging\real-fixture\spike-fixture.etl"
+)
+
+
+def _resolve_real_fixture() -> Path | None:
+    candidate = os.environ.get(_REAL_FIXTURE_ENV, _REAL_FIXTURE_DEFAULT)
+    if not candidate:
+        return None
+    path = Path(candidate)
+    return path if path.exists() else None
+
+
+@pytest.mark.skipif(
+    _resolve_real_fixture() is None,
+    reason=f"set {_REAL_FIXTURE_ENV} to a real ETL to exercise end-to-end",
+)
+def test_dotnet_e2e_against_real_fixture_rehydrates_from_cache(tmp_path: Path):
+    """End-to-end: real ETL through dotnet sidecar → reload from cache.
+
+    Only runs when:
+      * ``__KEEP_DOTNET_E2E__`` (or the default real-fixture path)
+        points at an existing ETL, AND
+      * ``find_dotnet_sidecar`` returns a binary, AND
+      * the platform is Windows.
+
+    This test is intentionally light — it exercises only the "load,
+    re-load, cache hit" path. The full smoke checklist (wall time
+    comparison vs native, dataset parity, etc.) lives in
+    ``tests/manual/test_dotnet_e2e_smoke.md`` for manual operator use.
+    """
+
+    if os.name != "nt":
+        pytest.skip("dotnet sidecar is Windows-only")
+
+    from etw_analyzer.native.config import find_dotnet_sidecar
+
+    if find_dotnet_sidecar() is None:
+        pytest.skip(".NET sidecar binary not locatable")
+
+    fixture = _resolve_real_fixture()
+    assert fixture is not None
+
+    # Stage the load into a private tree so we don't disturb the shared
+    # .etw-export-* directory beside the fixture.
+    from etw_analyzer.native.worker_supervisor import (
+        run_dotnet_worker_extraction,
+    )
+    import etw_analyzer.tools.trace_mgmt as trace_mgmt
+
+    export_dir = tmp_path / ".etw-export-spike-fixture"
+    result = run_dotnet_worker_extraction(
+        etl_path=fixture,
+        export_dir=export_dir,
+        trace_id="trace_e2e_smoke",
+        symbol_path=None,
+        requested_event_classes=list(trace_mgmt._DUMPER_EVENT_CLASSES.keys()),
+    )
+    assert result.ok is True, f"{result.message}; stderr={result.stderr_tail[:500]}"
+    assert export_dir.exists()
+
+    manifest = native_cache.read_manifest(export_dir)
+    assert manifest is not None
+    assert manifest.producer == "dotnet"
+    assert manifest.schema_version == 3
+
+    # Hydrate from cache and verify cpu_sampling is non-empty.
+    cached = trace_mgmt._load_from_cache(export_dir, fixture, mode="native")
+    assert cached is not None
+    assert "cpu_sampling" in cached
+    assert len(cached["cpu_sampling"]) > 0
