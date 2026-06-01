@@ -8,15 +8,59 @@ Works with any Windows performance trace: networking (tcpip.sys, NDIS, NIC drive
 
 ### Quick Install
 
-Copy-paste this into Claude Code, Copilot, or any AI assistant to install automatically. Use `.mcp.json` for Claude Code and `.vscode\mcp.json` for VS Code Copilot; the JSON body is shown in the setup examples below.
+> **The snippet below is hard-coded to v0.2.0.** For the latest version, grab the URLs from <https://github.com/nijosmsft/wpr-mcp-server/releases/latest> and substitute them in.
+
+Copy-paste this into Claude Code, Copilot, or any AI assistant to install automatically.
 
 ```
 Install the WPR trace analyzer MCP server on this Windows machine:
-1. Run: winget install astral-sh.uv (skip if uv is already installed)
-2. Install Windows Performance Toolkit for complete analysis: check if xperf.exe exists at "C:\Program Files (x86)\Windows Kits\10\Windows Performance Toolkit\xperf.exe". If not, run: winget install Microsoft.WindowsSDK
-3. Add the MCP server config shown below to your assistant's MCP config file.
-   {"mcpServers":{"wpr-trace-analyzer":{"type":"stdio","command":"uv","args":["run","--no-project","--with","https://github.com/nijosmsft/wpr-mcp-server/releases/download/<release-tag>/<wheel-file>.whl","python","-m","etw_analyzer.server"],"env":{"_NT_SYMBOL_PATH":"srv*C:\\symbols*https://msdl.microsoft.com/download/symbols"}}}}
-4. Verify: run "uv run --no-project --with https://github.com/nijosmsft/wpr-mcp-server/releases/download/<release-tag>/<wheel-file>.whl python -m etw_analyzer.server" and confirm it starts
+
+1. Install uv (skip if `uv --version` already works):
+     winget install astral-sh.uv
+   Note: uv will download a private CPython interpreter on the first `uv run` — benign but expected.
+
+2. Install xperf (skip if "C:\Program Files (x86)\Windows Kits\10\Windows Performance Toolkit\xperf.exe" exists):
+     winget install --id Microsoft.WindowsADK --override "/features OptionId.WindowsPerformanceToolkit /quiet"
+   The Windows Performance Toolkit is a ~150 MB feature of the Windows ADK; do NOT use `Microsoft.WindowsSDK` — it is not a valid winget ID.
+
+3. Download the .NET sidecar (38 MB; gives a ~9x faster load_trace than the in-process fallback; no .NET runtime install needed — the binary is self-contained):
+     New-Item -ItemType Directory -Force -Path C:\install | Out-Null
+     Invoke-WebRequest `
+       -Uri https://github.com/nijosmsft/wpr-mcp-server/releases/download/v0.2.0/wpr-mcp-extract.exe `
+       -OutFile C:\install\wpr-mcp-extract.exe
+
+4. Add this MCP server config to the file for your client:
+     - Claude Code (project):     <repo>\.mcp.json                              top-level key: "mcpServers"
+     - Claude Code (user):        %USERPROFILE%\.claude.json                    top-level key: "mcpServers"
+     - Claude Desktop:            %APPDATA%\Claude\claude_desktop_config.json   top-level key: "mcpServers"
+     - GitHub Copilot CLI:        %USERPROFILE%\.copilot\mcp-config.json        top-level key: "mcpServers"
+     - VS Code GitHub Copilot:    <repo>\.vscode\mcp.json  OR  %APPDATA%\Code\User\mcp.json
+                                                                                  top-level key: "servers"   <- not "mcpServers"
+     - Cursor:                    <repo>\.cursor\mcp.json  OR  %USERPROFILE%\.cursor\mcp.json
+                                                                                  top-level key: "mcpServers"
+
+     {
+       "<top-level-key>": {
+         "wpr-trace-analyzer": {
+           "type": "stdio",
+           "command": "uv",
+           "args": ["run", "--no-project", "--with",
+                    "https://github.com/nijosmsft/wpr-mcp-server/releases/download/v0.2.0/wpr_mcp_server-0.2.0-py3-none-any.whl",
+                    "python", "-m", "etw_analyzer.server"],
+           "env": {
+             "_NT_SYMBOL_PATH": "srv*C:\\symbols*https://msdl.microsoft.com/download/symbols",
+             "WPR_MCP_DOTNET_SIDECAR": "C:\\install\\wpr-mcp-extract.exe"
+           }
+         }
+       }
+     }
+
+5. Verify the wheel imports cleanly (does NOT hang; exits with "OK"):
+     uv run --no-project `
+       --with https://github.com/nijosmsft/wpr-mcp-server/releases/download/v0.2.0/wpr_mcp_server-0.2.0-py3-none-any.whl `
+       python -c "import etw_analyzer.server; print('OK - wpr-mcp-server v0.2.0 importable')"
+
+Expect the first `load_trace` call to download 200-500 MB of PDBs to C:\symbols (one-time; subsequent loads use the cache).
 ```
 
 ## Features
