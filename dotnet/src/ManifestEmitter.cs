@@ -1,7 +1,7 @@
 using System.Text;
 using System.Text.Json;
 
-namespace WprMcpExtract;
+namespace EtwExtract;
 
 internal static class ManifestEmitter
 {
@@ -81,6 +81,11 @@ internal static class ManifestEmitter
             },
             native_store = nativeStore,
         };
+        // NOTE: The manifest filename intentionally retains the "wpr-mcp-"
+        // prefix even after the v0.4 etw-mcp rename. The Python loader keys
+        // user cache discovery off this exact filename
+        // (see src/etw_analyzer/native/cache.py:MANIFEST_FILENAME); renaming
+        // it would invalidate every user's on-disk extracted-parquet cache.
         var path = Path.Combine(stagingDir, "wpr-mcp-cache-manifest.json");
         var json = JsonSerializer.Serialize(manifest, new JsonSerializerOptions
         {

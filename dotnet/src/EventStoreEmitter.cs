@@ -3,9 +3,9 @@ using System.Text.Json;
 using Parquet;
 using Parquet.Data;
 using Parquet.Schema;
-using WprMcpExtract.Rows;
+using EtwExtract.Rows;
 
-namespace WprMcpExtract;
+namespace EtwExtract;
 
 /// <summary>
 /// Writes the <c>event-store-streaming</c> strategy layout per spike-contract

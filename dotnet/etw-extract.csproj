@@ -2,8 +2,8 @@
   <PropertyGroup>
     <OutputType>Exe</OutputType>
     <TargetFramework>net8.0</TargetFramework>
-    <RootNamespace>WprMcpExtract</RootNamespace>
-    <AssemblyName>wpr-mcp-extract</AssemblyName>
+    <RootNamespace>EtwExtract</RootNamespace>
+    <AssemblyName>etw-extract</AssemblyName>
     <LangVersion>latest</LangVersion>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>

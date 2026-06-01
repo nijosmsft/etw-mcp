@@ -1,4 +1,4 @@
-namespace WprMcpExtract.Rows;
+namespace EtwExtract.Rows;
 
 // Mutable row types — the stack pairing pass writes the Stack field
 // after the row has been appended.

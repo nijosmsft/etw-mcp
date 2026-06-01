@@ -1,9 +1,9 @@
 using Parquet;
 using Parquet.Data;
 using Parquet.Schema;
-using WprMcpExtract.Rows;
+using EtwExtract.Rows;
 
-namespace WprMcpExtract;
+namespace EtwExtract;
 
 /// <summary>
 /// Writes Layer 1 flat-per-class parquets using the lower-level Parquet.Net

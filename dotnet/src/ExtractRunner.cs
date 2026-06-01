@@ -3,8 +3,8 @@ using System.Net;
 using Microsoft.Diagnostics.Tracing;
 using Microsoft.Diagnostics.Tracing.Parsers;
 using Microsoft.Diagnostics.Tracing.Parsers.Kernel;
-using WprMcpExtract.Rows;
-namespace WprMcpExtract;
+using EtwExtract.Rows;
+namespace EtwExtract;
 
 /// <summary>
 /// Owns the TraceEvent session lifecycle: open ETL, hook events, run
@@ -589,7 +589,7 @@ internal sealed class ExtractRunner
                 }
                 stop.Wait(Math.Max(250, _req.HeartbeatIntervalMs));
             }
-        }) { IsBackground = true, Name = "wpr-mcp-heartbeat" };
+        }) { IsBackground = true, Name = "etw-mcp-heartbeat" };
         hbThread.Start();
 
         try

@@ -1,4 +1,4 @@
-# `wpr-mcp-extract.exe` — .NET sidecar (production)
+# `etw-extract.exe` — .NET sidecar (production)
 
 Sidecar binary that decodes Windows ETL traces into Layer-1 parquets per
 [spike-contract.md](../../wpr-mcp-poc-staging/docs/spike-contract.md).
@@ -11,7 +11,7 @@ and bumps the spike to production quality on `feature/dotnet-sidecar`.
 ```powershell
 cd dotnet
 dotnet publish -c Release -r win-x64 --self-contained -o publish\win-x64
-# → publish\win-x64\wpr-mcp-extract.exe  (self-contained single-file, ~38 MB)
+# → publish\win-x64\etw-extract.exe  (self-contained single-file, ~38 MB)
 ```
 
 `net8.0` LTS. Self-contained single-file deploy. No runtime install required.
@@ -21,8 +21,8 @@ NativeAOT is intentionally not used — see
 ## Run
 
 ```powershell
-wpr-mcp-extract.exe --request <path-to-request.json>
-wpr-mcp-extract.exe --request <path>.json --no-include-tracelogging
+etw-extract.exe --request <path-to-request.json>
+etw-extract.exe --request <path>.json --no-include-tracelogging
 ```
 
 Stdout is reserved for JSONL protocol (heartbeat / progress / result).
@@ -63,7 +63,7 @@ Last green run (Server 2025, 80 CPUs):
 ## Event class coverage
 
 28 canonical classes from Python's `_DUMPER_EVENT_CLASSES`
-([trace_mgmt.py:555-585](../../wpr-mcp-server/src/etw_analyzer/tools/trace_mgmt.py)):
+([trace_mgmt.py:555-585](../../etw-mcp/src/etw_analyzer/tools/trace_mgmt.py)):
 
 Kernel MOF: `SampledProfile`, `CSwitch`, `ReadyThread`, `TcpIp/Recv|Send|Connect|Accept|Retransmit|Disconnect`,
 `UdpIp/Recv|Send`, `Process` (Start/End/DCStart/DCEnd/Defunct), `Thread` (Start/End/DCStart/DCEnd),
@@ -243,7 +243,7 @@ or prod deployment, sign with the engineering Authenticode cert.
 ```
 dotnet/
 ├── README.md                   (this file)
-├── wpr-mcp-extract.csproj      (.NET 8 single-file self-contained)
+├── etw-extract.csproj      (.NET 8 single-file self-contained)
 ├── docs/
 │   ├── event-class-mapping.md  (request-name → handler → parquet stem)
 │   └── signing.md              (Authenticode posture, WDAC/HVCI, SBOM)

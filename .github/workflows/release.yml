@@ -54,7 +54,7 @@ jobs:
 
       - name: Build .NET sidecar (self-contained single-file)
         run: |
-          dotnet publish dotnet/wpr-mcp-extract.csproj `
+          dotnet publish dotnet/etw-extract.csproj `
             -c Release -r win-x64 --self-contained `
             -o dotnet/publish/win-x64
 
@@ -62,7 +62,7 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Copy-Item dotnet/publish/win-x64/wpr-mcp-extract.exe dist/wpr-mcp-extract.exe
+          Copy-Item dotnet/publish/win-x64/etw-extract.exe dist/etw-extract.exe
 
       - name: Build package
         run: uv build

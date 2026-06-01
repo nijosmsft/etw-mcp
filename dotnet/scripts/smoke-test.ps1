@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    End-to-end smoke test for the wpr-mcp-extract C# sidecar.
+    End-to-end smoke test for the etw-extract C# sidecar.
 
 .DESCRIPTION
     Builds the sidecar, runs it against the real lab fixture
@@ -46,7 +46,7 @@ $ErrorActionPreference = "Stop"
 $repoRoot = Split-Path -Parent $PSScriptRoot
 Set-Location $repoRoot
 
-$exe = Join-Path $repoRoot "publish\win-x64\wpr-mcp-extract.exe"
+$exe = Join-Path $repoRoot "publish\win-x64\etw-extract.exe"
 $smokeDir = Join-Path $repoRoot "publish\smoke"
 $matStaging = Join-Path $smokeDir "materialized"
 $streamStaging = Join-Path $smokeDir "streaming"
@@ -67,7 +67,7 @@ if (-not (Test-Path $OracleDir)) { Fail "oracle dir missing: $OracleDir" }
 
 # --- Build ---
 if (-not $SkipBuild) {
-    Write-Header "Building wpr-mcp-extract"
+    Write-Header "Building etw-extract"
     & dotnet publish -c Release -r win-x64 --self-contained -o publish\win-x64 --nologo `
         | Where-Object { $_ -match "error|Error|->" }
     if ($LASTEXITCODE -ne 0) { Fail "dotnet publish exited $LASTEXITCODE" }
@@ -113,7 +113,7 @@ function Invoke-Sidecar {
     if (Test-Path $Staging) { Remove-Item -Recurse -Force $Staging }
     New-Item -ItemType Directory $Staging | Out-Null
 
-    $env:WPR_MCP_NATIVE_ALLOW_LARGE = "1"
+    $env:ETW_MCP_NATIVE_ALLOW_LARGE = "1"
     $sw = [Diagnostics.Stopwatch]::StartNew()
     $stdout = & $exe --request $RequestPath 2>$null
     $sw.Stop()

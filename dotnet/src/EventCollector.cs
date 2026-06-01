@@ -1,6 +1,6 @@
-using WprMcpExtract.Rows;
+using EtwExtract.Rows;
 
-namespace WprMcpExtract;
+namespace EtwExtract;
 
 /// <summary>
 /// Pending-row buffer for stack pairing. Per spike contract §10, capacity
