@@ -47,6 +47,23 @@ jobs:
       - name: Run tests
         run: uv run --python 3.11 --group dev pytest tests/ -q
 
+      - name: Set up .NET 8 LTS
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Build .NET sidecar (self-contained single-file)
+        run: |
+          dotnet publish dotnet/wpr-mcp-extract.csproj `
+            -c Release -r win-x64 --self-contained `
+            -o dotnet/publish/win-x64
+
+      - name: Stage sidecar binary for release
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item dotnet/publish/win-x64/wpr-mcp-extract.exe dist/wpr-mcp-extract.exe
+
       - name: Build package
         run: uv build
 

@@ -1,6 +1,6 @@
 [project]
 name = "wpr-mcp-server"
-version = "0.1.0"
+version = "0.2.0"
 description = "MCP server for analyzing Windows WPR/ETW traces — CPU sampling, DPC/ISR, per-CPU utilization, lock contention"
 readme = "README.md"
 license = {text = "MIT"}

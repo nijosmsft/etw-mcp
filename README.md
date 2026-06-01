@@ -323,7 +323,15 @@ The `WPR_MCP_MODE` environment variable overrides the default when `mode=` is le
 
 **How to enable it.**
 
-1. Build the binary once:
+1. Get the binary. **Either** download the prebuilt asset from the latest [GitHub release](https://github.com/nijosmsft/wpr-mcp-server/releases):
+
+   ```powershell
+   Invoke-WebRequest `
+     -Uri "https://github.com/nijosmsft/wpr-mcp-server/releases/download/<release-tag>/wpr-mcp-extract.exe" `
+     -OutFile "C:\install\wpr-mcp-extract.exe"
+   ```
+
+   **Or** build it from source (no .NET runtime required for the resulting binary; only for the build):
 
    ```powershell
    cd <repo>\dotnet
