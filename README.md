@@ -95,7 +95,7 @@ winget install --id Microsoft.WindowsADK --override "/features OptionId.WindowsP
                                          # The --override flag installs just the ~150 MB WPT feature instead of the full ~5 GB ADK.
 
 # 2. Verify the latest release wheel starts (Ctrl+C to stop)
-uv run --no-project --with https://github.com/nijosmsft/wpr-mcp-server/releases/download/<release-tag>/<wheel-file>.whl python -m etw_analyzer.server
+uv run --no-project --with https://github.com/nijosmsft/wpr-mcp-server/releases/download/v0.2.0/wpr_mcp_server-0.2.0-py3-none-any.whl python -m etw_analyzer.server
 ```
 
 - **uv** automatically downloads Python, creates a virtual environment, and installs all dependencies on first run. No separate Python install needed.
@@ -119,7 +119,7 @@ Add to your `.mcp.json` (project root or `~/.claude/.mcp.json`):
     "wpr-trace-analyzer": {
       "type": "stdio",
       "command": "uv",
-      "args": ["run", "--no-project", "--with", "https://github.com/nijosmsft/wpr-mcp-server/releases/download/<release-tag>/<wheel-file>.whl", "python", "-m", "etw_analyzer.server"],
+      "args": ["run", "--no-project", "--with", "https://github.com/nijosmsft/wpr-mcp-server/releases/download/v0.2.0/wpr_mcp_server-0.2.0-py3-none-any.whl", "python", "-m", "etw_analyzer.server"],
       "env": {
         "_NT_SYMBOL_PATH": "srv*C:\\symbols*https://msdl.microsoft.com/download/symbols"
       }
@@ -140,7 +140,7 @@ Add to `.vscode/mcp.json` (workspace) or `%APPDATA%\Code\User\mcp.json` (user-sc
     "wpr-trace-analyzer": {
       "type": "stdio",
       "command": "uv",
-      "args": ["run", "--no-project", "--with", "https://github.com/nijosmsft/wpr-mcp-server/releases/download/<release-tag>/<wheel-file>.whl", "python", "-m", "etw_analyzer.server"],
+      "args": ["run", "--no-project", "--with", "https://github.com/nijosmsft/wpr-mcp-server/releases/download/v0.2.0/wpr_mcp_server-0.2.0-py3-none-any.whl", "python", "-m", "etw_analyzer.server"],
       "env": {
         "_NT_SYMBOL_PATH": "srv*C:\\symbols*https://msdl.microsoft.com/download/symbols"
       }
@@ -159,7 +159,7 @@ Add to `%APPDATA%\Claude\claude_desktop_config.json` (top-level key: `mcpServers
     "wpr-trace-analyzer": {
       "type": "stdio",
       "command": "uv",
-      "args": ["run", "--no-project", "--with", "https://github.com/nijosmsft/wpr-mcp-server/releases/download/<release-tag>/<wheel-file>.whl", "python", "-m", "etw_analyzer.server"],
+      "args": ["run", "--no-project", "--with", "https://github.com/nijosmsft/wpr-mcp-server/releases/download/v0.2.0/wpr_mcp_server-0.2.0-py3-none-any.whl", "python", "-m", "etw_analyzer.server"],
       "env": {
         "_NT_SYMBOL_PATH": "srv*C:\\symbols*https://msdl.microsoft.com/download/symbols"
       }
@@ -178,7 +178,7 @@ Add to `%USERPROFILE%\.copilot\mcp-config.json` (top-level key: `mcpServers`):
     "wpr-trace-analyzer": {
       "type": "stdio",
       "command": "uv",
-      "args": ["run", "--no-project", "--with", "https://github.com/nijosmsft/wpr-mcp-server/releases/download/<release-tag>/<wheel-file>.whl", "python", "-m", "etw_analyzer.server"],
+      "args": ["run", "--no-project", "--with", "https://github.com/nijosmsft/wpr-mcp-server/releases/download/v0.2.0/wpr_mcp_server-0.2.0-py3-none-any.whl", "python", "-m", "etw_analyzer.server"],
       "env": {
         "_NT_SYMBOL_PATH": "srv*C:\\symbols*https://msdl.microsoft.com/download/symbols"
       }
@@ -439,7 +439,7 @@ The `WPR_MCP_MODE` environment variable overrides the default when `mode=` is le
        "wpr-trace-analyzer": {
          "type": "stdio",
          "command": "uv",
-         "args": ["run", "--no-project", "--with", "https://github.com/nijosmsft/wpr-mcp-server/releases/download/<release-tag>/<wheel-file>.whl", "python", "-m", "etw_analyzer.server"],
+         "args": ["run", "--no-project", "--with", "https://github.com/nijosmsft/wpr-mcp-server/releases/download/v0.2.0/wpr_mcp_server-0.2.0-py3-none-any.whl", "python", "-m", "etw_analyzer.server"],
          "env": {
            "_NT_SYMBOL_PATH": "srv*C:\\symbols*https://msdl.microsoft.com/download/symbols",
            "WPR_MCP_DOTNET_SIDECAR": "C:\\install\\wpr-mcp-extract.exe"
