@@ -1,0 +1,90 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    network_minimal.wprp - networking stack without the XDP Strict provider.
+
+    Use this profile on lab / test machines that do NOT have the matching
+    XDP manifest installed. network.wprp's EP_Net_Xdp is Strict="true",
+    which makes wpr -start fail 0xc558300c when the manifest is missing,
+    even though the driver may be loaded. This profile is the documented
+    workaround: drop XDP, keep everything else.
+
+    Kernel coverage (SystemProvider) and the six non-XDP networking
+    providers are identical to network.wprp. EventCollector kept at
+    1024 buffers x 1024 KB = 1 GB for 100 GbE-scale traffic.
+
+    Keyword hard-coded to 0x7FFFFFFFFFFFFFFF (never all-bits-set, which
+    triggers a downlevel WPR bug).
+-->
+<WindowsPerformanceRecorder Version="1.0" Author="wpr-mcp-server" Company="wpr-mcp-server">
+    <Profiles>
+        <SystemCollector Id="SystemCollector_NetMin" Name="NT Kernel Logger">
+            <BufferSize Value="4096"/>
+            <Buffers Value="320"/>
+        </SystemCollector>
+
+        <EventCollector Id="EC_NetMin" Name="Networking (no XDP)">
+            <BufferSize Value="1024"/>
+            <Buffers Value="1024"/>
+        </EventCollector>
+
+        <SystemProvider Id="SystemProvider_NetMin">
+            <Keywords>
+                <Keyword Value="ProcessThread"/>
+                <Keyword Value="Loader"/>
+                <Keyword Value="CSwitch"/>
+                <Keyword Value="ReadyThread"/>
+                <Keyword Value="SampledProfile"/>
+                <Keyword Value="DPC"/>
+                <Keyword Value="Interrupt"/>
+                <Keyword Value="IdleStates"/>
+            </Keywords>
+            <Stacks>
+                <Stack Value="CSwitch"/>
+                <Stack Value="ReadyThread"/>
+                <Stack Value="SampledProfile"/>
+            </Stacks>
+        </SystemProvider>
+
+        <EventProvider Id="EP_NetMin_Tcpip" Name="2F07E2EE-15DB-40F1-90EF-9D7BA282188A" Level="5">
+            <Keywords><Keyword Value="0x7FFFFFFFFFFFFFFF"/></Keywords>
+        </EventProvider>
+
+        <EventProvider Id="EP_NetMin_WinsockAfd" Name="E53C6823-7BB8-44BB-90DC-3F86090D48A6" Level="5">
+            <Keywords><Keyword Value="0x7FFFFFFFFFFFFFFF"/></Keywords>
+        </EventProvider>
+
+        <EventProvider Id="EP_NetMin_NdisPacketCapture" Name="2ED6006E-4729-4609-B423-3EE7BCD678EF" Level="5">
+            <Keywords><Keyword Value="0x7FFFFFFFFFFFFFFF"/></Keywords>
+        </EventProvider>
+
+        <EventProvider Id="EP_NetMin_MsQuic" Name="ff15e657-4f26-570e-88ab-0796b258d11c" Level="4">
+            <Keywords><Keyword Value="0x7FFFFFFFFFFFFFFF"/></Keywords>
+        </EventProvider>
+
+        <EventProvider Id="EP_NetMin_HttpService" Name="DD5EF90A-6398-47A4-AD34-4DCECDEF795F" Level="4">
+            <Keywords><Keyword Value="0x7FFFFFFFFFFFFFFF"/></Keywords>
+        </EventProvider>
+
+        <EventProvider Id="EP_NetMin_KernelNetwork" Name="7DD42A49-5329-4832-8DFD-43D979153A88" Level="4">
+            <Keywords><Keyword Value="0x7FFFFFFFFFFFFFFF"/></Keywords>
+        </EventProvider>
+
+        <Profile Id="NetworkMinimal.Verbose.File" Name="NetworkMinimal" Description="Networking stack without XDP (for labs without the XDP manifest)" LoggingMode="File" DetailLevel="Verbose">
+            <Collectors>
+                <SystemCollectorId Value="SystemCollector_NetMin">
+                    <SystemProviderId Value="SystemProvider_NetMin"/>
+                </SystemCollectorId>
+                <EventCollectorId Value="EC_NetMin">
+                    <EventProviders>
+                        <EventProviderId Value="EP_NetMin_Tcpip"/>
+                        <EventProviderId Value="EP_NetMin_WinsockAfd"/>
+                        <EventProviderId Value="EP_NetMin_NdisPacketCapture"/>
+                        <EventProviderId Value="EP_NetMin_MsQuic"/>
+                        <EventProviderId Value="EP_NetMin_HttpService"/>
+                        <EventProviderId Value="EP_NetMin_KernelNetwork"/>
+                    </EventProviders>
+                </EventCollectorId>
+            </Collectors>
+        </Profile>
+    </Profiles>
+</WindowsPerformanceRecorder>

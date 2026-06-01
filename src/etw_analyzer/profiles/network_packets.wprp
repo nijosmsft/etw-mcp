@@ -1,0 +1,91 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    network_packets.wprp - networking + larger ring buffer for packet capture.
+
+    Use this profile when the analysis target is per-packet decode at
+    100 GbE rates. Same provider set as network.wprp but the
+    EventCollector ring is doubled (2048 buffers x 1024 KB = 2 GB) so
+    NDIS-PacketCapture frames are not dropped under multi-million-PPS
+    traffic. The SystemCollector ring is unchanged.
+
+    Like network.wprp, this profile carries the XDP provider with
+    Strict="true". On machines without the XDP manifest, fall back to
+    network_minimal.wprp (also reuse network_packets.wprp's reasoning
+    about the larger event ring by editing the buffers value).
+
+    Keyword hard-coded to 0x7FFFFFFFFFFFFFFF (never all-bits-set, which
+    triggers a downlevel WPR bug).
+-->
+<WindowsPerformanceRecorder Version="1.0" Author="wpr-mcp-server" Company="wpr-mcp-server">
+    <Profiles>
+        <SystemCollector Id="SystemCollector_NetPkt" Name="NT Kernel Logger">
+            <BufferSize Value="4096"/>
+            <Buffers Value="320"/>
+        </SystemCollector>
+
+        <EventCollector Id="EC_NetPkt" Name="Networking (2 GB packet ring)">
+            <BufferSize Value="1024"/>
+            <Buffers Value="2048"/>
+        </EventCollector>
+
+        <SystemProvider Id="SystemProvider_NetPkt">
+            <Keywords>
+                <Keyword Value="ProcessThread"/>
+                <Keyword Value="Loader"/>
+                <Keyword Value="CSwitch"/>
+                <Keyword Value="ReadyThread"/>
+                <Keyword Value="SampledProfile"/>
+                <Keyword Value="DPC"/>
+                <Keyword Value="Interrupt"/>
+                <Keyword Value="IdleStates"/>
+            </Keywords>
+            <Stacks>
+                <Stack Value="CSwitch"/>
+                <Stack Value="ReadyThread"/>
+                <Stack Value="SampledProfile"/>
+            </Stacks>
+        </SystemProvider>
+
+        <EventProvider Id="EP_NetPkt_Tcpip" Name="2F07E2EE-15DB-40F1-90EF-9D7BA282188A" Level="5">
+            <Keywords><Keyword Value="0x7FFFFFFFFFFFFFFF"/></Keywords>
+        </EventProvider>
+
+        <EventProvider Id="EP_NetPkt_WinsockAfd" Name="E53C6823-7BB8-44BB-90DC-3F86090D48A6" Level="5">
+            <Keywords><Keyword Value="0x7FFFFFFFFFFFFFFF"/></Keywords>
+        </EventProvider>
+
+        <EventProvider Id="EP_NetPkt_NdisPacketCapture" Name="2ED6006E-4729-4609-B423-3EE7BCD678EF" Level="5">
+            <Keywords><Keyword Value="0x7FFFFFFFFFFFFFFF"/></Keywords>
+        </EventProvider>
+
+        <EventProvider Id="EP_NetPkt_MsQuic" Name="ff15e657-4f26-570e-88ab-0796b258d11c" Level="4">
+            <Keywords><Keyword Value="0x7FFFFFFFFFFFFFFF"/></Keywords>
+        </EventProvider>
+
+        <EventProvider Id="EP_NetPkt_HttpService" Name="DD5EF90A-6398-47A4-AD34-4DCECDEF795F" Level="4">
+            <Keywords><Keyword Value="0x7FFFFFFFFFFFFFFF"/></Keywords>
+        </EventProvider>
+
+        <EventProvider Id="EP_NetPkt_KernelNetwork" Name="7DD42A49-5329-4832-8DFD-43D979153A88" Level="4">
+            <Keywords><Keyword Value="0x7FFFFFFFFFFFFFFF"/></Keywords>
+        </EventProvider>
+
+        <Profile Id="NetworkPackets.Verbose.File" Name="NetworkPackets" Description="Networking + NDIS PacketCapture verbose with 2 GB ring (100 GbE packet decode)" LoggingMode="File" DetailLevel="Verbose">
+            <Collectors>
+                <SystemCollectorId Value="SystemCollector_NetPkt">
+                    <SystemProviderId Value="SystemProvider_NetPkt"/>
+                </SystemCollectorId>
+                <EventCollectorId Value="EC_NetPkt">
+                    <EventProviders>
+                        <EventProviderId Value="EP_NetPkt_Tcpip"/>
+                        <EventProviderId Value="EP_NetPkt_WinsockAfd"/>
+                        <EventProviderId Value="EP_NetPkt_NdisPacketCapture"/>
+                        <EventProviderId Value="EP_NetPkt_MsQuic"/>
+                        <EventProviderId Value="EP_NetPkt_HttpService"/>
+                        <EventProviderId Value="EP_NetPkt_KernelNetwork"/>
+                    </EventProviders>
+                </EventCollectorId>
+            </Collectors>
+        </Profile>
+    </Profiles>
+</WindowsPerformanceRecorder>

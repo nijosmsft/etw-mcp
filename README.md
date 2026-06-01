@@ -396,6 +396,29 @@ Most analysis tools accept:
 
 For full WPA/butterfly stack parity, load with `mode="xperf"` or set `WPR_MCP_MODE=xperf`. In xperf mode, `get_hot_stacks` uses xperf's butterfly `Functions by UniInclusive Hits` table, so inclusive and exclusive hit counts are kept separate. `walk_stack` and `butterfly_chain` use the butterfly caller/callee table and require the `trace_id` returned by `load_trace`. Native mode covers core stack analysis but may not expose every xperf-derived stack view. `count_stacks` currently works from aggregate butterfly edges, so it estimates matching sample counts rather than counting distinct raw stack instances.
 
+### Capturing traces
+
+Most workflows start by analyzing an existing `.etl`. When you need to author one — locally or on a lab machine — use the four `capture_profiles` tools:
+
+| Tool | Purpose |
+| --- | --- |
+| `list_capture_profiles` | Markdown table of the 9 bundled WPR scenarios (`cpu`, `cpu_dpc_isr`, `network`, `network_minimal`, `network_packets`, `xdp_cpumap`, `quic`, `ebpf`, `general`) plus the `pktmon` pseudo-scenario. Start here. |
+| `get_capture_profile(scenario)` | Metadata table + the bundled `.wprp` XML in a fenced ```xml``` block, ready to save to a file on the target. |
+| `get_capture_commands(scenario, output_path, duration_s=10)` | Paste-ready 3-step PowerShell (start / sleep / stop) plus a verification step. Branches automatically for the `pktmon` scenario (uses `pktmon start --capture --pkt-size 0 -f <path>` instead of `wpr -start`). |
+| `get_capture_instructions(scenario, target="local" \| "remote", output_path)` | Long-form runbook covering prerequisites, profile save, start/verify, transfer-back examples (PowerShell remoting / LabLink MCP / scp) when `target="remote"`, and a `load_trace` pointer. |
+
+The tools are transport-agnostic — they emit strings, never invoke `wpr.exe` or `pktmon.exe` themselves. Run the commands on local PowerShell, a [LabLink](https://github.com/microsoft/lablink) MCP node, an SSH host, or hand them to a human. Then call `load_trace(etl_path=...)` on the resulting file to analyze it.
+
+```powershell
+# Typical local capture: 10s CPU profile, then analyze
+wpr -start .\cpu.wprp -filemode
+Start-Sleep -Seconds 10
+wpr -stop 'C:\traces\cpu.etl'
+# → call load_trace(etl_path='C:\traces\cpu.etl')
+```
+
+All WPR profiles require administrator elevation. WPR uses the NT Kernel Logger and so cannot run inside a Windows container.
+
 ### Trace Loading Modes
 
 `load_trace` accepts a `mode` argument that selects the extraction pipeline. Three modern pipelines coexist, each with the same trace_id and parquet cache layout so a trace extracted in one mode can be reloaded in another. The default `mode="auto"` walks the fallback chain **`.NET sidecar → native → xperf`** and picks the first one available.

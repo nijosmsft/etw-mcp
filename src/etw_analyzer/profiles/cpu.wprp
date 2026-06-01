@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    cpu.wprp - lowest-overhead CPU profiling.
+
+    What this captures (kernel SystemProvider only - no user/kernel event
+    providers, no network providers):
+      ProcessThread, Loader   - module + process/thread bookkeeping (symbols)
+      SampledProfile          - 1 kHz CPU sampling (stacks attached)
+      IdleStates              - per-CPU idle-state transitions (utilization)
+
+    Use this profile when you want a fast snapshot of where CPU is being
+    spent across the system without DPC/ISR, scheduler, or networking noise.
+    The trace size grows roughly with sample stack depth and core count;
+    expect ~50 MB per minute on a busy 16-core box.
+
+    Stacks attached to SampledProfile only - keeps overhead low while still
+    enabling get_hot_functions / get_hot_stacks downstream analysis.
+
+    No EventProviders. No Strict="true". Hard-coded 0x7FFFFFFFFFFFFFFF for
+    any future keyword fields, never all-bits-set (downlevel WPR bug).
+-->
+<WindowsPerformanceRecorder Version="1.0" Author="wpr-mcp-server" Company="wpr-mcp-server">
+    <Profiles>
+        <SystemCollector Id="SystemCollector_Cpu" Name="NT Kernel Logger">
+            <BufferSize Value="1024"/>
+            <Buffers Value="128"/>
+        </SystemCollector>
+
+        <SystemProvider Id="SystemProvider_Cpu">
+            <Keywords>
+                <Keyword Value="ProcessThread"/>
+                <Keyword Value="Loader"/>
+                <Keyword Value="SampledProfile"/>
+                <Keyword Value="IdleStates"/>
+            </Keywords>
+            <Stacks>
+                <Stack Value="SampledProfile"/>
+            </Stacks>
+        </SystemProvider>
+
+        <Profile Id="Cpu.Verbose.File" Name="Cpu" Description="Low-overhead CPU profiling (SampledProfile + stacks + IdleStates)" LoggingMode="File" DetailLevel="Verbose">
+            <Collectors>
+                <SystemCollectorId Value="SystemCollector_Cpu">
+                    <SystemProviderId Value="SystemProvider_Cpu"/>
+                </SystemCollectorId>
+            </Collectors>
+        </Profile>
+    </Profiles>
+</WindowsPerformanceRecorder>

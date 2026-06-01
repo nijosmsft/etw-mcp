@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    cpu_dpc_isr.wprp - CPU + DPC + ISR + scheduler analysis.
+
+    Use this profile when you suspect kernel pressure: high DPC time, ISR
+    storms, spinlock contention, or context-switch hot spots. Adds the
+    keywords cpu.wprp omits so the trace can answer "what fired the DPC"
+    and "who readied the thread" questions.
+
+    Kernel coverage (SystemProvider only - no user/kernel event providers):
+      ProcessThread, Loader   - module + process/thread bookkeeping (symbols)
+      CSwitch, ReadyThread    - scheduler events with stacks
+      SampledProfile          - 1 kHz CPU sampling with stacks
+      DPC, Interrupt          - DPC and ISR timing with stacks on CSwitch
+      IdleStates              - per-CPU idle-state transitions
+
+    Stacks attached to CSwitch, ReadyThread, SampledProfile so
+    get_lock_contention / get_dpc_per_cpu / butterfly_chain can work.
+
+    Expect noticeably higher overhead than cpu.wprp (~200-400 MB per
+    minute on 80-core systems under load). No network providers, no
+    Strict="true", hard-coded 0x7FFFFFFFFFFFFFFF for any keyword fields.
+-->
+<WindowsPerformanceRecorder Version="1.0" Author="wpr-mcp-server" Company="wpr-mcp-server">
+    <Profiles>
+        <SystemCollector Id="SystemCollector_CpuDpc" Name="NT Kernel Logger">
+            <BufferSize Value="4096"/>
+            <Buffers Value="320"/>
+        </SystemCollector>
+
+        <SystemProvider Id="SystemProvider_CpuDpc">
+            <Keywords>
+                <Keyword Value="ProcessThread"/>
+                <Keyword Value="Loader"/>
+                <Keyword Value="CSwitch"/>
+                <Keyword Value="ReadyThread"/>
+                <Keyword Value="SampledProfile"/>
+                <Keyword Value="DPC"/>
+                <Keyword Value="Interrupt"/>
+                <Keyword Value="IdleStates"/>
+            </Keywords>
+            <Stacks>
+                <Stack Value="CSwitch"/>
+                <Stack Value="ReadyThread"/>
+                <Stack Value="SampledProfile"/>
+            </Stacks>
+        </SystemProvider>
+
+        <Profile Id="CpuDpcIsr.Verbose.File" Name="CpuDpcIsr" Description="CPU + DPC + ISR + CSwitch + ReadyThread with stacks (kernel pressure analysis)" LoggingMode="File" DetailLevel="Verbose">
+            <Collectors>
+                <SystemCollectorId Value="SystemCollector_CpuDpc">
+                    <SystemProviderId Value="SystemProvider_CpuDpc"/>
+                </SystemCollectorId>
+            </Collectors>
+        </Profile>
+    </Profiles>
+</WindowsPerformanceRecorder>

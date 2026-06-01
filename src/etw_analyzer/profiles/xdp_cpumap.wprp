@@ -1,0 +1,89 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    xdp_cpumap.wprp - XDP / CPUMAP debugging profile.
+
+    Use this profile when investigating the XDP fast path: CPUMAP ring
+    behavior, drain DPC timing, NBL flow through the LWF, XSK socket
+    activity. Pairs the kernel CPU/DPC/CSwitch keywords needed to see
+    the cross-CPU dispatch with the XDP ETW + WPP providers.
+
+    Kernel coverage (SystemProvider):
+      ProcessThread, Loader   - module + process/thread bookkeeping (symbols)
+      CSwitch, ReadyThread    - scheduler events with stacks (cross-CPU)
+      SampledProfile          - 1 kHz CPU sampling with stacks
+      DPC, Interrupt          - drain DPC timing for CPUMAP analysis
+      IdleStates              - per-CPU idle-state transitions
+
+    XDP providers (both marked Strict="true" so a missing XDP install
+    fails fast rather than producing a useless trace):
+      Microsoft-XDP   {580bbdea-b364-4369-b291-d3539e35d20b}
+          XDP fast-path events. Keyword 0x3F = Tx|Rx|Xsk|Generic|Ec|Ebpf
+          per xdpetw.man. Level 25 (XdpPerFrame) for per-frame visibility.
+      XDP WPP        {D6143B5C-9FD6-44BA-BA02-FAD9EA0C263D}
+          WPP traces from xdp.sys (CPUMAP ring spinlock, drain DPC).
+
+    Keyword hard-coded to 0x7FFFFFFFFFFFFFFF where used. EventCollector
+    ring is 1 GB to soak per-frame events under load.
+-->
+<WindowsPerformanceRecorder Version="1.0" Author="wpr-mcp-server" Company="wpr-mcp-server">
+    <Profiles>
+        <SystemCollector Id="SystemCollector_Xdp" Name="NT Kernel Logger">
+            <BufferSize Value="4096"/>
+            <Buffers Value="320"/>
+        </SystemCollector>
+
+        <EventCollector Id="EC_Xdp" Name="XDP CPUMAP High Volume">
+            <BufferSize Value="1024"/>
+            <Buffers Value="1024"/>
+        </EventCollector>
+
+        <SystemProvider Id="SystemProvider_Xdp">
+            <Keywords>
+                <Keyword Value="ProcessThread"/>
+                <Keyword Value="Loader"/>
+                <Keyword Value="CSwitch"/>
+                <Keyword Value="ReadyThread"/>
+                <Keyword Value="SampledProfile"/>
+                <Keyword Value="DPC"/>
+                <Keyword Value="Interrupt"/>
+                <Keyword Value="IdleStates"/>
+            </Keywords>
+            <Stacks>
+                <Stack Value="CSwitch"/>
+                <Stack Value="ReadyThread"/>
+                <Stack Value="SampledProfile"/>
+            </Stacks>
+        </SystemProvider>
+
+        <!--
+            XDP per-frame ETW. Level 25 (XdpPerFrame) is the verbose
+            "everything" level. Keyword 0x3F per xdpetw.man.
+        -->
+        <EventProvider Id="EP_Xdp_PerFrame" Name="580bbdea-b364-4369-b291-d3539e35d20b" Level="25" Strict="true">
+            <Keywords>
+                <Keyword Value="0x3F"/>
+            </Keywords>
+        </EventProvider>
+
+        <!-- XDP WPP for CPUMAP ring + drain DPC internals. -->
+        <EventProvider Id="EP_Xdp_Wpp" Name="D6143B5C-9FD6-44BA-BA02-FAD9EA0C263D" Level="5" NonPagedMemory="true" Strict="true">
+            <Keywords>
+                <Keyword Value="0x7FFFFFFFFFFFFFFF"/>
+            </Keywords>
+        </EventProvider>
+
+        <Profile Id="XdpCpuMap.Verbose.File" Name="XdpCpuMap" Description="XDP CPUMAP debugging (kernel CPU/DPC + XDP per-frame ETW + XDP WPP)" LoggingMode="File" DetailLevel="Verbose">
+            <Collectors>
+                <SystemCollectorId Value="SystemCollector_Xdp">
+                    <SystemProviderId Value="SystemProvider_Xdp"/>
+                </SystemCollectorId>
+                <EventCollectorId Value="EC_Xdp">
+                    <EventProviders>
+                        <EventProviderId Value="EP_Xdp_PerFrame"/>
+                        <EventProviderId Value="EP_Xdp_Wpp"/>
+                    </EventProviders>
+                </EventCollectorId>
+            </Collectors>
+        </Profile>
+    </Profiles>
+</WindowsPerformanceRecorder>
