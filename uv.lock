@@ -201,6 +201,35 @@ wheels = [
 ]
 
 [[package]]
+name = "etw-mcp"
+version = "0.4.0"
+source = { editable = "." }
+dependencies = [
+    { name = "mcp" },
+    { name = "pandas" },
+    { name = "pyarrow" },
+]
+
+[package.dev-dependencies]
+dev = [
+    { name = "psutil" },
+    { name = "pytest" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "mcp", specifier = ">=1.0" },
+    { name = "pandas", specifier = ">=2.0" },
+    { name = "pyarrow", specifier = ">=14.0" },
+]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "psutil", specifier = ">=5.9" },
+    { name = "pytest", specifier = ">=8.0" },
+]
+
+[[package]]
 name = "h11"
 version = "0.16.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1006,33 +1035,4 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/e6/bf/f6544ba992ddb9a6077343a576f9844f7f8f06ab819aefd00206e9255f18/uvicorn-0.48.0.tar.gz", hash = "sha256:a5504207195d08c2511bf9125ede5ac4a4b71725d519e758d01dcf0bc2d31c37", size = 91074, upload-time = "2026-05-24T12:08:41.925Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/01/be/72532be3da7acc5fdfbccdb95215cd04f995a0886532a5b423f929cda4cc/uvicorn-0.48.0-py3-none-any.whl", hash = "sha256:48097851328b87ec36117d3d575234519eb58c2b22d79666e9bbc6c49a761dad", size = 71410, upload-time = "2026-05-24T12:08:40.258Z" },
-]
-
-[[package]]
-name = "wpr-mcp-server"
-version = "0.3.0"
-source = { editable = "." }
-dependencies = [
-    { name = "mcp" },
-    { name = "pandas" },
-    { name = "pyarrow" },
-]
-
-[package.dev-dependencies]
-dev = [
-    { name = "psutil" },
-    { name = "pytest" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "mcp", specifier = ">=1.0" },
-    { name = "pandas", specifier = ">=2.0" },
-    { name = "pyarrow", specifier = ">=14.0" },
-]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "psutil", specifier = ">=5.9" },
-    { name = "pytest", specifier = ">=8.0" },
 ]

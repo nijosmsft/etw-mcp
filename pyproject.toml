@@ -1,14 +1,14 @@
 [project]
-name = "wpr-mcp-server"
-version = "0.3.0"
-description = "MCP server for analyzing Windows WPR/ETW traces — CPU sampling, DPC/ISR, per-CPU utilization, lock contention"
+name = "etw-mcp"
+version = "0.4.0"
+description = "MCP server for analyzing Windows ETW (.etl) traces — xperf / native ETW / .NET sidecar + WPR & pktmon capture authoring"
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.11"
 authors = [
     {name = "Nithin Jose", email = "nijos@microsoft.com"},
 ]
-keywords = ["mcp", "etw", "wpr", "windows", "performance", "tracing", "xperf"]
+keywords = ["mcp", "etw", "wpr", "pktmon", "windows", "performance", "tracing", "xperf"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Environment :: Console",
@@ -30,9 +30,9 @@ dependencies = [
 
 # Evidence-store federation is OFF by default and not installed as a default
 # dep. The integration in src/etw_analyzer/evidence_integration.py is
-# guarded by ``try/except ImportError`` AND the ``WPR_MCP_EVIDENCE_PATH``
-# env var, so an unchanged-env install behaves identically to a v0.1.x
-# install.
+# guarded by ``try/except ImportError`` AND the ``ETW_MCP_EVIDENCE_PATH``
+# env var (legacy ``WPR_MCP_EVIDENCE_PATH`` still honored via env_compat),
+# so an unchanged-env install behaves identically to a v0.1.x install.
 #
 # To enable evidence federation (POC):
 #
@@ -46,10 +46,10 @@ dependencies = [
 #
 #   2. Set the env var:
 #
-#         $env:WPR_MCP_EVIDENCE_PATH = "C:\evidence"
+#         $env:ETW_MCP_EVIDENCE_PATH = "C:\evidence"
 #
 # Once both are in place, ``load_trace`` will register entities into the
-# per-machine DuckDB under ``$WPR_MCP_EVIDENCE_PATH``.
+# per-machine DuckDB under ``$ETW_MCP_EVIDENCE_PATH``.
 #
 # The optional extras-dep entry was removed in v0.2.0 because the
 # evidence-store repo is currently private; uv cannot resolve an
@@ -59,9 +59,9 @@ dependencies = [
 # ``[tool.uv.sources]`` override will be restored.
 
 [project.urls]
-Homepage = "https://github.com/nijosmsft/wpr-mcp-server"
-Repository = "https://github.com/nijosmsft/wpr-mcp-server"
-Issues = "https://github.com/nijosmsft/wpr-mcp-server/issues"
+Homepage = "https://github.com/nijosmsft/etw-mcp"
+Repository = "https://github.com/nijosmsft/etw-mcp"
+Issues = "https://github.com/nijosmsft/etw-mcp/issues"
 
 [dependency-groups]
 dev = [
