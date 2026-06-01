@@ -1,0 +1,92 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    ebpf.wprp - eBPF for Windows runtime + verifier + kernel CPU/DPC.
+
+    Use this profile when investigating eBPF program loading, verifier
+    behavior, JIT compilation, or program execution in ebpfcore.sys /
+    netebpfext.sys. Adds kernel CPU/DPC stacks to the upstream
+    ebpfforwindows.wprp providers so cross-component analysis is
+    possible from one trace.
+
+    Kernel coverage (SystemProvider):
+      ProcessThread, Loader   - module + process/thread bookkeeping (symbols)
+      CSwitch, ReadyThread    - scheduler events with stacks
+      SampledProfile          - 1 kHz CPU sampling with stacks
+      DPC, Interrupt          - DPC / ISR timing
+      IdleStates              - per-CPU idle-state transitions
+
+    eBPF and networking providers:
+      ExecutionContext   {394f321c-5cf4-404c-aa34-4df1428a7f9c}
+          ebpfcore.sys execution context: program load, JIT, map ops.
+      NetEbpfExt         {f2f2ca01-ad02-4a07-9e90-95a2334f3692}
+          netebpfext.sys: WFP hook attach / detach, XDP / SOCK hooks.
+      Microsoft-Windows-TCPIP {2F07E2EE-15DB-40F1-90EF-9D7BA282188A}
+          Kernel TCP/UDP visibility for hook target context.
+
+    Keyword hard-coded to 0x7FFFFFFFFFFFFFFF where used (never all-bits-set,
+    which triggers a downlevel WPR bug).
+-->
+<WindowsPerformanceRecorder Version="1.0" Author="wpr-mcp-server" Company="wpr-mcp-server">
+    <Profiles>
+        <SystemCollector Id="SystemCollector_Ebpf" Name="NT Kernel Logger">
+            <BufferSize Value="4096"/>
+            <Buffers Value="320"/>
+        </SystemCollector>
+
+        <EventCollector Id="EC_Ebpf" Name="eBPF High Volume">
+            <BufferSize Value="512"/>
+            <Buffers Value="1024"/>
+        </EventCollector>
+
+        <SystemProvider Id="SystemProvider_Ebpf">
+            <Keywords>
+                <Keyword Value="ProcessThread"/>
+                <Keyword Value="Loader"/>
+                <Keyword Value="CSwitch"/>
+                <Keyword Value="ReadyThread"/>
+                <Keyword Value="SampledProfile"/>
+                <Keyword Value="DPC"/>
+                <Keyword Value="Interrupt"/>
+                <Keyword Value="IdleStates"/>
+            </Keywords>
+            <Stacks>
+                <Stack Value="CSwitch"/>
+                <Stack Value="ReadyThread"/>
+                <Stack Value="SampledProfile"/>
+            </Stacks>
+        </SystemProvider>
+
+        <EventProvider Id="EP_Ebpf_ExecutionContext" Name="394f321c-5cf4-404c-aa34-4df1428a7f9c" NonPagedMemory="true" Level="5">
+            <Keywords>
+                <Keyword Value="0x7FFFFFFFFFFFFFFF"/>
+            </Keywords>
+        </EventProvider>
+
+        <EventProvider Id="EP_Ebpf_NetEbpfExt" Name="f2f2ca01-ad02-4a07-9e90-95a2334f3692" NonPagedMemory="true" Level="5">
+            <Keywords>
+                <Keyword Value="0x7FFFFFFFFFFFFFFF"/>
+            </Keywords>
+        </EventProvider>
+
+        <EventProvider Id="EP_Ebpf_Tcpip" Name="2F07E2EE-15DB-40F1-90EF-9D7BA282188A" Level="4">
+            <Keywords>
+                <Keyword Value="0x7FFFFFFFFFFFFFFF"/>
+            </Keywords>
+        </EventProvider>
+
+        <Profile Id="Ebpf.Verbose.File" Name="Ebpf" Description="eBPF runtime + verifier + netebpfext with kernel CPU/DPC stacks" LoggingMode="File" DetailLevel="Verbose">
+            <Collectors>
+                <SystemCollectorId Value="SystemCollector_Ebpf">
+                    <SystemProviderId Value="SystemProvider_Ebpf"/>
+                </SystemCollectorId>
+                <EventCollectorId Value="EC_Ebpf">
+                    <EventProviders>
+                        <EventProviderId Value="EP_Ebpf_ExecutionContext"/>
+                        <EventProviderId Value="EP_Ebpf_NetEbpfExt"/>
+                        <EventProviderId Value="EP_Ebpf_Tcpip"/>
+                    </EventProviders>
+                </EventCollectorId>
+            </Collectors>
+        </Profile>
+    </Profiles>
+</WindowsPerformanceRecorder>

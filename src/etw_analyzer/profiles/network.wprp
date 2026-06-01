@@ -1,0 +1,147 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    network.wprp - full networking stack including XDP.
+
+    Use this profile when you want "everything networking" and the XDP
+    driver + ETW manifest are installed on the target machine. The
+    EP_Net_Xdp provider is marked Strict="true" so wpr -start will fail
+    fast if XDP is not available (0xc558300c) rather than silently
+    dropping the provider. If you do not need XDP coverage, use
+    network_minimal.wprp which omits the Strict provider.
+
+    Kernel coverage (SystemProvider):
+      ProcessThread, Loader      - module + process/thread bookkeeping
+      CSwitch, ReadyThread       - scheduling and wakeups (with stacks)
+      SampledProfile             - 1 kHz CPU sampling (with stacks)
+      DPC, Interrupt             - ISR/DPC timing for NIC interrupt analysis
+      IdleStates                 - per-CPU idle-state transitions
+
+    Networking providers (user/kernel):
+      Microsoft-Windows-TCPIP            {2F07E2EE-15DB-40F1-90EF-9D7BA282188A}
+          TCP/UDP send/recv, connection state, retransmits.
+      Microsoft-Windows-Winsock-AFD      {E53C6823-7BB8-44BB-90DC-3F86090D48A6}
+          Socket lifecycle and Winsock send/recv calls.
+      Microsoft-Windows-NDIS-PacketCapture {2ED6006E-4729-4609-B423-3EE7BCD678EF}
+          Full packet capture at the NDIS layer (verbose, high volume).
+      Microsoft-Quic                     {ff15e657-4f26-570e-88ab-0796b258d11c}
+          msquic protocol events: connection, stream, handshake, datagram.
+      Microsoft-Windows-HttpService      {DD5EF90A-6398-47A4-AD34-4DCECDEF795F}
+          HTTP.sys request lifecycle.
+      Microsoft-Windows-XDP               {580bbdea-b364-4369-b291-d3539e35d20b}
+          XDP fast-path events (CPUMAP, generic RX/TX, XSK). Strict="true".
+      Microsoft-Windows-Kernel-Network   {7DD42A49-5329-4832-8DFD-43D979153A88}
+          Kernel-level send/recv events (backup if TCPIP gaps occur).
+
+    Sizing: 1024 buffers x 1024 KB = 1 GB EventCollector ring keeps
+    several seconds of packet-level events on an 80-core / 100 GbE host
+    before wrap. Kernel SystemCollector is 4096 KB x 320 = ~1.25 GB so
+    sampled and cswitch stacks are not dropped under load.
+
+    Keyword hard-coded to 0x7FFFFFFFFFFFFFFF (never all-bits-set, which
+    triggers a downlevel WPR bug). XDP keyword 0x3F = Tx|Rx|Xsk|Generic|Ec|Ebpf
+    per xdpetw.man.
+-->
+<WindowsPerformanceRecorder Version="1.0" Author="wpr-mcp-server" Company="wpr-mcp-server">
+    <Profiles>
+        <SystemCollector Id="SystemCollector_Network" Name="NT Kernel Logger">
+            <BufferSize Value="4096"/>
+            <Buffers Value="320"/>
+        </SystemCollector>
+
+        <EventCollector Id="EC_Network" Name="Networking High Volume">
+            <BufferSize Value="1024"/>
+            <Buffers Value="1024"/>
+        </EventCollector>
+
+        <SystemProvider Id="SystemProvider_Network">
+            <Keywords>
+                <Keyword Value="ProcessThread"/>
+                <Keyword Value="Loader"/>
+                <Keyword Value="CSwitch"/>
+                <Keyword Value="ReadyThread"/>
+                <Keyword Value="SampledProfile"/>
+                <Keyword Value="DPC"/>
+                <Keyword Value="Interrupt"/>
+                <Keyword Value="IdleStates"/>
+            </Keywords>
+            <Stacks>
+                <Stack Value="CSwitch"/>
+                <Stack Value="ReadyThread"/>
+                <Stack Value="SampledProfile"/>
+            </Stacks>
+        </SystemProvider>
+
+        <!-- TCP/IP: connection state + per-packet send/recv. Verbose. -->
+        <EventProvider Id="EP_Net_Tcpip" Name="2F07E2EE-15DB-40F1-90EF-9D7BA282188A" Level="5">
+            <Keywords>
+                <Keyword Value="0x7FFFFFFFFFFFFFFF"/>
+            </Keywords>
+        </EventProvider>
+
+        <!-- Winsock AFD: socket lifecycle + send/recv at user/kernel boundary. -->
+        <EventProvider Id="EP_Net_WinsockAfd" Name="E53C6823-7BB8-44BB-90DC-3F86090D48A6" Level="5">
+            <Keywords>
+                <Keyword Value="0x7FFFFFFFFFFFFFFF"/>
+            </Keywords>
+        </EventProvider>
+
+        <!-- NDIS packet capture: full packet contents. Verbose, very high volume. -->
+        <EventProvider Id="EP_Net_NdisPacketCapture" Name="2ED6006E-4729-4609-B423-3EE7BCD678EF" Level="5">
+            <Keywords>
+                <Keyword Value="0x7FFFFFFFFFFFFFFF"/>
+            </Keywords>
+        </EventProvider>
+
+        <!-- msquic: QUIC protocol events. Informational to keep volume reasonable. -->
+        <EventProvider Id="EP_Net_MsQuic" Name="ff15e657-4f26-570e-88ab-0796b258d11c" Level="4">
+            <Keywords>
+                <Keyword Value="0x7FFFFFFFFFFFFFFF"/>
+            </Keywords>
+        </EventProvider>
+
+        <!-- HTTP.sys: request lifecycle. Informational. -->
+        <EventProvider Id="EP_Net_HttpService" Name="DD5EF90A-6398-47A4-AD34-4DCECDEF795F" Level="4">
+            <Keywords>
+                <Keyword Value="0x7FFFFFFFFFFFFFFF"/>
+            </Keywords>
+        </EventProvider>
+
+        <!--
+            XDP: keep keyword 0x3F (Tx|Rx|Xsk|Generic|Ec|Ebpf) per xdpetw.man.
+            Strict="true" so wpr -start fails fast on a machine without
+            the matching XDP manifest. Use network_minimal.wprp on such
+            machines to capture the rest of the networking stack.
+        -->
+        <EventProvider Id="EP_Net_Xdp" Name="580bbdea-b364-4369-b291-d3539e35d20b" Level="5" Strict="true">
+            <Keywords>
+                <Keyword Value="0x3F"/>
+            </Keywords>
+        </EventProvider>
+
+        <!-- Kernel-Network: backup transport events if TCPIP provider gaps. -->
+        <EventProvider Id="EP_Net_KernelNetwork" Name="7DD42A49-5329-4832-8DFD-43D979153A88" Level="4">
+            <Keywords>
+                <Keyword Value="0x7FFFFFFFFFFFFFFF"/>
+            </Keywords>
+        </EventProvider>
+
+        <Profile Id="Network.Verbose.File" Name="Network" Description="Networking + CPU + DPC + TCPIP + AFD + NDIS + QUIC + HTTP + XDP" LoggingMode="File" DetailLevel="Verbose">
+            <Collectors>
+                <SystemCollectorId Value="SystemCollector_Network">
+                    <SystemProviderId Value="SystemProvider_Network"/>
+                </SystemCollectorId>
+                <EventCollectorId Value="EC_Network">
+                    <EventProviders>
+                        <EventProviderId Value="EP_Net_Tcpip"/>
+                        <EventProviderId Value="EP_Net_WinsockAfd"/>
+                        <EventProviderId Value="EP_Net_NdisPacketCapture"/>
+                        <EventProviderId Value="EP_Net_MsQuic"/>
+                        <EventProviderId Value="EP_Net_HttpService"/>
+                        <EventProviderId Value="EP_Net_Xdp"/>
+                        <EventProviderId Value="EP_Net_KernelNetwork"/>
+                    </EventProviders>
+                </EventCollectorId>
+            </Collectors>
+        </Profile>
+    </Profiles>
+</WindowsPerformanceRecorder>

@@ -1,0 +1,77 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    general.wprp - "I don't know what I'm looking for" default.
+
+    Use this profile when you want a single capture that lets you ask
+    follow-up questions across CPU, kernel pressure, and basic
+    networking without committing to verbose packet capture or the XDP
+    Strict provider. Equivalent to cpu_dpc_isr.wprp plus TCPIP at
+    Level 4 (Informational, not Verbose). Adds connection-level TCP
+    visibility without flooding the ring with per-packet send/recv.
+
+    Kernel coverage (SystemProvider):
+      ProcessThread, Loader   - module + process/thread bookkeeping (symbols)
+      CSwitch, ReadyThread    - scheduler events with stacks
+      SampledProfile          - 1 kHz CPU sampling with stacks
+      DPC, Interrupt          - DPC / ISR timing
+      IdleStates              - per-CPU idle-state transitions
+
+    Networking providers:
+      Microsoft-Windows-TCPIP {2F07E2EE-15DB-40F1-90EF-9D7BA282188A}
+          Level 4 only: connection state, RST/FIN, retransmit counts.
+          Skips per-packet send/recv.
+
+    Keyword hard-coded to 0x7FFFFFFFFFFFFFFF (never all-bits-set, which
+    triggers a downlevel WPR bug).
+-->
+<WindowsPerformanceRecorder Version="1.0" Author="wpr-mcp-server" Company="wpr-mcp-server">
+    <Profiles>
+        <SystemCollector Id="SystemCollector_General" Name="NT Kernel Logger">
+            <BufferSize Value="4096"/>
+            <Buffers Value="320"/>
+        </SystemCollector>
+
+        <EventCollector Id="EC_General" Name="General (low volume)">
+            <BufferSize Value="256"/>
+            <Buffers Value="256"/>
+        </EventCollector>
+
+        <SystemProvider Id="SystemProvider_General">
+            <Keywords>
+                <Keyword Value="ProcessThread"/>
+                <Keyword Value="Loader"/>
+                <Keyword Value="CSwitch"/>
+                <Keyword Value="ReadyThread"/>
+                <Keyword Value="SampledProfile"/>
+                <Keyword Value="DPC"/>
+                <Keyword Value="Interrupt"/>
+                <Keyword Value="IdleStates"/>
+            </Keywords>
+            <Stacks>
+                <Stack Value="CSwitch"/>
+                <Stack Value="ReadyThread"/>
+                <Stack Value="SampledProfile"/>
+            </Stacks>
+        </SystemProvider>
+
+        <!-- TCPIP at Informational (Level 4): connection state, no per-packet. -->
+        <EventProvider Id="EP_General_Tcpip" Name="2F07E2EE-15DB-40F1-90EF-9D7BA282188A" Level="4">
+            <Keywords>
+                <Keyword Value="0x7FFFFFFFFFFFFFFF"/>
+            </Keywords>
+        </EventProvider>
+
+        <Profile Id="General.Verbose.File" Name="General" Description="CPU + DPC + ISR + CSwitch + ReadyThread + TCPIP (informational) - default when scenario is unclear" LoggingMode="File" DetailLevel="Verbose">
+            <Collectors>
+                <SystemCollectorId Value="SystemCollector_General">
+                    <SystemProviderId Value="SystemProvider_General"/>
+                </SystemCollectorId>
+                <EventCollectorId Value="EC_General">
+                    <EventProviders>
+                        <EventProviderId Value="EP_General_Tcpip"/>
+                    </EventProviders>
+                </EventCollectorId>
+            </Collectors>
+        </Profile>
+    </Profiles>
+</WindowsPerformanceRecorder>

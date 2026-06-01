@@ -1,0 +1,105 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    quic.wprp - QUIC handshake and connection analysis.
+
+    Use this profile when the workload of interest is msquic: handshake
+    cost, connection lifetime, ACK / loss patterns, scheduling jitter.
+    Captures the MsQuic provider at the full ETW keyword set plus the
+    Schannel / TCPIP / Winsock-AFD providers that sit underneath it.
+
+    Kernel coverage (SystemProvider):
+      ProcessThread, Loader   - module + process/thread bookkeeping (symbols)
+      CSwitch, ReadyThread    - scheduler events with stacks
+      SampledProfile          - 1 kHz CPU sampling with stacks
+      DPC, Interrupt          - DPC / ISR timing
+      IdleStates              - per-CPU idle-state transitions
+
+    Networking providers:
+      Microsoft-Quic                 {ff15e657-4f26-570e-88ab-0796b258d11c}
+          All msquic events: connection, stream, handshake, datagram,
+          scheduling, loss recovery.
+      Microsoft-Windows-TCPIP        {2F07E2EE-15DB-40F1-90EF-9D7BA282188A}
+          UDP datapath underneath QUIC.
+      Microsoft-Windows-Winsock-AFD  {E53C6823-7BB8-44BB-90DC-3F86090D48A6}
+          Socket lifecycle and user / kernel boundary calls.
+      Schannel WPP                   {37D2C3CD-C5D4-4587-8531-4696C44244C8}
+          TLS handshake events used for QUIC over schannel.
+
+    Keyword hard-coded to 0x7FFFFFFFFFFFFFFF for the providers that take
+    arbitrary keywords. Schannel uses a documented 24-bit mask.
+-->
+<WindowsPerformanceRecorder Version="1.0" Author="wpr-mcp-server" Company="wpr-mcp-server">
+    <Profiles>
+        <SystemCollector Id="SystemCollector_Quic" Name="NT Kernel Logger">
+            <BufferSize Value="4096"/>
+            <Buffers Value="320"/>
+        </SystemCollector>
+
+        <EventCollector Id="EC_Quic" Name="QUIC High Volume">
+            <BufferSize Value="1024"/>
+            <Buffers Value="512"/>
+        </EventCollector>
+
+        <SystemProvider Id="SystemProvider_Quic">
+            <Keywords>
+                <Keyword Value="ProcessThread"/>
+                <Keyword Value="Loader"/>
+                <Keyword Value="CSwitch"/>
+                <Keyword Value="ReadyThread"/>
+                <Keyword Value="SampledProfile"/>
+                <Keyword Value="DPC"/>
+                <Keyword Value="Interrupt"/>
+                <Keyword Value="IdleStates"/>
+            </Keywords>
+            <Stacks>
+                <Stack Value="CSwitch"/>
+                <Stack Value="ReadyThread"/>
+                <Stack Value="SampledProfile"/>
+            </Stacks>
+        </SystemProvider>
+
+        <!-- All MsQuic ETW events. NonPagedMemory because msquic kernel mode logs. -->
+        <EventProvider Id="EP_Quic_MsQuic" Name="ff15e657-4f26-570e-88ab-0796b258d11c" NonPagedMemory="true" Level="5">
+            <Keywords>
+                <Keyword Value="0x7FFFFFFFFFFFFFFF"/>
+            </Keywords>
+        </EventProvider>
+
+        <!-- TCPIP at Level 4 (Informational): UDP datapath visibility without per-packet noise. -->
+        <EventProvider Id="EP_Quic_Tcpip" Name="2F07E2EE-15DB-40F1-90EF-9D7BA282188A" Level="4">
+            <Keywords>
+                <Keyword Value="0x7FFFFFFFFFFFFFFF"/>
+            </Keywords>
+        </EventProvider>
+
+        <!-- Winsock-AFD: socket lifecycle for msquic UDP socket. -->
+        <EventProvider Id="EP_Quic_WinsockAfd" Name="E53C6823-7BB8-44BB-90DC-3F86090D48A6" Level="5">
+            <Keywords>
+                <Keyword Value="0x7FFFFFFFFFFFFFFF"/>
+            </Keywords>
+        </EventProvider>
+
+        <!-- Schannel WPP: TLS handshake events. 24-bit keyword mask is documented. -->
+        <EventProvider Id="EP_Quic_Schannel" Name="37D2C3CD-C5D4-4587-8531-4696C44244C8" Level="5">
+            <Keywords>
+                <Keyword Value="0x7FFFFF"/>
+            </Keywords>
+        </EventProvider>
+
+        <Profile Id="Quic.Verbose.File" Name="Quic" Description="MsQuic + Schannel + TCPIP + AFD with kernel CPU/DPC stacks" LoggingMode="File" DetailLevel="Verbose">
+            <Collectors>
+                <SystemCollectorId Value="SystemCollector_Quic">
+                    <SystemProviderId Value="SystemProvider_Quic"/>
+                </SystemCollectorId>
+                <EventCollectorId Value="EC_Quic">
+                    <EventProviders>
+                        <EventProviderId Value="EP_Quic_MsQuic"/>
+                        <EventProviderId Value="EP_Quic_Tcpip"/>
+                        <EventProviderId Value="EP_Quic_WinsockAfd"/>
+                        <EventProviderId Value="EP_Quic_Schannel"/>
+                    </EventProviders>
+                </EventCollectorId>
+            </Collectors>
+        </Profile>
+    </Profiles>
+</WindowsPerformanceRecorder>
