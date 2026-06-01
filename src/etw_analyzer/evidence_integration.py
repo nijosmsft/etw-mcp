@@ -27,7 +27,7 @@ missing). Both must hold for entities to be written.
 from __future__ import annotations
 
 import logging
-import os
+
 import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -48,7 +48,9 @@ except ImportError:
     _EVIDENCE_AVAILABLE = False
 
 
-ENV_VAR = "WPR_MCP_EVIDENCE_PATH"
+from .native.env_compat import getenv as _compat_getenv
+
+ENV_VAR = "ETW_MCP_EVIDENCE_PATH"
 
 
 def is_available() -> bool:
@@ -58,12 +60,12 @@ def is_available() -> bool:
 
 def is_configured() -> bool:
     """Return True when the env var is set (regardless of library)."""
-    return bool(os.environ.get(ENV_VAR))
+    return bool(_compat_getenv(ENV_VAR))
 
 
 def evidence_root() -> Path | None:
     """Return the configured evidence root, or ``None`` if unset."""
-    value = os.environ.get(ENV_VAR)
+    value = _compat_getenv(ENV_VAR)
     if not value:
         return None
     return Path(value)

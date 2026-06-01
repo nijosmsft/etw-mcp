@@ -23,16 +23,17 @@ from .config import (
     DOTNET_SIDECAR_EXE,
     find_dotnet_sidecar,
 )
+from .env_compat import getenv as _compat_getenv
 
 
-NATIVE_WORKER_ENV = "WPR_MCP_NATIVE_WORKER"
-NATIVE_WORKER_SYMBOL_ENV = "WPR_MCP_NATIVE_WORKER_SYMBOL_PATH"
-NATIVE_WORKER_TIMEOUT_ENV = "WPR_MCP_NATIVE_WORKER_TIMEOUT_SECONDS"
-NATIVE_WORKER_STALE_ENV = "WPR_MCP_NATIVE_WORKER_STALE_SECONDS"
-NATIVE_WORKER_MEMORY_MB_ENV = "WPR_MCP_NATIVE_WORKER_MEMORY_MB"
-NATIVE_WORKER_DISABLE_JOB_ENV = "WPR_MCP_NATIVE_WORKER_DISABLE_JOB"
-NATIVE_STREAMING_ENV = "WPR_MCP_NATIVE_STREAMING"
-NATIVE_STREAMING_PROFILE_ENV = "WPR_MCP_NATIVE_STREAMING_PROFILE"
+NATIVE_WORKER_ENV = "ETW_MCP_NATIVE_WORKER"
+NATIVE_WORKER_SYMBOL_ENV = "ETW_MCP_NATIVE_WORKER_SYMBOL_PATH"
+NATIVE_WORKER_TIMEOUT_ENV = "ETW_MCP_NATIVE_WORKER_TIMEOUT_SECONDS"
+NATIVE_WORKER_STALE_ENV = "ETW_MCP_NATIVE_WORKER_STALE_SECONDS"
+NATIVE_WORKER_MEMORY_MB_ENV = "ETW_MCP_NATIVE_WORKER_MEMORY_MB"
+NATIVE_WORKER_DISABLE_JOB_ENV = "ETW_MCP_NATIVE_WORKER_DISABLE_JOB"
+NATIVE_STREAMING_ENV = "ETW_MCP_NATIVE_STREAMING"
+NATIVE_STREAMING_PROFILE_ENV = "ETW_MCP_NATIVE_STREAMING_PROFILE"
 
 DEFAULT_TIMEOUT_SECONDS = 3600.0
 DEFAULT_STALE_SECONDS = 120.0
@@ -115,13 +116,13 @@ class _BoundedTextTail:
 def native_worker_enabled() -> bool:
     """Return True when native extraction should run in a child process."""
 
-    return os.environ.get(NATIVE_WORKER_ENV) == "1"
+    return _compat_getenv(NATIVE_WORKER_ENV) == "1"
 
 
 def native_streaming_enabled() -> bool:
     """Return True when the worker should write chunked native event-store data."""
 
-    return os.environ.get(NATIVE_STREAMING_ENV) == "1"
+    return _compat_getenv(NATIVE_STREAMING_ENV) == "1"
 
 
 def native_streaming_profile() -> str:
@@ -133,7 +134,7 @@ def native_streaming_profile() -> str:
     completing in reasonable time.
     """
 
-    raw = os.environ.get(NATIVE_STREAMING_PROFILE_ENV, STREAMING_PROFILE_SUMMARY)
+    raw = _compat_getenv(NATIVE_STREAMING_PROFILE_ENV, STREAMING_PROFILE_SUMMARY)
     profile = raw.strip().lower()
     if profile not in STREAMING_PROFILE_VALUES:
         raise ValueError(
@@ -555,7 +556,7 @@ def _handle_stdout_line(
 
 
 def _float_env(name: str, value: float | None, default: float) -> float:
-    raw = os.environ.get(name)
+    raw = _compat_getenv(name)
     chosen: float
     if raw is not None and raw.strip():
         try:
@@ -576,7 +577,7 @@ def _float_env(name: str, value: float | None, default: float) -> float:
 
 
 def _job_memory_limit_bytes() -> int | None:
-    raw = os.environ.get(NATIVE_WORKER_MEMORY_MB_ENV)
+    raw = _compat_getenv(NATIVE_WORKER_MEMORY_MB_ENV)
     if raw is None or raw.strip() == "":
         mb = DEFAULT_JOB_MEMORY_MB
     else:
@@ -602,7 +603,7 @@ def _should_use_windows_job(enforce_job: bool) -> bool:
     return (
         enforce_job
         and os.name == "nt"
-        and os.environ.get(NATIVE_WORKER_DISABLE_JOB_ENV) != "1"
+        and _compat_getenv(NATIVE_WORKER_DISABLE_JOB_ENV) != "1"
     )
 
 
@@ -622,7 +623,7 @@ def _assign_windows_job(proc: subprocess.Popen, memory_limit_bytes: int | None) 
     """Assign the child to a Windows Job Object with kill-on-close.
 
     The memory limit is a process-memory cap when ``memory_limit_bytes`` is not
-    None. Set ``WPR_MCP_NATIVE_WORKER_MEMORY_MB=0`` to test only the lifecycle
+    None. Set ``ETW_MCP_NATIVE_WORKER_MEMORY_MB=0`` to test only the lifecycle
     wrapper; do not interpret that mode as memory isolation.
     """
 
@@ -816,7 +817,7 @@ def build_dotnet_request(
     log_level: str = "info",
     include_tracelogging: bool = True,
 ) -> dict[str, Any]:
-    """Build the request JSON consumed by ``wpr-mcp-extract.exe``.
+    """Build the request JSON consumed by ``etw-extract.exe``.
 
     Matches the schema in ``dotnet/src/Request.cs`` exactly. The version
     field is locked to 1 per ``spike-contract.md`` §3.1.
@@ -865,7 +866,7 @@ def run_dotnet_worker_extraction(
     1. Locate the sidecar binary via :func:`find_dotnet_sidecar` (or use
        the caller-supplied ``sidecar_path``).
     2. Write a ``request.json`` matching the spike-contract schema.
-    3. Spawn ``wpr-mcp-extract.exe --request <path>``; stream stdout
+    3. Spawn ``etw-extract.exe --request <path>``; stream stdout
        line-by-line through the same JSONL handler used for the native
        worker (heartbeat/progress/result).
     4. Validate the sidecar's manifest in staging.
