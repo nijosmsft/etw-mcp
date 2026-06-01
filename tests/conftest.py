@@ -33,7 +33,7 @@ _RUN_OPTIONS = {
 
 
 def pytest_addoption(parser: pytest.Parser) -> None:
-    group = parser.getgroup("wpr-mcp-server integration gates")
+    group = parser.getgroup("etw-mcp integration gates")
     for _marker, (option, help_text) in _RUN_OPTIONS.items():
         group.addoption(option, action="store_true", default=False, help=help_text)
     group.addoption(

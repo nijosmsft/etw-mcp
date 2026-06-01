@@ -232,7 +232,7 @@ def test_wprp_files_load_via_importlib_resources(scenario):
     assert "<WindowsPerformanceRecorder" in xml
     # Authoring stamp per the prompt - confirms our vendored copy, not
     # an upstream rename.
-    assert 'Author="wpr-mcp-server"' in xml
+    assert 'Author="etw-mcp"' in xml
     # Safe keyword present; unsafe all-bits-set keyword must not appear
     # anywhere (downlevel WPR bug).
     assert "0x7FFFFFFFFFFFFFFF" in xml

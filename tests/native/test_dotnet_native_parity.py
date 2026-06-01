@@ -255,8 +255,8 @@ def test_dotnet_vs_native_row_count_parity_real_fixture(
 
     if find_dotnet_sidecar() is None:
         pytest.skip(
-            "C# sidecar binary not locatable (set WPR_MCP_DOTNET_SIDECAR or "
-            "place wpr-mcp-extract.exe on PATH)"
+            "C# sidecar binary not locatable (set ETW_MCP_DOTNET_SIDECAR or "
+            "place etw-extract.exe on PATH)"
         )
 
     fixture = _resolve_real_fixture()
@@ -276,7 +276,7 @@ def test_dotnet_vs_native_row_count_parity_real_fixture(
     # limit is 512 MB. The parity test deliberately runs the same large
     # fixture through both producers, so opt out of the guardrail for
     # this run only (monkeypatch restores it at teardown).
-    monkeypatch.setenv("WPR_MCP_NATIVE_ALLOW_LARGE", "1")
+    monkeypatch.setenv("ETW_MCP_NATIVE_ALLOW_LARGE", "1")
 
     dotnet_dir = tmp_path / "dotnet"
     native_dir = tmp_path / "native"

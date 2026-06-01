@@ -27,7 +27,7 @@ def _make_etl(tmp_path: Path) -> Path:
 
 
 def _fake_sidecar(tmp_path: Path) -> Path:
-    path = tmp_path / "wpr-mcp-extract.exe"
+    path = tmp_path / "etw-extract.exe"
     path.write_bytes(b"MZ fake sidecar")
     return path
 
