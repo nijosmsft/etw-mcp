@@ -31,13 +31,24 @@ dependencies = [
 # Evidence-store federation (POC, gated). Production users running plain
 # ``uv sync`` get zero new behavior. Opt in with
 # ``uv sync --extra evidence`` AND ``WPR_MCP_EVIDENCE_PATH=<dir>``.
-# See ``evidence-mcp-poc-plan.md`` §1.1 G3 for the load-bearing guarantees.
+#
+# The ``evidence-store`` package lives in a separate private repo
+# (https://github.com/nijosmsft/evidence-store). It is not on PyPI. To
+# resolve the optional ``evidence`` extra, users must provide their own
+# ``[tool.uv.sources]`` override in a workspace pyproject or via
+# ``--with``. Example:
+#
+#     [tool.uv.sources]
+#     evidence-store = { git = "https://github.com/nijosmsft/evidence-store" }
+#
+#     # or pointing at a local checkout
+#     evidence-store = { path = "../evidence-store", editable = true }
+#
+# We do NOT ship a default source here so that ``uv sync`` on machines
+# without the sibling repo (CI, fresh user installs) doesn't try to
+# resolve a path that may not exist.
 [project.optional-dependencies]
 evidence = ["evidence-store"]
-
-[tool.uv.sources]
-# Local path for the POC; replace with PyPI / git URL once published.
-evidence-store = { path = "../evidence-store", editable = true }
 
 [project.urls]
 Homepage = "https://github.com/nijosmsft/wpr-mcp-server"
