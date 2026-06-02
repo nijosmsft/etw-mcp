@@ -38,6 +38,11 @@ _ENV_VAR_ALIASES: dict[str, str] = {
     "ETW_MCP_MODE": "WPR_MCP_MODE",
     "ETW_MCP_NATIVE_ALLOW_LARGE": "WPR_MCP_NATIVE_ALLOW_LARGE",
     "ETW_MCP_NATIVE_MAX_ETL_MB": "WPR_MCP_NATIVE_MAX_ETL_MB",
+    # v0.5: auto-bootstrap opt-out. Symmetric WPR_MCP_* alias retained
+    # so the table stays uniform; this var is brand-new in v0.5 so no
+    # real operator is using the legacy name today, but the symmetry
+    # keeps the shim's contract obvious for future deprecations.
+    "ETW_MCP_NO_AUTO_DOWNLOAD": "WPR_MCP_NO_AUTO_DOWNLOAD",
     "ETW_MCP_NATIVE_STREAMING": "WPR_MCP_NATIVE_STREAMING",
     "ETW_MCP_NATIVE_STREAMING_PROFILE": "WPR_MCP_NATIVE_STREAMING_PROFILE",
     "ETW_MCP_NATIVE_WORKER": "WPR_MCP_NATIVE_WORKER",

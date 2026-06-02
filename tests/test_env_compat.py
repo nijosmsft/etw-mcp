@@ -119,7 +119,7 @@ def test_default_returned_for_unknown_name_when_unset(monkeypatch: pytest.Monkey
     assert env_compat.getenv("DEFINITELY_NOT_SET_XYZ") is None
 
 
-def test_all_15_legacy_names_resolve(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_all_legacy_names_resolve(monkeypatch: pytest.MonkeyPatch) -> None:
     """Sanity check: every alias in the table actually reads from its
     legacy counterpart."""
 
@@ -130,6 +130,7 @@ def test_all_15_legacy_names_resolve(monkeypatch: pytest.MonkeyPatch) -> None:
         "ETW_MCP_MODE": "WPR_MCP_MODE",
         "ETW_MCP_NATIVE_ALLOW_LARGE": "WPR_MCP_NATIVE_ALLOW_LARGE",
         "ETW_MCP_NATIVE_MAX_ETL_MB": "WPR_MCP_NATIVE_MAX_ETL_MB",
+        "ETW_MCP_NO_AUTO_DOWNLOAD": "WPR_MCP_NO_AUTO_DOWNLOAD",
         "ETW_MCP_NATIVE_STREAMING": "WPR_MCP_NATIVE_STREAMING",
         "ETW_MCP_NATIVE_STREAMING_PROFILE": "WPR_MCP_NATIVE_STREAMING_PROFILE",
         "ETW_MCP_NATIVE_WORKER": "WPR_MCP_NATIVE_WORKER",
