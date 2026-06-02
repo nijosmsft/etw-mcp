@@ -24,6 +24,7 @@ from .config import (
     find_dotnet_sidecar,
 )
 from .env_compat import getenv as _compat_getenv
+from .sidecar_bootstrap import resolve_sidecar_path
 
 
 NATIVE_WORKER_ENV = "ETW_MCP_NATIVE_WORKER"
@@ -863,8 +864,13 @@ def run_dotnet_worker_extraction(
 
     Pipeline:
 
-    1. Locate the sidecar binary via :func:`find_dotnet_sidecar` (or use
-       the caller-supplied ``sidecar_path``).
+    1. Locate the sidecar binary via
+       :func:`sidecar_bootstrap.resolve_sidecar_path` (or use the
+       caller-supplied ``sidecar_path``). The resolver consults
+       ``ETW_MCP_DOTNET_SIDECAR`` first, then the per-version cache
+       under ``%LOCALAPPDATA%\\etw-mcp\\sidecar``, then auto-fetches
+       the matching release from GitHub (unless
+       ``ETW_MCP_NO_AUTO_DOWNLOAD=1`` is set).
     2. Write a ``request.json`` matching the spike-contract schema.
     3. Spawn ``etw-extract.exe --request <path>``; stream stdout
        line-by-line through the same JSONL handler used for the native
@@ -878,19 +884,23 @@ def run_dotnet_worker_extraction(
     return ``ok=False`` with a structured ``failure_kind``.
     """
 
-    resolved_sidecar = sidecar_path or find_dotnet_sidecar()
-    if resolved_sidecar is None:
-        raise ValueError(
-            f".NET sidecar binary {DOTNET_SIDECAR_EXE} could not be located. "
-            f"Set {DOTNET_SIDECAR_ENV} to the absolute path of the built "
-            "binary, publish it under dotnet/publish/win-x64/, or add it "
-            "to PATH."
-        )
-    if not resolved_sidecar.is_file():
-        raise ValueError(
-            f".NET sidecar path {resolved_sidecar} is not a file. "
-            f"Check {DOTNET_SIDECAR_ENV}."
-        )
+    if sidecar_path is not None:
+        resolved_sidecar = sidecar_path
+        if not resolved_sidecar.is_file():
+            raise ValueError(
+                f".NET sidecar path {resolved_sidecar} is not a file. "
+                f"Check {DOTNET_SIDECAR_ENV}."
+            )
+    else:
+        try:
+            resolved_sidecar = resolve_sidecar_path()
+        except RuntimeError as exc:
+            # The supervisor's historical contract is to raise
+            # ``ValueError`` when the binary cannot be located so the
+            # caller (load_trace explicit-dotnet path) can distinguish
+            # "wrong configuration" from "transport / staging error".
+            # Re-raise as ValueError preserving the actionable text.
+            raise ValueError(str(exc)) from exc
 
     etl_path = etl_path.resolve()
     export_dir = export_dir.resolve()

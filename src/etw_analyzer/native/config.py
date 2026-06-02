@@ -146,6 +146,29 @@ def reset_dotnet_cache() -> None:
     _DOTNET_SIDECAR_PROBED = False
 
 
+def _dotnet_sidecar_available() -> bool:
+    """Return ``True`` iff the .NET sidecar can be resolved.
+
+    Wraps :func:`sidecar_bootstrap.resolve_sidecar_path` so the auto
+    branch of :func:`resolve_mode` can ask "is dotnet usable?" without
+    propagating ``RuntimeError`` when the operator has disabled
+    auto-download or the upstream release is unreachable. Any
+    ``RuntimeError`` from the resolver means "not usable right now" --
+    auto silently degrades to native/xperf in that case.
+    """
+
+    # Lazy import to avoid a circular dependency: sidecar_bootstrap
+    # uses env_compat which imports from this module's namespace
+    # indirectly via package-level shared helpers.
+    from .sidecar_bootstrap import resolve_sidecar_path
+
+    try:
+        resolve_sidecar_path()
+    except RuntimeError:
+        return False
+    return True
+
+
 def normalize_mode(mode: Optional[str]) -> str:
     """Validate ``mode`` and return it normalised to lowercase.
 
@@ -208,10 +231,12 @@ def resolve_mode(
     if candidate == "auto":
         if _AUTO_CACHED is not None:
             return _AUTO_CACHED
-        # Preferred order: dotnet → native → xperf. Auto-detect uses the
-        # conservative .NET sidecar lookup (env var + PATH only), so a
-        # stray in-tree publish build does not flip the default pipeline.
-        if find_dotnet_sidecar(auto_detect=True) is not None:
+        # Preferred order: dotnet -> native -> xperf. The sidecar
+        # bootstrap may auto-fetch the matching release on first use
+        # (suppressed by ETW_MCP_NO_AUTO_DOWNLOAD=1, in which case
+        # the resolver raises RuntimeError and we silently fall
+        # through to native -- auto degrades gracefully).
+        if _dotnet_sidecar_available():
             _AUTO_CACHED = "dotnet"
             return _AUTO_CACHED
         try:
@@ -226,18 +251,26 @@ def resolve_mode(
         return _AUTO_CACHED
 
     if candidate == "dotnet":
-        # Explicit dotnet request — fail loudly when the binary cannot
+        # Explicit dotnet request -- fail loudly when the binary cannot
         # be located so the caller knows to install/publish the sidecar
         # rather than silently falling through to a different pipeline.
-        if find_dotnet_sidecar() is None:
+        # The resolver covers env-var, cache, and auto-fetch; only an
+        # actively-blocked or actively-failed fetch reaches the except
+        # branch here.
+        try:
+            from .sidecar_bootstrap import resolve_sidecar_path
+
+            resolve_sidecar_path()
+        except RuntimeError as exc:
             raise ValueError(
                 "mode='dotnet' was requested but the .NET sidecar binary "
                 f"({DOTNET_SIDECAR_EXE}) could not be located. Set the "
                 f"{DOTNET_SIDECAR_ENV} environment variable to the absolute "
                 "path of the built binary, publish it under "
                 "dotnet/publish/win-x64/ in the repo, or add it to PATH. "
-                "Use mode='native' or mode='xperf' to bypass the sidecar."
-            )
+                "Use mode='native' or mode='xperf' to bypass the sidecar. "
+                f"Underlying error: {exc}"
+            ) from exc
         return candidate
 
     if candidate == "native":
