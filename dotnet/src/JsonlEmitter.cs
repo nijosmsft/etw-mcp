@@ -1,6 +1,6 @@
 using System.Text.Json;
 
-namespace WprMcpExtract;
+namespace EtwExtract;
 
 /// <summary>
 /// Thread-safe JSONL writer to stdout. The spike contract reserves stdout

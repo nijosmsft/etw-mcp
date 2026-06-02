@@ -1,11 +1,11 @@
-# Code-signing posture for `wpr-mcp-extract.exe`
+# Code-signing posture for `etw-extract.exe`
 
 ## Default state — unsigned
 
 `dotnet publish -c Release -r win-x64 --self-contained -o publish/win-x64`
 emits an **unsigned** Windows x64 PE. This is intentional for the POC and
 for lab deployment: the binary is invoked as a child process by
-`wpr-mcp-server` (Python) on the analyst's workstation or a controlled
+`etw-mcp` (Python) on the analyst's workstation or a controlled
 internal jumpbox, not redistributed to customers. No SmartScreen or WDAC
 prompt fires when launched from PowerShell/cmd by an authenticated user.
 
@@ -13,24 +13,24 @@ prompt fires when launched from PowerShell/cmd by an authenticated user.
 
 For any deployment beyond the developer machine — including pushing the
 binary to `\\fileshare\...` or installing it on a CI runner under
-`%ProgramFiles%\wpr-mcp\` — sign it with the engineering Authenticode cert
+`%ProgramFiles%\etw-mcp\` — sign it with the engineering Authenticode cert
 before publishing.
 
 ### Authenticode (signtool)
 
 ```powershell
 # After dotnet publish, before copying anywhere.
-$exe = "C:\git\wpr-mcp-server-dotnet-sidecar\dotnet\publish\win-x64\wpr-mcp-extract.exe"
+$exe = "C:\git\wpr-mcp-server-dotnet-sidecar\dotnet\publish\win-x64\etw-extract.exe"
 
 # Cert file:
 signtool sign /f $env:SIGNING_PFX /p $env:SIGNING_PFX_PW `
     /tr http://timestamp.digicert.com /td sha256 /fd sha256 `
-    /d "wpr-mcp-extract" /du "https://aka.ms/wpr-mcp" $exe
+    /d "etw-extract" /du "https://aka.ms/wpr-mcp" $exe
 
 # Or cert store reference:
 signtool sign /sm /n "Microsoft Corporation" `
     /tr http://timestamp.digicert.com /td sha256 /fd sha256 `
-    /d "wpr-mcp-extract" $exe
+    /d "etw-extract" $exe
 
 # Verify
 signtool verify /pa /v $exe
@@ -44,7 +44,7 @@ covered by the outer signature.
 ### .NET signed-resource considerations
 
 `PublishSingleFile=true` and `IncludeNativeLibrariesForSelfExtract=true`
-(already set in `wpr-mcp-extract.csproj`) ensure the runtime DLLs are
+(already set in `etw-extract.csproj`) ensure the runtime DLLs are
 embedded. The bundle is `Authenticode`-signable as a single PE; you do
 **not** need to sign the embedded runtime libraries separately.
 
@@ -95,8 +95,8 @@ those targets:
 
 ## Tamper-evidence
 
-Once signed, `signtool verify /pa /v wpr-mcp-extract.exe` confirms the
-chain and timestamp. The Python supervisor (`wpr-mcp-server`) does not
+Once signed, `signtool verify /pa /v etw-extract.exe` confirms the
+chain and timestamp. The Python supervisor (`etw-mcp`) does not
 currently re-verify the signature on each invocation; if you need
 per-invocation enforcement, wrap the spawn in a PowerShell `Get-AuthenticodeSignature`
 check at the supervisor side.

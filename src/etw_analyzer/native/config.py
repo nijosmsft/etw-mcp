@@ -3,7 +3,8 @@
 The resolution order is documented in the design doc §8.1:
 
     1. The explicit ``mode=...`` argument on ``load_trace``.
-    2. The ``WPR_MCP_MODE`` environment variable.
+    2. The ``ETW_MCP_MODE`` environment variable
+       (legacy ``WPR_MCP_MODE`` still read with a DeprecationWarning).
     3. The hard-coded default ``"auto"`` (Phase N5 flipped this from
        ``"xperf"`` once the native pipeline became a fast-path coverage
        subset for common analysis).
@@ -22,7 +23,7 @@ available (e.g. running on a non-Windows host, or ``tdh.dll`` failed
 to load), :func:`resolve_mode` raises ``RuntimeError``. When
 ``"dotnet"`` is requested explicitly but the sidecar binary is not
 locatable, :func:`resolve_mode` raises ``ValueError`` naming the
-``WPR_MCP_DOTNET_SIDECAR`` override. Auto silently falls back along the
+``ETW_MCP_DOTNET_SIDECAR`` override. Auto silently falls back along the
 chain in the same situation — the contract is "explicit wins over
 graceful degradation".
 """
@@ -33,13 +34,15 @@ import os
 from pathlib import Path
 from typing import Optional
 
+from .env_compat import getenv as _compat_getenv
+
 
 VALID_MODES = frozenset({"xperf", "native", "dotnet", "auto"})
 DEFAULT_NATIVE_MAX_ETL_MB = 512.0
-NATIVE_MAX_ETL_MB_ENV = "WPR_MCP_NATIVE_MAX_ETL_MB"
-NATIVE_ALLOW_LARGE_ENV = "WPR_MCP_NATIVE_ALLOW_LARGE"
-DOTNET_SIDECAR_ENV = "WPR_MCP_DOTNET_SIDECAR"
-DOTNET_SIDECAR_EXE = "wpr-mcp-extract.exe"
+NATIVE_MAX_ETL_MB_ENV = "ETW_MCP_NATIVE_MAX_ETL_MB"
+NATIVE_ALLOW_LARGE_ENV = "ETW_MCP_NATIVE_ALLOW_LARGE"
+DOTNET_SIDECAR_ENV = "ETW_MCP_DOTNET_SIDECAR"
+DOTNET_SIDECAR_EXE = "etw-extract.exe"
 
 
 # Cache the auto-detect result so we don't pay the ``OpenTraceW`` probe
@@ -52,13 +55,15 @@ _DOTNET_SIDECAR_PROBED: bool = False
 
 
 def find_dotnet_sidecar(*, auto_detect: bool = False) -> Path | None:
-    """Locate the C# sidecar binary ``wpr-mcp-extract.exe``.
+    """Locate the C# sidecar binary ``etw-extract.exe``.
 
     Search order:
 
-    1. ``WPR_MCP_DOTNET_SIDECAR`` environment variable — when set, the
-       value MUST point at an existing file or ``None`` is returned.
-       This lets a deployment pin the exact build that gets exercised.
+    1. ``ETW_MCP_DOTNET_SIDECAR`` environment variable (legacy
+       ``WPR_MCP_DOTNET_SIDECAR`` still read with a DeprecationWarning) —
+       when set, the value MUST point at an existing file or ``None`` is
+       returned. This lets a deployment pin the exact build that gets
+       exercised.
     2. Relative to the installed package — ``../../dotnet/publish/win-x64/``
        resolved from this module's directory. Convenient for in-tree
        development where ``dotnet publish`` lands the binary next to the
@@ -95,7 +100,7 @@ def find_dotnet_sidecar(*, auto_detect: bool = False) -> Path | None:
     candidates: list[Path] = []
     env_only = False
 
-    env_override = os.environ.get(DOTNET_SIDECAR_ENV)
+    env_override = _compat_getenv(DOTNET_SIDECAR_ENV)
     if env_override:
         # When the env var is set, the caller has pinned an exact path.
         # Don't fall through to in-tree / PATH lookup — that masks
@@ -179,7 +184,7 @@ def resolve_mode(
 
     global _AUTO_CACHED
 
-    env_mode = os.environ.get("WPR_MCP_MODE")
+    env_mode = _compat_getenv("ETW_MCP_MODE")
 
     # Arg wins, except that ``"auto"`` is treated as "let policy
     # decide" — i.e. it's indistinguishable from "no arg passed"
@@ -245,7 +250,7 @@ def resolve_mode(
             raise RuntimeError(
                 "mode='native' was requested but the native ETW consumer "
                 "could not be imported on this host. Use mode='xperf' "
-                "(or set WPR_MCP_MODE=xperf) to fall back to the "
+                "(or set ETW_MCP_MODE=xperf) to fall back to the "
                 "text-based xperf extraction pipeline. "
                 f"Underlying error: {exc}"
             ) from exc
@@ -254,7 +259,7 @@ def resolve_mode(
                 "mode='native' was requested but the native ETW consumer "
                 "is not available on this host (advapi32/tdh failed to "
                 "load, or the trace file could not be probed). Use "
-                "mode='xperf' (or set WPR_MCP_MODE=xperf) to fall back "
+                "mode='xperf' (or set ETW_MCP_MODE=xperf) to fall back "
                 "to the text-based xperf extraction pipeline."
             )
 
@@ -266,7 +271,7 @@ def _etl_size_mb(etl_path: Path | str) -> float:
 
 
 def _native_max_etl_mb() -> float:
-    raw = os.environ.get(NATIVE_MAX_ETL_MB_ENV)
+    raw = _compat_getenv(NATIVE_MAX_ETL_MB_ENV)
     if raw is None or raw.strip() == "":
         return DEFAULT_NATIVE_MAX_ETL_MB
     try:
@@ -283,7 +288,7 @@ def _native_max_etl_mb() -> float:
 
 
 def _allow_large_native() -> bool:
-    return os.environ.get(NATIVE_ALLOW_LARGE_ENV) == "1"
+    return _compat_getenv(NATIVE_ALLOW_LARGE_ENV) == "1"
 
 
 def _native_was_forced(arg_mode: Optional[str]) -> bool:
@@ -294,7 +299,7 @@ def _native_was_forced(arg_mode: Optional[str]) -> bool:
         if normalized_arg != "auto":
             return False
 
-    env_mode = os.environ.get("WPR_MCP_MODE")
+    env_mode = _compat_getenv("ETW_MCP_MODE")
     if env_mode:
         return normalize_mode(env_mode) == "native"
     return False
@@ -308,7 +313,7 @@ def _dotnet_was_forced(arg_mode: Optional[str]) -> bool:
         if normalized_arg != "auto":
             return False
 
-    env_mode = os.environ.get("WPR_MCP_MODE")
+    env_mode = _compat_getenv("ETW_MCP_MODE")
     if env_mode:
         return normalize_mode(env_mode) == "dotnet"
     return False
@@ -322,8 +327,8 @@ def apply_native_size_guardrail(
     """Apply the native ETW size guardrail.
 
     Native extraction buffers decoded events today. To avoid OOM on large
-    traces, auto mode falls back to xperf above ``WPR_MCP_NATIVE_MAX_ETL_MB``.
-    Explicit native requests fail fast unless ``WPR_MCP_NATIVE_ALLOW_LARGE=1``
+    traces, auto mode falls back to xperf above ``ETW_MCP_NATIVE_MAX_ETL_MB``.
+    Explicit native requests fail fast unless ``ETW_MCP_NATIVE_ALLOW_LARGE=1``
     is set.
     """
 

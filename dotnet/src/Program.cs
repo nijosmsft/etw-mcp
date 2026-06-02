@@ -1,5 +1,5 @@
 using System.Diagnostics;
-using WprMcpExtract;
+using EtwExtract;
 
 var emit = new JsonlEmitter();
 var startTime = Stopwatch.StartNew();
@@ -46,7 +46,7 @@ try
         }
         else if (args[i] == "--help" || args[i] == "-h")
         {
-            Console.Error.WriteLine("wpr-mcp-extract --request <path> [--include-tracelogging|--no-include-tracelogging]");
+            Console.Error.WriteLine("etw-extract --request <path> [--include-tracelogging|--no-include-tracelogging]");
             Console.Error.WriteLine("  Per spike-contract §2.2 the only required flag is --request.");
             Console.Error.WriteLine("  --include-tracelogging (default: true) writes a generic TraceLogging");
             Console.Error.WriteLine("  passthrough parquet for self-describing providers not routed to a");

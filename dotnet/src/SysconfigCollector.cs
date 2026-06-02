@@ -1,6 +1,6 @@
 using System.Text;
 
-namespace WprMcpExtract;
+namespace EtwExtract;
 
 /// <summary>
 /// Collects SystemConfig data from the trace and emits sysconfig.txt

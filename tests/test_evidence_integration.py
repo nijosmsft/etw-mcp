@@ -99,7 +99,7 @@ def _make_trace(tmp_path: Path, hostname: str = "test-host-01") -> TraceData:
 
 @pytest.fixture
 def evidence_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """Set WPR_MCP_EVIDENCE_PATH for the duration of the test."""
+    """Set ETW_MCP_EVIDENCE_PATH for the duration of the test."""
     root = tmp_path / "evidence"
     monkeypatch.setenv(evidence_integration.ENV_VAR, str(root))
     return root
@@ -300,7 +300,7 @@ def test_get_evidence_status_reports_state(
     monkeypatch.delenv(evidence_integration.ENV_VAR, raising=False)
     out = evidence_tool.get_evidence_status()
     assert "Library installed" in out
-    assert "WPR_MCP_EVIDENCE_PATH" in out
+    assert "ETW_MCP_EVIDENCE_PATH" in out
 
 
 def test_get_entities_returns_markdown_table(
@@ -366,6 +366,6 @@ def test_get_entities_friendly_when_env_unset(
     try:
         register_trace(trace)
         out = evidence_tool.get_entities(trace.trace_id, "module")
-        assert "WPR_MCP_EVIDENCE_PATH" in out
+        assert "ETW_MCP_EVIDENCE_PATH" in out
     finally:
         clear_traces()

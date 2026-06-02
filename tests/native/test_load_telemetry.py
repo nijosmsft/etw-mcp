@@ -219,7 +219,7 @@ def test_dotnet_phase_telemetry_via_mocked_supervisor(
 
     # Force the in-tree sidecar lookup to return a stub path (its absence
     # would raise ValueError before any telemetry fires).
-    sidecar_stub = tmp_path / "wpr-mcp-extract.exe"
+    sidecar_stub = tmp_path / "etw-extract.exe"
     sidecar_stub.write_bytes(b"stub")
     monkeypatch.setattr(supervisor, "find_dotnet_sidecar", lambda: sidecar_stub)
 

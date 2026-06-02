@@ -1,6 +1,6 @@
 # .NET sidecar — developer notes
 
-The `wpr-mcp-extract.exe` sidecar is Track B of the hybrid migration plan
+The `etw-extract.exe` sidecar is Track B of the hybrid migration plan
 (see `rust-hybrid-migration-plan.md` §4 and `spike-contract.md`). It is a
 self-contained Windows .NET binary that decodes ETW Layer-1 events from an
 `.etl` and writes per-class parquets + a v3 cache manifest into a staging
@@ -13,12 +13,12 @@ the final cache directory.
 
 | Mode      | Wins when…                                                                  |
 | --------- | --------------------------------------------------------------------------- |
-| `dotnet`  | `WPR_MCP_DOTNET_SIDECAR` env var is set OR `wpr-mcp-extract.exe` is on PATH |
+| `dotnet`  | `ETW_MCP_DOTNET_SIDECAR` env var is set OR `etw-extract.exe` is on PATH |
 | `native`  | The in-process `OpenTraceW` consumer loads (Windows Server / recent client) |
 | `xperf`   | Anywhere else, or as the explicit `mode="xperf"` opt-out                    |
 
 The `auto` chain is `dotnet → native → xperf`. The in-tree publish path
-(`dotnet/publish/win-x64/wpr-mcp-extract.exe`) is **intentionally skipped**
+(`dotnet/publish/win-x64/etw-extract.exe`) is **intentionally skipped**
 by the auto detector so a dev workstation with a published build doesn't
 silently switch its default pipeline. Explicit `mode="dotnet"` *does*
 include the in-tree path — that's the convenience hook for development.
@@ -31,14 +31,14 @@ include the in-tree path — that's the convenience hook for development.
    ```powershell
    cd dotnet
    dotnet publish -c Release -r win-x64 --self-contained
-   # → dotnet/publish/win-x64/wpr-mcp-extract.exe  (~38 MB)
+   # → dotnet/publish/win-x64/etw-extract.exe  (~38 MB)
    ```
 
 2. **Pin the path** for production use:
 
    ```powershell
-   $env:WPR_MCP_DOTNET_SIDECAR = "C:\install\wpr-mcp-extract.exe"
-   $env:WPR_MCP_MODE = "dotnet"        # force, or leave at auto
+   $env:ETW_MCP_DOTNET_SIDECAR = "C:\install\etw-extract.exe"
+   $env:ETW_MCP_MODE = "dotnet"        # force, or leave at auto
    ```
 
 3. **Verify** with the `find_dotnet_sidecar` helper:
@@ -52,11 +52,11 @@ include the in-tree path — that's the convenience hook for development.
 
 ```
 load_trace(etl_path)              # default mode="auto"
-  ↓ config.resolve_mode → "dotnet" when WPR_MCP_DOTNET_SIDECAR set
+  ↓ config.resolve_mode → "dotnet" when ETW_MCP_DOTNET_SIDECAR set
   ↓ trace_mgmt invokes worker_supervisor.run_dotnet_worker_extraction
   ↓
   ├─ build request.json (spike-contract §3 schema)
-  ├─ spawn wpr-mcp-extract.exe --request <path>
+  ├─ spawn etw-extract.exe --request <path>
   ├─ stream stdout JSONL (heartbeat / progress / result)
   ├─ validate sidecar manifest (mode='native', producer='dotnet')
   ├─ run aggregation_worker.run_aggregation_worker(staging_dir, …)
@@ -77,7 +77,7 @@ walk the PID tree + JSONL trail + staging contents:
 ### 1. Find the sidecar PID
 
 ```powershell
-Get-CimInstance Win32_Process -Filter "Name='wpr-mcp-extract.exe'" |
+Get-CimInstance Win32_Process -Filter "Name='etw-extract.exe'" |
     Select-Object ProcessId, ParentProcessId, CommandLine
 ```
 
@@ -100,7 +100,7 @@ The supervisor captures the last 16 KiB of stdout in
 re-run the sidecar by hand to see live output:
 
 ```powershell
-& "C:\install\wpr-mcp-extract.exe" --request "<path-to-request.json>"
+& "C:\install\etw-extract.exe" --request "<path-to-request.json>"
 ```
 
 Every stdout line is `{"type": "heartbeat"|"progress"|"result", "time": …}`.

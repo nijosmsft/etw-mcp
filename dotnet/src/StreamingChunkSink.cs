@@ -1,6 +1,6 @@
 using System.Collections.Concurrent;
 
-namespace WprMcpExtract;
+namespace EtwExtract;
 
 /// <summary>
 /// Producer/consumer sink for the <c>event-store-streaming</c> strategy.

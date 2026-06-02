@@ -15,7 +15,7 @@ reviewer can re-execute to validate a release candidate.
    ```powershell
    cd dotnet
    dotnet publish -c Release -r win-x64 --self-contained
-   Test-Path .\publish\win-x64\wpr-mcp-extract.exe   # → True
+   Test-Path .\publish\win-x64\etw-extract.exe   # → True
    ```
 
 2. **Real fixture present** at the canonical staging-poc location:
@@ -38,10 +38,10 @@ reviewer can re-execute to validate a release candidate.
 ```powershell
 cd C:\git\wpr-mcp-server-dotnet-sidecar
 
-$env:WPR_MCP_DOTNET_SIDECAR = `
-    "C:\git\wpr-mcp-server-dotnet-sidecar\dotnet\publish\win-x64\wpr-mcp-extract.exe"
-$env:WPR_MCP_MODE             = "dotnet"
-$env:WPR_MCP_NATIVE_ALLOW_LARGE = "1"   # required because fixture > 512 MB native limit
+$env:ETW_MCP_DOTNET_SIDECAR = `
+    "C:\git\wpr-mcp-server-dotnet-sidecar\dotnet\publish\win-x64\etw-extract.exe"
+$env:ETW_MCP_MODE             = "dotnet"
+$env:ETW_MCP_NATIVE_ALLOW_LARGE = "1"   # required because fixture > 512 MB native limit
 
 # Clean any stale output so timings are meaningful.
 Remove-Item -Recurse -Force C:\Temp\etw-export-dotnet-smoke -ErrorAction SilentlyContinue
@@ -52,7 +52,7 @@ uv run python tests\manual\_smoke_dotnet.py
 ## Expected output (validated 2026-05-29, branch `feature/dotnet-sidecar`)
 
 ```
-SIDECAR_PATH=C:\git\wpr-mcp-server-dotnet-sidecar\dotnet\publish\win-x64\wpr-mcp-extract.exe
+SIDECAR_PATH=C:\git\wpr-mcp-server-dotnet-sidecar\dotnet\publish\win-x64\etw-extract.exe
 ETL_SIZE_MB=1068.0
 OK=True
 MSG=dotnet sidecar completed: aggregation completed: 1 aggregator parquets written, 31 datasets in manifest
@@ -100,8 +100,8 @@ To verify dotnet and native produce the same `cpu_sampling` row count:
 uv run python -c "import pandas as pd; print('dotnet_rows=', len(pd.read_parquet(r'C:\Temp\etw-export-dotnet-smoke\cpu_sampling.parquet')))"
 
 # native mode — clean re-extract via the legacy in-process path
-Remove-Item Env:WPR_MCP_DOTNET_SIDECAR -ErrorAction SilentlyContinue
-$env:WPR_MCP_MODE = "native"
+Remove-Item Env:ETW_MCP_DOTNET_SIDECAR -ErrorAction SilentlyContinue
+$env:ETW_MCP_MODE = "native"
 Remove-Item -Recurse -Force C:\Temp\etw-export-native-smoke -ErrorAction SilentlyContinue
 # (no automated harness for this yet — invoke load_trace via the MCP server
 # or write a one-off harness like _smoke_dotnet.py)

@@ -17,7 +17,7 @@ cd C:\git\wpr-mcp-server-evidence-wiring
 uv sync --extra evidence --group dev
 
 # 2. Point the federation at a per-machine evidence root.
-$env:WPR_MCP_EVIDENCE_PATH = "C:\Temp\evidence-poc"
+$env:ETW_MCP_EVIDENCE_PATH = "C:\Temp\evidence-poc"
 
 # 3. Run the MCP server.
 uv run python -m etw_analyzer.server
@@ -32,7 +32,7 @@ trace_<id> loaded.
 > get_evidence_status()
 **Evidence federation status**
 - Library installed: **True**
-- `WPR_MCP_EVIDENCE_PATH` set: **True**
+- `ETW_MCP_EVIDENCE_PATH` set: **True**
 - Evidence root: `C:\Temp\evidence-poc`
 
 > get_entities(trace_id="trace_<id>", entity_type="module")

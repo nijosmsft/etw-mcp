@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-Guidance for Claude Code (and other AI assistants) when working on the **wpr-mcp-server** source. For end-user docs (install, MCP config, tool list), see `README.md`.
+Guidance for Claude Code (and other AI assistants) when working on the **etw-mcp** source. For end-user docs (install, MCP config, tool list), see `README.md`.
 
 ## What this repo is
 
@@ -44,7 +44,7 @@ Every analysis tool's signature starts with `trace_id: str` and calls `require_t
 
 ## Trace lifecycle
 
-Phase N5 flipped the default extraction mode from `"xperf"` to `"auto"`. `resolve_mode()` in `src/etw_analyzer/native/config.py` now walks a three-step fallback chain: `dotnet → native → xperf`. `"dotnet"` wins when the .NET sidecar binary is locatable via the `WPR_MCP_DOTNET_SIDECAR` env var or `wpr-mcp-extract.exe` on PATH (the in-tree `dotnet/publish/win-x64/` path is intentionally skipped during auto-detect so a stray dev build does not silently change the default pipeline — explicit `mode="dotnet"` does use it). `"native"` wins next when the in-process bindings load. `"xperf"` is the universal last resort. Resolution precedence: explicit `mode=` arg > `WPR_MCP_MODE` env var > the `"auto"` default. Explicit `mode="native"` raises `RuntimeError` if the consumer is unavailable; explicit `mode="dotnet"` raises `ValueError` (naming the env var override) if the binary is unfindable; explicit `mode="xperf"` always works as the opt-out.
+Phase N5 flipped the default extraction mode from `"xperf"` to `"auto"`. `resolve_mode()` in `src/etw_analyzer/native/config.py` now walks a three-step fallback chain: `dotnet → native → xperf`. `"dotnet"` wins when the .NET sidecar binary is locatable via the `ETW_MCP_DOTNET_SIDECAR` env var or `etw-extract.exe` on PATH (the in-tree `dotnet/publish/win-x64/` path is intentionally skipped during auto-detect so a stray dev build does not silently change the default pipeline — explicit `mode="dotnet"` does use it). `"native"` wins next when the in-process bindings load. `"xperf"` is the universal last resort. Resolution precedence: explicit `mode=` arg > `ETW_MCP_MODE` env var > the `"auto"` default. Explicit `mode="native"` raises `RuntimeError` if the consumer is unavailable; explicit `mode="dotnet"` raises `ValueError` (naming the env var override) if the binary is unfindable; explicit `mode="xperf"` always works as the opt-out.
 
 ### Native path (default when no sidecar is configured)
 ```
@@ -68,10 +68,10 @@ load_trace(etl_path)               # mode defaults to "auto"
 ### .NET sidecar path (`mode="dotnet"` or auto with sidecar configured)
 ```
 load_trace(etl_path)               # mode defaults to "auto"
-  → resolve_mode() → "dotnet" when WPR_MCP_DOTNET_SIDECAR is set
+  → resolve_mode() → "dotnet" when ETW_MCP_DOTNET_SIDECAR is set
   → worker_supervisor.run_dotnet_worker_extraction:
        1. build request.json (spike-contract.md §3 schema)
-       2. spawn wpr-mcp-extract.exe --request <path>
+       2. spawn etw-extract.exe --request <path>
        3. stream stdout JSONL: heartbeat / progress / result
        4. validate sidecar's v3 manifest (producer="dotnet")
        5. aggregation_worker.run_aggregation_worker(staging_dir, …):
@@ -84,7 +84,7 @@ load_trace(etl_path)               # mode defaults to "auto"
 
 Full developer docs: `src/etw_analyzer/native/SIDECAR.md`.
 
-### xperf fallback (`mode="xperf"` or `WPR_MCP_MODE=xperf`)
+### xperf fallback (`mode="xperf"` or `ETW_MCP_MODE=xperf`)
 ```
 load_trace(etl_path, mode="xperf")
   → find_xperf() locates xperf.exe under "Windows Kits\10\Windows Performance Toolkit"

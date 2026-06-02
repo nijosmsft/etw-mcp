@@ -25,6 +25,11 @@ _UINT64_MAX = (1 << 64) - 1
 
 
 def _schema(name: str, fields: Iterable[pa.Field]) -> EventSchema:
+    # NOTE: The parquet metadata keys intentionally retain the
+    # "wpr_mcp_" prefix even after the v0.4 etw-mcp rename. The
+    # native loader keys schema/version detection off these byte
+    # strings; renaming them would silently invalidate every user's
+    # on-disk extracted-parquet cache and force a fresh extraction.
     metadata = {
         b"wpr_mcp_event_class": name.encode("utf-8"),
         b"wpr_mcp_schema_version": str(EVENT_SCHEMA_VERSION).encode("ascii"),

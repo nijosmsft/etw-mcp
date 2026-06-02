@@ -5,7 +5,7 @@ sidecar supervisor (worker_supervisor.run_dotnet_worker_extraction) and
 asserts that load_trace correctly:
 
 * dispatches to the dotnet worker when ``mode="dotnet"`` (or
-  ``WPR_MCP_mode=dotnet``) is in effect,
+  ``ETW_MCP_MODE=dotnet``) is in effect,
 * registers the loaded trace with ``trace.mode == "dotnet"`` and the
   expected raw_csv contents,
 * falls back along the documented ``dotnet → native → xperf`` chain when
@@ -103,7 +103,7 @@ def _write_dotnet_cache(cache: Path, etl: Path, weight: int) -> None:
 
 def _fake_dotnet_sidecar_path(tmp_path: Path) -> Path:
     """Create a fake (empty) sidecar binary the resolver will accept."""
-    fake = tmp_path / "wpr-mcp-extract.exe"
+    fake = tmp_path / "etw-extract.exe"
     fake.write_bytes(b"MZ")
     return fake
 
@@ -156,7 +156,7 @@ def test_load_trace_auto_picks_dotnet_when_sidecar_is_configured(
         str(_fake_dotnet_sidecar_path(tmp_path)),
     )
     native_config.reset_dotnet_cache()
-    monkeypatch.delenv("WPR_MCP_MODE", raising=False)
+    monkeypatch.delenv("ETW_MCP_MODE", raising=False)
     monkeypatch.setattr(trace_mgmt, "find_xperf", lambda: None)
 
     def fake_worker(**kwargs):
@@ -198,7 +198,7 @@ def test_auto_dotnet_failure_falls_back_to_native_worker(
         str(_fake_dotnet_sidecar_path(tmp_path)),
     )
     native_config.reset_dotnet_cache()
-    monkeypatch.delenv("WPR_MCP_MODE", raising=False)
+    monkeypatch.delenv("ETW_MCP_MODE", raising=False)
     monkeypatch.setenv(worker_supervisor.NATIVE_WORKER_ENV, "1")
     monkeypatch.setattr(native_config, "_etl_size_mb", lambda etl_path: 0.1)
     monkeypatch.setattr(trace_mgmt, "find_xperf", lambda: None)

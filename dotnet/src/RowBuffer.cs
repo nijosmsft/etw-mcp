@@ -1,6 +1,6 @@
 using System.Collections;
 
-namespace WprMcpExtract;
+namespace EtwExtract;
 
 /// <summary>
 /// Strategy-aware wrapper around a per-class row store. Exposes a uniform

@@ -11,10 +11,12 @@ Gating contract (G3 in ``evidence-mcp-poc-plan.md`` §1.1):
    is wrapped in ``try/except ImportError`` so a default
    ``uv sync`` install (without ``--extra evidence``) does NOT pull
    the library and this module still imports cleanly.
-2. Registration is **opt-in** via the ``WPR_MCP_EVIDENCE_PATH``
-   environment variable. When unset, :func:`register_entities_from_trace`
-   is a no-op. With it set, the library writes to
-   ``$WPR_MCP_EVIDENCE_PATH/<machine_id>/evidence.duckdb``.
+2. Registration is **opt-in** via the ``ETW_MCP_EVIDENCE_PATH``
+   environment variable (legacy ``WPR_MCP_EVIDENCE_PATH`` still
+   honored via the env_compat shim with a one-shot DeprecationWarning).
+   When unset, :func:`register_entities_from_trace` is a no-op. With
+   it set, the library writes to
+   ``$ETW_MCP_EVIDENCE_PATH/<machine_id>/evidence.duckdb``.
 3. Any failure inside :func:`register_entities_from_trace` is logged
    and swallowed by the call site — load_trace must never break
    because of evidence wiring.
@@ -27,7 +29,7 @@ missing). Both must hold for entities to be written.
 from __future__ import annotations
 
 import logging
-import os
+
 import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -48,7 +50,9 @@ except ImportError:
     _EVIDENCE_AVAILABLE = False
 
 
-ENV_VAR = "WPR_MCP_EVIDENCE_PATH"
+from .native.env_compat import getenv as _compat_getenv
+
+ENV_VAR = "ETW_MCP_EVIDENCE_PATH"
 
 
 def is_available() -> bool:
@@ -58,12 +62,12 @@ def is_available() -> bool:
 
 def is_configured() -> bool:
     """Return True when the env var is set (regardless of library)."""
-    return bool(os.environ.get(ENV_VAR))
+    return bool(_compat_getenv(ENV_VAR))
 
 
 def evidence_root() -> Path | None:
     """Return the configured evidence root, or ``None`` if unset."""
-    value = os.environ.get(ENV_VAR)
+    value = _compat_getenv(ENV_VAR)
     if not value:
         return None
     return Path(value)

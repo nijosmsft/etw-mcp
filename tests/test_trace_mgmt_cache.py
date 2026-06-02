@@ -298,7 +298,7 @@ def test_dumper_cache_stems_are_manifest_mode_scoped(tmp_path: Path):
 def test_auto_large_native_falls_back_to_xperf(monkeypatch, tmp_path: Path):
     etl = _make_etl(tmp_path)
 
-    monkeypatch.setenv("WPR_MCP_NATIVE_MAX_ETL_MB", "1")
+    monkeypatch.setenv("ETW_MCP_NATIVE_MAX_ETL_MB", "1")
     monkeypatch.setattr(native_config, "resolve_mode", lambda mode, etl_path=None: "native")
     monkeypatch.setattr(native_config, "_etl_size_mb", lambda etl_path: 2.0)
     monkeypatch.setattr(trace_mgmt, "find_xperf", lambda: Path(r"C:\fake\xperf.exe"))
@@ -323,22 +323,22 @@ def test_auto_large_native_falls_back_to_xperf(monkeypatch, tmp_path: Path):
 def test_explicit_native_large_fails_without_override(monkeypatch, tmp_path: Path):
     etl = _make_etl(tmp_path)
 
-    monkeypatch.setenv("WPR_MCP_NATIVE_MAX_ETL_MB", "1")
+    monkeypatch.setenv("ETW_MCP_NATIVE_MAX_ETL_MB", "1")
     monkeypatch.setattr(native_config, "resolve_mode", lambda mode, etl_path=None: "native")
     monkeypatch.setattr(native_config, "_etl_size_mb", lambda etl_path: 2.0)
 
     result = trace_mgmt.load_trace(str(etl), mode="native")
 
     assert "above the native safety limit" in result
-    assert "WPR_MCP_NATIVE_ALLOW_LARGE=1" in result
+    assert "ETW_MCP_NATIVE_ALLOW_LARGE=1" in result
     assert list_loaded_trace_ids() == []
 
 
 def test_native_large_override_allows_load(monkeypatch, tmp_path: Path):
     etl = _make_etl(tmp_path)
 
-    monkeypatch.setenv("WPR_MCP_NATIVE_MAX_ETL_MB", "1")
-    monkeypatch.setenv("WPR_MCP_NATIVE_ALLOW_LARGE", "1")
+    monkeypatch.setenv("ETW_MCP_NATIVE_MAX_ETL_MB", "1")
+    monkeypatch.setenv("ETW_MCP_NATIVE_ALLOW_LARGE", "1")
     monkeypatch.setattr(native_config, "resolve_mode", lambda mode, etl_path=None: "native")
     monkeypatch.setattr(native_config, "_etl_size_mb", lambda etl_path: 2.0)
 

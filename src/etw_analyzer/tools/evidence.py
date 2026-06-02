@@ -3,7 +3,7 @@
 Exposes two tools:
 
 - :func:`get_evidence_status` — whether the optional ``evidence-store``
-  library is installed and whether the ``WPR_MCP_EVIDENCE_PATH`` env
+  library is installed and whether the ``ETW_MCP_EVIDENCE_PATH`` env
   var is set. Useful for the operator to diagnose why
   :func:`get_entities` returns no rows.
 - :func:`get_entities` — list entities registered for a loaded trace,
@@ -51,7 +51,7 @@ def get_evidence_status() -> str:
 
     Two independent gates must both be on for entities to be written:
     the optional ``evidence-store`` library must be installed
-    (``uv sync --extra evidence``) AND the ``WPR_MCP_EVIDENCE_PATH``
+    (``uv sync --extra evidence``) AND the ``ETW_MCP_EVIDENCE_PATH``
     environment variable must point at a directory.
     """
     lines = ["**Evidence federation status**", ""]
@@ -96,7 +96,7 @@ def get_entities(
         max_rows: Truncate the table to this many rows. Default 50.
 
     Returns a markdown table. Returns a friendly message when the
-    evidence-store library is unavailable or ``WPR_MCP_EVIDENCE_PATH``
+    evidence-store library is unavailable or ``ETW_MCP_EVIDENCE_PATH``
     is unset (G3 — neither condition is an error).
     """
     trace = require_trace(trace_id)

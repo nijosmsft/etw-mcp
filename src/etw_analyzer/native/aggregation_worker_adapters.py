@@ -1,6 +1,6 @@
 """Dotnet-sidecar → native-aggregator schema adapters.
 
-The .NET sidecar (``wpr-mcp-extract.exe``) writes per-event-class parquets
+The .NET sidecar (``etw-extract.exe``) writes per-event-class parquets
 whose column names follow the layer-2 schema in
 ``dotnet/docs/event-class-mapping.md`` — notably ``TimeStampQpc`` (raw
 QPC ticks) instead of the legacy ``TimeStamp`` column the in-tree

@@ -326,12 +326,12 @@ def test_load_trace_default_uses_native(isolate_traces):
 
 
 @need_multi_provider
-def test_wpr_mcp_mode_env_var_can_force_xperf(isolate_traces, monkeypatch):
-    """Setting WPR_MCP_MODE=xperf opts out of the new native default."""
+def test_etw_mcp_mode_env_var_can_force_xperf(isolate_traces, monkeypatch):
+    """Setting ETW_MCP_MODE=xperf opts out of the new native default."""
     from etw_analyzer.tools.trace_mgmt import load_trace
     from etw_analyzer.trace_state import get_trace
 
-    monkeypatch.setenv("WPR_MCP_MODE", "xperf")
+    monkeypatch.setenv("ETW_MCP_MODE", "xperf")
     _clear_export_dir(MULTI_PROVIDER_ETL)
     # No explicit ``mode=`` arg — the env var takes over and forces
     # the legacy xperf pipeline.
@@ -342,12 +342,12 @@ def test_wpr_mcp_mode_env_var_can_force_xperf(isolate_traces, monkeypatch):
 
 
 @need_multi_provider
-def test_wpr_mcp_mode_env_var_overrides_arg(isolate_traces, monkeypatch):
+def test_etw_mcp_mode_env_var_overrides_arg(isolate_traces, monkeypatch):
     """The explicit ``mode=`` arg wins over the env var when both are set."""
     from etw_analyzer.tools.trace_mgmt import load_trace
     from etw_analyzer.trace_state import get_trace
 
-    monkeypatch.setenv("WPR_MCP_MODE", "native")
+    monkeypatch.setenv("ETW_MCP_MODE", "native")
     _clear_export_dir(MULTI_PROVIDER_ETL)
     # Explicit mode='xperf' beats the env var per the documented
     # precedence (arg > env > default).
@@ -358,17 +358,17 @@ def test_wpr_mcp_mode_env_var_overrides_arg(isolate_traces, monkeypatch):
 
 
 @need_multi_provider
-def test_wpr_mcp_mode_env_var_used_when_arg_default(isolate_traces, monkeypatch):
-    """WPR_MCP_MODE is consulted when load_trace is called without mode."""
+def test_etw_mcp_mode_env_var_used_when_arg_default(isolate_traces, monkeypatch):
+    """ETW_MCP_MODE is consulted when load_trace is called without mode."""
     from etw_analyzer.native.config import resolve_mode, reset_auto_cache
 
-    monkeypatch.setenv("WPR_MCP_MODE", "native")
+    monkeypatch.setenv("ETW_MCP_MODE", "native")
     reset_auto_cache()
     # ``resolve_mode`` only honours the env var when the argument is
     # falsy. This test pins the contract for resolve_mode after the
     # Phase N5 default flip.
     assert resolve_mode(None) == "native"
-    monkeypatch.setenv("WPR_MCP_MODE", "xperf")
+    monkeypatch.setenv("ETW_MCP_MODE", "xperf")
     reset_auto_cache()
     assert resolve_mode(None) == "xperf"
 

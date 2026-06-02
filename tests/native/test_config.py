@@ -12,7 +12,7 @@ from etw_analyzer.native import config
 
 
 def _make_fake_sidecar(tmp_path: Path) -> Path:
-    """Write a fake ``wpr-mcp-extract.exe`` file in ``tmp_path`` and return it."""
+    """Write a fake ``etw-extract.exe`` file in ``tmp_path`` and return it."""
 
     target = tmp_path / config.DOTNET_SIDECAR_EXE
     target.write_bytes(b"MZ fake sidecar")
@@ -23,7 +23,7 @@ def _make_fake_sidecar(tmp_path: Path) -> Path:
 def _clear_caches(monkeypatch):
     """Reset both auto-detect caches so test interaction is impossible."""
 
-    monkeypatch.delenv("WPR_MCP_MODE", raising=False)
+    monkeypatch.delenv("ETW_MCP_MODE", raising=False)
     monkeypatch.delenv(config.DOTNET_SIDECAR_ENV, raising=False)
     config.reset_auto_cache()
     yield
@@ -61,7 +61,7 @@ def test_find_dotnet_sidecar_env_missing_file_returns_none(tmp_path, monkeypatch
     )
     config.reset_dotnet_cache()
     # No env file, no in-tree publish in this fake tree → expect None unless
-    # the host happens to have wpr-mcp-extract.exe on PATH. Tolerate that case.
+    # the host happens to have etw-extract.exe on PATH. Tolerate that case.
     found = config.find_dotnet_sidecar()
     if found is not None:
         # Must be a real file that exists.
@@ -92,12 +92,12 @@ def test_resolve_mode_dotnet_explicit_missing_binary_raises(monkeypatch, tmp_pat
     # Ensure no binary is findable: clear env, point at non-existent path.
     monkeypatch.setenv(config.DOTNET_SIDECAR_ENV, str(tmp_path / "nope.exe"))
     config.reset_dotnet_cache()
-    # On a host where wpr-mcp-extract.exe is on PATH this would mis-pass;
+    # On a host where etw-extract.exe is on PATH this would mis-pass;
     # skip in that case so the test stays portable across dev machines.
     import shutil
 
     if shutil.which(config.DOTNET_SIDECAR_EXE):
-        pytest.skip("wpr-mcp-extract.exe is on PATH; cannot test missing binary case")
+        pytest.skip("etw-extract.exe is on PATH; cannot test missing binary case")
 
     with pytest.raises(ValueError, match=config.DOTNET_SIDECAR_ENV):
         config.resolve_mode("dotnet")
@@ -122,7 +122,7 @@ def test_resolve_mode_auto_falls_back_to_native_when_dotnet_missing(
     import shutil
 
     if shutil.which(config.DOTNET_SIDECAR_EXE):
-        pytest.skip("wpr-mcp-extract.exe is on PATH; cannot test fallback")
+        pytest.skip("etw-extract.exe is on PATH; cannot test fallback")
 
     # The native vs xperf branch depends on host capability; we only assert
     # that dotnet was NOT chosen (the fallback chain advanced past it).
@@ -131,32 +131,32 @@ def test_resolve_mode_auto_falls_back_to_native_when_dotnet_missing(
     assert resolved in {"native", "xperf"}
 
 
-def test_wpr_mcp_mode_env_dotnet_honored(tmp_path, monkeypatch):
+def test_etw_mcp_mode_env_dotnet_honored(tmp_path, monkeypatch):
     sidecar = _make_fake_sidecar(tmp_path)
     monkeypatch.setenv(config.DOTNET_SIDECAR_ENV, str(sidecar))
-    monkeypatch.setenv("WPR_MCP_MODE", "dotnet")
+    monkeypatch.setenv("ETW_MCP_MODE", "dotnet")
     config.reset_auto_cache()
     assert config.resolve_mode(None) == "dotnet"
 
 
-def test_wpr_mcp_mode_env_native_honored(monkeypatch):
+def test_etw_mcp_mode_env_native_honored(monkeypatch):
     """Existing contract: env var sets mode when no explicit arg is given."""
 
-    monkeypatch.setenv("WPR_MCP_MODE", "xperf")
+    monkeypatch.setenv("ETW_MCP_MODE", "xperf")
     config.reset_auto_cache()
     # xperf never fails to resolve, so this is the safe one to pin.
     assert config.resolve_mode(None) == "xperf"
 
 
-def test_wpr_mcp_mode_env_auto_honored(monkeypatch):
-    monkeypatch.setenv("WPR_MCP_MODE", "auto")
+def test_etw_mcp_mode_env_auto_honored(monkeypatch):
+    monkeypatch.setenv("ETW_MCP_MODE", "auto")
     config.reset_auto_cache()
     resolved = config.resolve_mode(None)
     assert resolved in {"dotnet", "native", "xperf"}
 
 
-def test_wpr_mcp_mode_env_xperf_honored(monkeypatch):
-    monkeypatch.setenv("WPR_MCP_MODE", "xperf")
+def test_etw_mcp_mode_env_xperf_honored(monkeypatch):
+    monkeypatch.setenv("ETW_MCP_MODE", "xperf")
     config.reset_auto_cache()
     assert config.resolve_mode(None) == "xperf"
 
@@ -166,7 +166,7 @@ def test_explicit_arg_overrides_env_var(tmp_path, monkeypatch):
 
     sidecar = _make_fake_sidecar(tmp_path)
     monkeypatch.setenv(config.DOTNET_SIDECAR_ENV, str(sidecar))
-    monkeypatch.setenv("WPR_MCP_MODE", "dotnet")
+    monkeypatch.setenv("ETW_MCP_MODE", "dotnet")
     config.reset_auto_cache()
     # Explicit xperf wins over env var dotnet.
     assert config.resolve_mode("xperf") == "xperf"
@@ -175,7 +175,7 @@ def test_explicit_arg_overrides_env_var(tmp_path, monkeypatch):
 def test_explicit_auto_arg_lets_env_var_win(monkeypatch):
     """auto from caller is identical to "no arg" — env var still wins."""
 
-    monkeypatch.setenv("WPR_MCP_MODE", "xperf")
+    monkeypatch.setenv("ETW_MCP_MODE", "xperf")
     config.reset_auto_cache()
     assert config.resolve_mode("auto") == "xperf"
 
@@ -186,7 +186,7 @@ def test_auto_detect_ignores_in_tree_dotnet_binary(monkeypatch):
     a dev convenience; flipping the default pipeline on its presence would
     be a surprise to every dev with a published checkout.
 
-    The behaviour is opt-in via the ``WPR_MCP_DOTNET_SIDECAR`` env var or
+    The behaviour is opt-in via the ``ETW_MCP_DOTNET_SIDECAR`` env var or
     by putting the binary on PATH.
     """
 
@@ -197,7 +197,7 @@ def test_auto_detect_ignores_in_tree_dotnet_binary(monkeypatch):
 
     if shutil.which(config.DOTNET_SIDECAR_EXE):
         pytest.skip(
-            "wpr-mcp-extract.exe is on PATH; cannot test the in-tree-only case"
+            "etw-extract.exe is on PATH; cannot test the in-tree-only case"
         )
 
     # The conservative lookup must NOT find the in-tree binary.

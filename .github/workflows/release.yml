@@ -54,7 +54,7 @@ jobs:
 
       - name: Build .NET sidecar (self-contained single-file)
         run: |
-          dotnet publish dotnet/wpr-mcp-extract.csproj `
+          dotnet publish dotnet/etw-extract.csproj `
             -c Release -r win-x64 --self-contained `
             -o dotnet/publish/win-x64
 
@@ -62,7 +62,7 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Copy-Item dotnet/publish/win-x64/wpr-mcp-extract.exe dist/wpr-mcp-extract.exe
+          Copy-Item dotnet/publish/win-x64/etw-extract.exe dist/etw-extract.exe
 
       - name: Build package
         run: uv build
@@ -116,23 +116,23 @@ jobs:
           $readme = Get-Content README.md -Raw
           $original = $readme
 
-          # Wheel download URLs: .../releases/download/vX.Y.Z/wpr_mcp_server-X.Y.Z-py3-none-any.whl
+          # Wheel download URLs: .../releases/download/vX.Y.Z/etw_mcp-X.Y.Z-py3-none-any.whl
           $readme = $readme -replace `
-            'releases/download/v\d+\.\d+\.\d+/wpr_mcp_server-\d+\.\d+\.\d+-py3-none-any\.whl', `
-            "releases/download/$tag/wpr_mcp_server-$version-py3-none-any.whl"
+            'releases/download/v\d+\.\d+\.\d+/etw_mcp-\d+\.\d+\.\d+-py3-none-any\.whl', `
+            "releases/download/$tag/etw_mcp-$version-py3-none-any.whl"
 
-          # Sidecar download URLs: .../releases/download/vX.Y.Z/wpr-mcp-extract.exe
+          # Sidecar download URLs: .../releases/download/vX.Y.Z/etw-extract.exe
           $readme = $readme -replace `
-            'releases/download/v\d+\.\d+\.\d+/wpr-mcp-extract\.exe', `
-            "releases/download/$tag/wpr-mcp-extract.exe"
+            'releases/download/v\d+\.\d+\.\d+/etw-extract\.exe', `
+            "releases/download/$tag/etw-extract.exe"
 
-          # "hard-coded to v0.2.0" / "wpr-mcp-server v0.2.0 importable" prose markers
+          # "hard-coded to v0.2.0" / "etw-mcp v0.2.0 importable" prose markers
           $readme = $readme -replace `
             'hard-coded to v\d+\.\d+\.\d+', `
             "hard-coded to $tag"
           $readme = $readme -replace `
-            'wpr-mcp-server v\d+\.\d+\.\d+ importable', `
-            "wpr-mcp-server $tag importable"
+            'etw-mcp v\d+\.\d+\.\d+ importable', `
+            "etw-mcp $tag importable"
 
           if ($readme -eq $original) {
             Write-Host "README URLs already at $tag — nothing to update."
