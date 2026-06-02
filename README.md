@@ -41,7 +41,7 @@ Install the WPR trace analyzer MCP server on this Windows machine:
 
      {
        "<top-level-key>": {
-         "wpr-trace-analyzer": {
+         "etw-trace-analyzer": {
            "type": "stdio",
            "command": "uv",
            "args": ["run", "--no-project", "--with",
@@ -116,7 +116,7 @@ Add to your `.mcp.json` (project root or `~/.claude/.mcp.json`):
 ```json
 {
   "mcpServers": {
-    "wpr-trace-analyzer": {
+    "etw-trace-analyzer": {
       "type": "stdio",
       "command": "uv",
       "args": ["run", "--no-project", "--with", "https://github.com/nijosmsft/etw-mcp/releases/download/v0.4.0/etw_mcp-0.4.0-py3-none-any.whl", "python", "-m", "etw_analyzer.server"],
@@ -137,7 +137,7 @@ Add to `.vscode/mcp.json` (workspace) or `%APPDATA%\Code\User\mcp.json` (user-sc
 ```json
 {
   "servers": {
-    "wpr-trace-analyzer": {
+    "etw-trace-analyzer": {
       "type": "stdio",
       "command": "uv",
       "args": ["run", "--no-project", "--with", "https://github.com/nijosmsft/etw-mcp/releases/download/v0.4.0/etw_mcp-0.4.0-py3-none-any.whl", "python", "-m", "etw_analyzer.server"],
@@ -156,7 +156,7 @@ Add to `%APPDATA%\Claude\claude_desktop_config.json` (top-level key: `mcpServers
 ```json
 {
   "mcpServers": {
-    "wpr-trace-analyzer": {
+    "etw-trace-analyzer": {
       "type": "stdio",
       "command": "uv",
       "args": ["run", "--no-project", "--with", "https://github.com/nijosmsft/etw-mcp/releases/download/v0.4.0/etw_mcp-0.4.0-py3-none-any.whl", "python", "-m", "etw_analyzer.server"],
@@ -175,7 +175,7 @@ Add to `%USERPROFILE%\.copilot\mcp-config.json` (top-level key: `mcpServers`):
 ```json
 {
   "mcpServers": {
-    "wpr-trace-analyzer": {
+    "etw-trace-analyzer": {
       "type": "stdio",
       "command": "uv",
       "args": ["run", "--no-project", "--with", "https://github.com/nijosmsft/etw-mcp/releases/download/v0.4.0/etw_mcp-0.4.0-py3-none-any.whl", "python", "-m", "etw_analyzer.server"],
@@ -459,7 +459,7 @@ The `ETW_MCP_MODE` environment variable overrides the default when `mode=` is le
    ```json
    {
      "mcpServers": {
-       "wpr-trace-analyzer": {
+       "etw-trace-analyzer": {
          "type": "stdio",
          "command": "uv",
          "args": ["run", "--no-project", "--with", "https://github.com/nijosmsft/etw-mcp/releases/download/v0.4.0/etw_mcp-0.4.0-py3-none-any.whl", "python", "-m", "etw_analyzer.server"],
