@@ -309,16 +309,29 @@ def test_load_trace_xperf_mode_is_unchanged(isolate_traces):
 
 
 @need_multi_provider
-def test_load_trace_default_uses_native(isolate_traces):
-    """Phase N5: the default (no ``mode=`` arg) resolves to native on Windows."""
+def test_load_trace_default_uses_native(isolate_traces, monkeypatch, tmp_path):
+    """Default (no ``mode=`` arg) resolves to native when dotnet is unavailable.
+
+    v0.5 introduces auto-bootstrap of the .NET sidecar: with no
+    explicit config and an unblocked network, ``mode="auto"`` prefers
+    dotnet. To pin the *fallback* contract that the native consumer is
+    still the default when dotnet is genuinely unavailable, this test
+    blocks the auto-bootstrap (``ETW_MCP_NO_AUTO_DOWNLOAD=1``) and
+    redirects the cache lookup to an empty directory.
+    """
+
     from etw_analyzer.tools.trace_mgmt import load_trace
     from etw_analyzer.trace_state import get_trace
 
+    monkeypatch.setenv("ETW_MCP_NO_AUTO_DOWNLOAD", "1")
+    monkeypatch.delenv("ETW_MCP_DOTNET_SIDECAR", raising=False)
+    monkeypatch.delenv("WPR_MCP_DOTNET_SIDECAR", raising=False)
+    # Redirect the sidecar cache lookup to an empty tmpdir so an
+    # existing per-user cache (a v0.4.0 binary from a prior run, say)
+    # doesn't satisfy the dotnet probe and flip auto away from native.
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+
     _clear_export_dir(MULTI_PROVIDER_ETL)
-    # No ``mode=`` arg — the default is now ``"auto"`` which picks
-    # native when the bindings load (always true on Windows hosts
-    # where this test runs; the module-level pytestmark skips
-    # everywhere else).
     result = load_trace(str(MULTI_PROVIDER_ETL))
     tid = _extract_trace_id(result)
     trace = get_trace(tid)

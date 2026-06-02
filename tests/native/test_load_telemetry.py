@@ -221,7 +221,7 @@ def test_dotnet_phase_telemetry_via_mocked_supervisor(
     # would raise ValueError before any telemetry fires).
     sidecar_stub = tmp_path / "etw-extract.exe"
     sidecar_stub.write_bytes(b"stub")
-    monkeypatch.setattr(supervisor, "find_dotnet_sidecar", lambda: sidecar_stub)
+    monkeypatch.setattr(supervisor, "resolve_sidecar_path", lambda: sidecar_stub)
 
     def fake_runner(sidecar_path, request_path, **kwargs):
         # Locate the staging dir from the request file and seed it with the
