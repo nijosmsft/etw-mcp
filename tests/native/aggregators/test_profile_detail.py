@@ -22,6 +22,16 @@ class _FakeSymbolizer:
     def bulk_resolve(self, addrs):
         return {int(a): self._mapping.get(int(a), "") for a in addrs}
 
+    def bulk_resolve_with_source(self, addrs):
+        # Tag every resolved label as a "pdb" source so the v0.6
+        # aggregator path (SymbolSource column) gets a meaningful value
+        # without requiring tests to spin up a real dbghelp instance.
+        out: dict[int, tuple[str, str]] = {}
+        for a in addrs:
+            label = self._mapping.get(int(a), "")
+            out[int(a)] = (label, "pdb" if label else "unknown")
+        return out
+
 
 def _make_trace(
     dumper_df,
@@ -92,7 +102,7 @@ class TestAggregateCpuSampling:
 
         result = aggregate_cpu_sampling(trace)
         assert result is not None
-        assert set(result.columns) == {"Process Name", "PID", "Weight", "% Weight", "Module", "Function"}
+        assert set(result.columns) == {"Process Name", "PID", "Weight", "% Weight", "Module", "Function", "SymbolSource"}
         assert len(result) == 2
 
         ntos_row = result[result["Module"] == "ntoskrnl.exe"].iloc[0]

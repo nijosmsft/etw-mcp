@@ -1438,7 +1438,10 @@ def _synthesize_native_cpu_sampling(trace: TraceData) -> None:
 
     # Match the xperf schema. Process Name, PID are already there;
     # Module / Function are empty strings on the native path; Weight
-    # comes from the per-sample Count.
+    # comes from the per-sample Count. SymbolSource is empty for this
+    # fallback path because no symbolization was attempted — keep the
+    # column for schema parity with aggregate_cpu_sampling so consumers
+    # don't need to special-case the absence (item 63).
     group_cols = ["Process Name", "PID", "Module", "Function"]
     agg = (
         dumper_df.groupby(group_cols, dropna=False)["Weight"]
@@ -1447,10 +1450,11 @@ def _synthesize_native_cpu_sampling(trace: TraceData) -> None:
     )
     total = agg["Weight"].sum() or 1
     agg["% Weight"] = (agg["Weight"] / total) * 100.0
+    agg["SymbolSource"] = ""
 
     # Reorder columns to match xperf for downstream tools that index by
     # name/position.
-    agg = agg[["Process Name", "PID", "Weight", "% Weight", "Module", "Function"]]
+    agg = agg[["Process Name", "PID", "Weight", "% Weight", "Module", "Function", "SymbolSource"]]
 
     with trace.lock:
         trace.raw_csv["cpu_sampling"] = agg

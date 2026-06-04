@@ -114,7 +114,12 @@ class _AddressResolver:
         self.image_index = image_index
         self.warnings = warnings
         self.max_symbol_addresses = max_symbol_addresses
+        # _pairs maps address -> (module, function). _sources maps
+        # address -> symbol source string ("pdb" | "export" | "unknown")
+        # mirroring the v0.6 dataframe aggregator path so the streaming
+        # cpu_sampling output can populate SymbolSource for item 63.
         self._pairs: dict[int, tuple[str, str]] = {}
+        self._sources: dict[int, str] = {}
         self._warned_cap = False
 
     def prepare(self, addresses: list[int | None]) -> None:
@@ -127,12 +132,22 @@ class _AddressResolver:
             return
 
         labels: dict[int, str] = {}
+        sources: dict[int, str] = {}
         if self.symbolizer is not None:
             if len(self._pairs) + len(missing) <= self.max_symbol_addresses:
                 try:
-                    labels = self.symbolizer.bulk_resolve(missing)
+                    # Prefer the v0.6 source-aware API; older Symbolizer
+                    # implementations (or mocks) only expose bulk_resolve,
+                    # so fall back transparently.
+                    if hasattr(self.symbolizer, "bulk_resolve_with_source"):
+                        pairs = self.symbolizer.bulk_resolve_with_source(missing)
+                        labels = {k: v[0] for k, v in pairs.items()}
+                        sources = {k: v[1] for k, v in pairs.items()}
+                    else:
+                        labels = self.symbolizer.bulk_resolve(missing)
                 except Exception:
                     labels = {}
+                    sources = {}
             elif not self._warned_cap:
                 self.warnings.append(
                     "Streaming symbolization reached the safety cap; "
@@ -146,6 +161,7 @@ class _AddressResolver:
             if not module or module == "unknown":
                 module = self.image_index.module_for(addr)
             self._pairs[addr] = (module or "unknown", function or "")
+            self._sources[addr] = sources.get(addr, "" if label else "unknown")
 
     def pair_for(self, address: int | None) -> tuple[str, str]:
         if address is None:
@@ -154,6 +170,15 @@ class _AddressResolver:
         if addr not in self._pairs:
             self.prepare([addr])
         return self._pairs.get(addr, ("unknown", ""))
+
+    def source_for(self, address: int | None) -> str:
+        """Return the SymbolSource for ``address`` ("pdb"/"export"/"unknown"/"")."""
+        if address is None:
+            return ""
+        addr = int(address)
+        if addr not in self._pairs:
+            self.prepare([addr])
+        return self._sources.get(addr, "")
 
     def module_for(self, address: int | None) -> str:
         module, _function = self.pair_for(address)
@@ -290,6 +315,7 @@ def _normalize_cpu_sampling_capacity(
                     "Weight": idle_weight,
                     "Module": "<Heuristic Low Power State>",
                     "Function": "<C3>",
+                    "SymbolSource": "",
                 }
                 normalized = pd.concat([normalized, pd.DataFrame([idle_row])], ignore_index=True)
         return _recompute_cpu_sampling_percent(normalized)
@@ -318,6 +344,7 @@ def _normalize_cpu_sampling_capacity(
             "Weight": int(round(idle_target)),
             "Module": "<Heuristic Low Power State>",
             "Function": "<C3>",
+            "SymbolSource": "",
         }
         normalized = pd.concat([normalized, pd.DataFrame([idle_row])], ignore_index=True)
 
@@ -552,7 +579,7 @@ def _build_cpu_sampling(
     *,
     batch_size: int,
 ) -> pd.DataFrame | None:
-    weights: dict[tuple[str, int, str, str], int] = defaultdict(int)
+    weights: dict[tuple[str, int, str, str, str], int] = defaultdict(int)
     profile_weight_time_scaled = False
 
     columns = [
@@ -590,7 +617,8 @@ def _build_cpu_sampling(
             if weight is None:
                 weight = base_weight or 1
             module, function = resolver.pair_for(ip)
-            weights[(process_name, pid, module, function)] += int(weight)
+            symbol_source = resolver.source_for(ip)
+            weights[(process_name, pid, module, function, symbol_source)] += int(weight)
 
     if not weights:
         return None
@@ -601,13 +629,14 @@ def _build_cpu_sampling(
             "Weight": weight,
             "Module": module,
             "Function": function,
+            "SymbolSource": symbol_source,
         }
-        for (process_name, pid, module, function), weight in weights.items()
+        for (process_name, pid, module, function, symbol_source), weight in weights.items()
     ]
     df = pd.DataFrame(rows)
     total = float(df["Weight"].sum()) or 1.0
     df["% Weight"] = df["Weight"].astype(float) / total * 100.0
-    df = df[["Process Name", "PID", "Weight", "% Weight", "Module", "Function"]]
+    df = df[["Process Name", "PID", "Weight", "% Weight", "Module", "Function", "SymbolSource"]]
     df = df.sort_values("Weight", ascending=False).reset_index(drop=True)
     df.attrs["profile_weight_time_scaled"] = profile_weight_time_scaled
     return df
