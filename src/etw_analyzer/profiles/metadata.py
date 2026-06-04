@@ -374,7 +374,7 @@ PROFILES: dict[str, ProfileMeta] = {
             "--pkt-size 0 -f <out.etl>`, then `pktmon stop`. The MCP "
             "tools document this in get_capture_commands and "
             "get_capture_instructions. Convert to pcapng with "
-            "`pktmon etl2pcapng <in.etl> -o <out.pcapng>` if a tool "
+            "`pktmon etl2pcap <in.etl> -o <out.pcapng>` if a tool "
             "needs the wireshark format."
         ),
         wprp_filename=None,
