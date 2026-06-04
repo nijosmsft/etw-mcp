@@ -38,6 +38,19 @@ SYMOPT_AUTO_PUBLICS         = 0x00010000  # search publics by default
 SYMOPT_DEBUG                = 0x80000000
 
 
+# ---------------------------------------------------------------------------
+# SYMBOL_INFOW.Flags bits we care about. See DbgHelp.h ``SYMFLAG_*``.
+#
+# When SymFromAddrW succeeds with no matching PDB symbol it still returns
+# the nearest PE export-table entry and sets ``SYMFLAG_EXPORT`` on Flags.
+# That is dbghelp telling us "this name came from the PE export table, not
+# from a PDB" — the result is a heuristic, not a real symbol. We surface
+# that bit so check_symbols / get_hot_functions can distinguish "PDB-quality
+# function name" from "export-table nearest-neighbour guess".
+# ---------------------------------------------------------------------------
+SYMFLAG_EXPORT              = 0x00000200
+
+
 # Maximum symbol-name length we ever request from dbghelp. The SDK header
 # uses MAX_SYM_NAME = 2000 as the conventional ceiling; SYMBOL_INFOW is
 # typically allocated with this many WCHARs after the fixed prefix.
@@ -123,6 +136,7 @@ __all__ = [
     "SYMOPT_FAIL_CRITICAL_ERRORS",
     "SYMOPT_AUTO_PUBLICS",
     "SYMOPT_DEBUG",
+    "SYMFLAG_EXPORT",
     "MAX_SYM_NAME",
     "SymInitializeW",
     "SymCleanup",
