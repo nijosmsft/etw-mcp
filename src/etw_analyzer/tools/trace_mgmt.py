@@ -30,6 +30,55 @@ from etw_analyzer.formatting.markdown import format_table
 import pandas as pd
 
 
+def _resolve_sym_path(
+    symbol_path: str | None,
+    extra_symbol_paths: list[str] | None,
+) -> str | None:
+    """Build the effective ``_NT_SYMBOL_PATH`` for a tool call.
+
+    Precedence:
+
+    1. ``symbol_path`` REPLACES the ``_NT_SYMBOL_PATH`` environment
+       variable when given (preserves the pre-v0.6 behaviour — passing
+       ``symbol_path=...`` used to clobber the env var, and existing
+       callers rely on that).
+    2. ``extra_symbol_paths`` are APPENDED to whatever base was chosen
+       (either ``symbol_path`` or the env var). This is the new escape
+       hatch — callers can add local build outputs without losing the
+       symbol server entries from .mcp.json.
+
+    Returns the combined semicolon-joined path, or ``None`` if no entry
+    was provided.
+
+    Examples:
+
+        _NT_SYMBOL_PATH = "srv*C:\\symbols*https://msdl..."
+
+        _resolve_sym_path(None, None)
+            -> "srv*C:\\symbols*https://msdl..."   (env wins)
+        _resolve_sym_path("srv*D:\\custom", None)
+            -> "srv*D:\\custom"                     (arg replaces env)
+        _resolve_sym_path(None, ["C:\\build\\Release"])
+            -> "srv*C:\\symbols*...;C:\\build\\Release"  (env + extra)
+        _resolve_sym_path("srv*D:\\custom", ["C:\\build\\Release"])
+            -> "srv*D:\\custom;C:\\build\\Release"  (arg + extra)
+    """
+    base = symbol_path if symbol_path is not None else os.environ.get("_NT_SYMBOL_PATH")
+    entries: list[str] = []
+    if base:
+        entries.append(base.strip())
+    if extra_symbol_paths:
+        for raw in extra_symbol_paths:
+            if raw is None:
+                continue
+            entry = str(raw).strip()
+            if entry:
+                entries.append(entry)
+    if not entries:
+        return None
+    return ";".join(entries)
+
+
 @mcp.tool()
 def list_traces(directory: str = r"C:\traces", pattern: str = "*.etl") -> str:
     """List ETL trace files in a directory.
@@ -69,6 +118,7 @@ def load_trace(
     timeout_seconds: int = 300,
     force: bool = False,
     mode: str = "auto",
+    extra_symbol_paths: list[str] | None = None,
 ) -> str:
     """Load an ETL trace file for analysis.
 
@@ -82,7 +132,8 @@ def load_trace(
     Args:
         etl_path: Full path to the .etl file.
         symbol_path: NT symbol path (e.g. 'srv*C:\\symbols*https://msdl.microsoft.com/download/symbols').
-                     If not set, uses _NT_SYMBOL_PATH env var.
+                     When set, REPLACES the ``_NT_SYMBOL_PATH`` env var.
+                     If not set, uses ``_NT_SYMBOL_PATH``.
         timeout_seconds: Max seconds per xperf invocation. Default: 300.
                          Native ETW extraction currently runs to completion;
                          non-default timeout values require mode="xperf".
@@ -103,6 +154,12 @@ def load_trace(
               dotnet pipelines are fast paths for a curated event /
               aggregation subset; use ``mode="xperf"`` for broadest
               coverage.
+        extra_symbol_paths: Additional symbol path entries APPENDED to
+              whatever base was chosen (``symbol_path`` or the env var).
+              Use this to add local build outputs (e.g. your private
+              .exe + .pdb directory) without losing the symbol server
+              entries from ``_NT_SYMBOL_PATH``. Each entry is joined
+              with ``;``.
     """
     path = Path(etl_path)
     if not path.exists():
@@ -170,8 +227,11 @@ def load_trace(
             "enforcement, or leave timeout_seconds at its default for native."
         )
 
-    # Resolve symbol path
-    sym_path = symbol_path or os.environ.get("_NT_SYMBOL_PATH")
+    # Resolve symbol path. ``symbol_path`` REPLACES the env var when
+    # given (preserves pre-v0.6 behaviour). ``extra_symbol_paths`` are
+    # APPENDED so callers can add local build outputs without losing
+    # the symbol server entries from .mcp.json.
+    sym_path = _resolve_sym_path(symbol_path, extra_symbol_paths)
     load_notices: list[str] = [guardrail_notice] if guardrail_notice else []
 
     # Export directory next to the ETL file
@@ -2367,7 +2427,10 @@ def unload_trace(trace_id: str) -> str:
 
 
 @mcp.tool()
-def check_symbols(trace_id: str) -> str:
+def check_symbols(
+    trace_id: str,
+    extra_symbol_paths: list[str] | None = None,
+) -> str:
     """Check symbol resolution status for a trace.
 
     Reports:
@@ -2384,12 +2447,20 @@ def check_symbols(trace_id: str) -> str:
 
     Args:
         trace_id: ID returned by load_trace.
+        extra_symbol_paths: Additional symbol path entries APPENDED to
+            the trace's saved symbol path (or ``_NT_SYMBOL_PATH``)
+            when computing the reported path. Use to preview the
+            effect of adding a local build directory without
+            re-loading the trace.
     """
     trace = require_trace(trace_id)
     lines: list[str] = ["**Symbol Resolution Check**", ""]
 
     # 1. Symbol path analysis
-    sym_path = trace.symbol_path or os.environ.get("_NT_SYMBOL_PATH", "")
+    sym_path = _resolve_sym_path(
+        trace.symbol_path or os.environ.get("_NT_SYMBOL_PATH", ""),
+        extra_symbol_paths,
+    ) or ""
     lines.append("**Symbol Path (`_NT_SYMBOL_PATH`):**")
     if not sym_path:
         lines.append("- **NOT SET** — xperf cannot resolve function names without symbols")
@@ -2597,7 +2668,12 @@ def check_symbols(trace_id: str) -> str:
 
 
 @mcp.tool()
-def resolve_symbols(trace_id: str, modules: str | None = None) -> str:
+@mcp.tool()
+def resolve_symbols(
+    trace_id: str,
+    modules: str | None = None,
+    extra_symbol_paths: list[str] | None = None,
+) -> str:
     """Build symbol cache for a trace using xperf.
 
     Runs xperf -a symcache -build which uses dbghelp.dll to download PDBs
@@ -2608,14 +2684,22 @@ def resolve_symbols(trace_id: str, modules: str | None = None) -> str:
         trace_id: ID returned by load_trace.
         modules: Comma-separated module names to focus on (e.g. 'ntoskrnl.exe,ndis.sys').
                  Default: all modules in the trace.
+        extra_symbol_paths: Additional symbol path entries APPENDED to
+            the trace's saved symbol path (or ``_NT_SYMBOL_PATH``) for
+            this run only. Use this to point xperf at a local PDB
+            directory without re-loading the trace.
     """
     try:
-        return _resolve_symbols_impl(trace_id, modules)
+        return _resolve_symbols_impl(trace_id, modules, extra_symbol_paths)
     except Exception as e:
         return f"Symbol resolution failed: {e}"
 
 
-def _resolve_symbols_impl(trace_id: str, modules: str | None) -> str:
+def _resolve_symbols_impl(
+    trace_id: str,
+    modules: str | None,
+    extra_symbol_paths: list[str] | None = None,
+) -> str:
     import re
     from etw_analyzer.parsing.wpa_exporter import find_xperf, _run_xperf
 
@@ -2625,7 +2709,10 @@ def _resolve_symbols_impl(trace_id: str, modules: str | None) -> str:
     if not path.exists():
         return f"File not found: {path}"
 
-    sym_path = trace.symbol_path or os.environ.get("_NT_SYMBOL_PATH", "")
+    sym_path = _resolve_sym_path(
+        trace.symbol_path or os.environ.get("_NT_SYMBOL_PATH", ""),
+        extra_symbol_paths,
+    ) or ""
     lines = ["**Symbol Resolver**", ""]
     lines.append(f"Trace: `{path.name}`")
     lines.append(f"Trace ID: `{trace.trace_id}`")
