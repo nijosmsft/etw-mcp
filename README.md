@@ -1,4 +1,4 @@
-# WPR Trace Analyzer MCP Server
+# etw-mcp
 
 An [MCP](https://modelcontextprotocol.io/) server that lets AI coding assistants analyze Windows WPR/ETW traces (`.etl` files). Load a trace, then ask questions in natural language — the server uses a self-contained .NET sidecar by default (auto-downloaded on first use), with a fast in-process ETW path and `xperf.exe` as fallbacks.
 
@@ -8,58 +8,23 @@ Works with any Windows performance trace: networking (tcpip.sys, NDIS, NIC drive
 
 ### Quick Install
 
-> **The snippet below is hard-coded to v0.6.0.** For the latest version, grab the wheel URL from <https://github.com/nijosmsft/etw-mcp/releases/latest> and substitute it in.
+The snippet below pins v0.6.0 — grab the latest wheel URL from <https://github.com/nijosmsft/etw-mcp/releases/latest> if you need a newer build. Install [uv](https://docs.astral.sh/uv/) (`winget install astral-sh.uv`) and the Windows Performance Toolkit (`winget install --id Microsoft.WindowsADK --override "/features OptionId.WindowsPerformanceToolkit /quiet"`), then drop the config below into your MCP client. The top-level key is `mcpServers` for Claude / Copilot CLI / Claude Desktop / Cursor and `servers` for VS Code — per-client config paths are spelled out in [Setup](#setup) below. The first `load_trace` call auto-downloads the matching .NET sidecar (~40 MB) into `%LOCALAPPDATA%\etw-mcp\sidecar\v0.6.0\` and pulls 200-500 MB of PDBs to `C:\symbols`; set `ETW_MCP_NO_AUTO_DOWNLOAD=1` to skip the sidecar fetch.
 
-Copy-paste this into Claude Code, Copilot, or any AI assistant to install automatically.
-
-```
-Install the WPR trace analyzer MCP server on this Windows machine:
-
-1. Install uv (skip if `uv --version` already works):
-     winget install astral-sh.uv
-   Note: uv will download a private CPython interpreter on the first `uv run` — benign but expected.
-
-2. Install xperf (skip if "C:\Program Files (x86)\Windows Kits\10\Windows Performance Toolkit\xperf.exe" exists):
-     winget install --id Microsoft.WindowsADK --override "/features OptionId.WindowsPerformanceToolkit /quiet"
-   The Windows Performance Toolkit is a ~150 MB feature of the Windows ADK; do NOT use `Microsoft.WindowsSDK` — it is not a valid winget ID.
-
-3. Add this MCP server config to the file for your client:
-     - Claude Code (project):     <repo>\.mcp.json                              top-level key: "mcpServers"
-     - Claude Code (user):        %USERPROFILE%\.claude.json                    top-level key: "mcpServers"
-     - Claude Desktop:            %APPDATA%\Claude\claude_desktop_config.json   top-level key: "mcpServers"
-     - GitHub Copilot CLI:        %USERPROFILE%\.copilot\mcp-config.json        top-level key: "mcpServers"
-     - VS Code GitHub Copilot:    <repo>\.vscode\mcp.json  OR  %APPDATA%\Code\User\mcp.json
-                                                                                  top-level key: "servers"   <- not "mcpServers"
-     - Cursor:                    <repo>\.cursor\mcp.json  OR  %USERPROFILE%\.cursor\mcp.json
-                                                                                  top-level key: "mcpServers"
-
-     {
-       "<top-level-key>": {
-         "etw-trace-analyzer": {
-           "type": "stdio",
-           "command": "uv",
-           "args": ["run", "--no-project", "--with",
-                    "https://github.com/nijosmsft/etw-mcp/releases/download/v0.6.0/etw_mcp-0.6.0-py3-none-any.whl",
-                    "python", "-m", "etw_analyzer.server"],
-           "env": {
-             "_NT_SYMBOL_PATH": "srv*C:\\symbols*https://msdl.microsoft.com/download/symbols"
-           }
-         }
-       }
-     }
-
-4. Verify the wheel imports cleanly (does NOT hang; exits with "OK"):
-     uv run --no-project `
-       --with https://github.com/nijosmsft/etw-mcp/releases/download/v0.6.0/etw_mcp-0.6.0-py3-none-any.whl `
-       python -c "import etw_analyzer.server; print('OK - etw-mcp v0.6.0 importable')"
-
-Expect the first `load_trace` call to:
-  - Download the matching .NET sidecar (~40 MB) to %LOCALAPPDATA%\etw-mcp\sidecar\v0.5.0\
-    (one-time per wheel version; subsequent loads reuse the cache). Set
-    ETW_MCP_NO_AUTO_DOWNLOAD=1 to disable the fetch (the server then falls
-    back to the in-process native path), or set ETW_MCP_DOTNET_SIDECAR to
-    pin a manually-downloaded binary.
-  - Download 200-500 MB of PDBs to C:\symbols (one-time; subsequent loads use the cache).
+```json
+{
+  "mcpServers": {
+    "etw-trace-analyzer": {
+      "type": "stdio",
+      "command": "uv",
+      "args": ["run", "--no-project", "--with",
+               "https://github.com/nijosmsft/etw-mcp/releases/download/v0.6.0/etw_mcp-0.6.0-py3-none-any.whl",
+               "python", "-m", "etw_analyzer.server"],
+      "env": {
+        "_NT_SYMBOL_PATH": "srv*C:\\symbols*https://msdl.microsoft.com/download/symbols"
+      }
+    }
+  }
+}
 ```
 
 ## Features
@@ -102,7 +67,6 @@ uv run --no-project --with https://github.com/nijosmsft/etw-mcp/releases/downloa
 - **.NET sidecar (default; auto-bootstrapped)** — `etw-extract.exe` is a self-contained .NET binary (~40 MB, no .NET install required) that decodes ETL files faster than the in-process path and frees the Python process from holding the full event buffer. The wheel **auto-fetches the matching version** from the GitHub release on first use and caches it at `%LOCALAPPDATA%\etw-mcp\sidecar\v<wheel-version>\`. Set `ETW_MCP_NO_AUTO_DOWNLOAD=1` to disable the fetch (the server then falls back to the native consumer) or set `ETW_MCP_DOTNET_SIDECAR` to pin a manually-built binary. See [`dotnet/README.md`](dotnet/README.md) for build instructions and [`src/etw_analyzer/native/SIDECAR.md`](src/etw_analyzer/native/SIDECAR.md) for the supervisor plumbing.
 - **Native ETW consumer (fallback when sidecar is unavailable)** — the server decodes ETL files in-process via `OpenTraceW`/`tdh.dll`. This path is enough to start the MCP server and run the core native analysis tools on recent Windows builds and is the automatic fallback when auto-bootstrap is blocked.
 - **xperf.exe / Windows Performance Toolkit** — installed as part of the Windows SDK. Recommended for complete results because it enables fallback extraction, richer WPA-derived stack views, xperf-only tools such as pool analysis, and older Windows builds where the native bindings can't load. Expected location: `C:\Program Files (x86)\Windows Kits\10\Windows Performance Toolkit\xperf.exe`
-- **Evidence federation (optional)** — `uv sync --extra evidence` pulls in the [`wpr-mcp-evidence-store`](../wpr-mcp-evidence-store) library and, when `ETW_MCP_EVIDENCE_PATH` is set, the server writes per-host entity rows (modules, processes, CPU sample summaries) to a shared DuckDB so the [`wpr-mcp-evidence-query`](../wpr-mcp-evidence-query) MCP can correlate ETW evidence with crash dumps from the same host. The feature is silently inert when the extra isn't installed or the env var isn't set.
 
 ## Setup
 
@@ -267,7 +231,7 @@ Then ask questions like:
 
 ### Remote Collection with LabLink MCP
 
-This server pairs well with [LabLink MCP](https://github.com/nijosmsft/LabLink) when the AI client has both MCP servers configured. LabLink can collect traces from remote Windows machines; etw-mcp analyzes the ETL after LabLink pulls it to the operator machine.
+[LabLink](https://github.com/nijosmsft/LabLink) — lightweight Go MCP for remote command execution on Windows lab machines. When the AI client has both MCP servers configured, LabLink can collect traces from remote Windows machines; etw-mcp analyzes the ETL after LabLink pulls it to the operator machine.
 
 Common combined prompts:
 
@@ -395,7 +359,7 @@ Most analysis tools accept:
 
 ### Stack Analysis Notes
 
-For full WPA/butterfly stack parity, load with `mode="xperf"` or set `ETW_MCP_MODE=xperf`. In xperf mode, `get_hot_stacks` uses xperf's butterfly `Functions by UniInclusive Hits` table, so inclusive and exclusive hit counts are kept separate. `walk_stack` and `butterfly_chain` use the butterfly caller/callee table and require the `trace_id` returned by `load_trace`. Native mode covers core stack analysis but may not expose every xperf-derived stack view. `count_stacks` currently works from aggregate butterfly edges, so it estimates matching sample counts rather than counting distinct raw stack instances.
+For full WPA/butterfly stack parity, load with `mode="xperf"` (or set `ETW_MCP_MODE=xperf`); native mode covers core stack analysis but may not expose every xperf-derived view.
 
 ### Capturing traces
 
@@ -408,7 +372,7 @@ Most workflows start by analyzing an existing `.etl`. When you need to author on
 | `get_capture_commands(scenario, output_path, duration_s=10)` | Paste-ready 3-step PowerShell (start / sleep / stop) plus a verification step. Branches automatically for the `pktmon` scenario (uses `pktmon start --capture --pkt-size 0 -f <path>` instead of `wpr -start`). |
 | `get_capture_instructions(scenario, target="local" \| "remote", output_path)` | Long-form runbook covering prerequisites, profile save, start/verify, transfer-back examples (PowerShell remoting / LabLink MCP / scp) when `target="remote"`, and a `load_trace` pointer. |
 
-The tools are transport-agnostic — they emit strings, never invoke `wpr.exe` or `pktmon.exe` themselves. Run the commands on local PowerShell, a [LabLink](https://github.com/microsoft/lablink) MCP node, an SSH host, or hand them to a human. Then call `load_trace(etl_path=...)` on the resulting file to analyze it.
+The tools are transport-agnostic — they emit strings, never invoke `wpr.exe` or `pktmon.exe` themselves. Run the commands on local PowerShell, a [LabLink](https://github.com/nijosmsft/LabLink) MCP node, an SSH host, or hand them to a human. Then call `load_trace(etl_path=...)` on the resulting file to analyze it.
 
 ```powershell
 # Typical local capture: 10s CPU profile, then analyze
@@ -422,146 +386,39 @@ All WPR profiles require administrator elevation. WPR uses the NT Kernel Logger 
 
 ### Trace Loading Modes
 
-`load_trace` accepts a `mode` argument that selects the extraction pipeline. Three modern pipelines coexist, each with the same trace_id and parquet cache layout so a trace extracted in one mode can be reloaded in another. The default `mode="auto"` walks the fallback chain **`.NET sidecar → native → xperf`** and picks the first one available.
+`load_trace` accepts a `mode` argument that selects the extraction pipeline. Three pipelines coexist, each with the same trace_id and parquet cache layout so a trace extracted in one mode can be reloaded in another. The default `mode="auto"` walks the fallback chain **`.NET sidecar → native → xperf`** and picks the first one available.
 
-The `ETW_MCP_MODE` environment variable overrides the default when `mode=` is left unspecified. The explicit `mode=` arg always wins over the env var.
+The `ETW_MCP_MODE` environment variable overrides the default when `mode=` is left unspecified. The explicit `mode=` arg always wins over the env var. See [CHANGELOG.md](CHANGELOG.md) for the `csharp` → `dotnet` rename history.
 
-> **Naming note.** Earlier versions of this server called the sidecar mode `"csharp"` (matching the language of the binary). It was renamed to `"dotnet"` across the API (env vars, `mode=` args, manifest `producer` field, telemetry events, Python symbols) to align with the user-facing `.NET sidecar` label, which more accurately describes the bundled runtime. Stale on-disk caches with `producer="csharp"` no longer validate; pass `force=True` (or delete the `.etw-export-*` directory) once to re-extract under the new producer name. The old `ETW_MCP_CSHARP_SIDECAR` env var is no longer recognized — set `ETW_MCP_DOTNET_SIDECAR` instead.
+| Mode | What it is | When `auto` picks it | Force with | Notes |
+| --- | --- | --- | --- | --- |
+| `dotnet` | Self-contained .NET 8 binary (`etw-extract.exe`, ~40 MB) that decodes ETW Layer-1 events into per-class parquets. The Python server runs Layer-3 aggregators over the result. ~9× faster end-to-end than native on a 1 GB ETL. | Sidecar resolvable (auto-bootstrapped on first use). | `mode="dotnet"` or `ETW_MCP_MODE=dotnet` (raises if the binary cannot be resolved). | Pin a specific binary with `ETW_MCP_DOTNET_SIDECAR=<path>`; disable the GitHub fetch with `ETW_MCP_NO_AUTO_DOWNLOAD=1`. Manifests record `producer="dotnet"`. |
+| `native` | In-process `OpenTraceW` + `tdh.dll` consumer in Python via `advapi32`. Decodes manifest providers (TCPIP, AFD, MsQuic, HTTP.sys) that xperf can't enumerate. | `.NET sidecar` unavailable, native bindings load. | `mode="native"` or `ETW_MCP_MODE=native` (raises if bindings can't load). | For ETLs >1 GB also set `ETW_MCP_NATIVE_ALLOW_LARGE=1` (the pipeline buffers events in pandas DataFrames in-process). Probe availability with `uv run python -c "from etw_analyzer.native.consumer import is_available; print(is_available())"`. Manifests record `producer="native"`. |
+| `xperf` | Subprocess pipeline that shells out to `xperf.exe` from the Windows Performance Toolkit (`profile`, `dpcisr`, `stack -butterfly`, `cswitch`, `sysconfig`, `process`, `diskio`, `tracestats`) plus `xperf -a dumper` for raw events. Slowest path, broadest WPA tool coverage. | Neither sidecar nor native consumer is available. | `mode="xperf"` or `ETW_MCP_MODE=xperf`. | Requires WPT installed (default path `C:\Program Files (x86)\Windows Kits\10\Windows Performance Toolkit\xperf.exe`, or on `PATH`). Legacy pre-v3 manifests with no producer field are read as `producer="xperf"`. |
 
----
+#### Pre-populating or building the .NET sidecar
 
-#### .NET sidecar mode — recommended (fast, default-preferred in `auto`)
-
-> **~9× faster end-to-end than native on a 1 GB ETL: `dotnet` 45 s vs `native` 429 s on the lab fixture.** Same parquet schema, same `trace_id`, identical cache layout — the only difference is wall-clock on the first `load_trace`.
-
-**What it is.** A self-contained .NET 8 binary (`etw-extract.exe`, ~40 MB single-file deploy) that decodes ETW Layer-1 events from an ETL into per-class parquet files. The Python server invokes it as a subprocess, streams its JSONL progress, then runs the same Layer-3 aggregators it would for native mode.
-
-**When to use it.** The default choice for everything. Correct TraceLogging decode out of the box, and the cache layout is identical to native mode so you don't lock yourself in.
-
-**How to enable it.**
-
-The wheel **auto-bootstraps** the matching binary on first use — no manual install needed for the recommended path. On the first `load_trace` call, the server walks the resolution chain:
-
-1. `ETW_MCP_DOTNET_SIDECAR` env var — if set, must point at an existing file (raises loudly on mismatch).
-2. Per-version cache at `%LOCALAPPDATA%\etw-mcp\sidecar\v<wheel-version>\etw-extract.exe` — reused across runs once populated.
-3. GitHub release fetch: `https://github.com/nijosmsft/etw-mcp/releases/download/v<wheel-version>/etw-extract.exe`. The download is atomic (a sibling `.tmp` file is renamed only on success) and logged to stderr where MCP clients surface it. ETW_MCP_NO_AUTO_DOWNLOAD=1 short-circuits this step.
-
-For locked-down environments where the network fetch is undesirable, set `ETW_MCP_NO_AUTO_DOWNLOAD=1`. The server then falls back to the in-process native consumer (slower but always available). To pin a specific binary, set `ETW_MCP_DOTNET_SIDECAR` to its absolute path; this also wins over the cache and the fetch.
-
-You can pre-populate the cache by manually downloading the release asset or building from source. **Either** download the prebuilt asset:
+The wheel auto-bootstraps the matching binary on first use, so most users don't need to do anything. For locked-down environments (no GitHub access) you can pre-populate the per-version cache or build from source.
 
 ```powershell
-New-Item -ItemType Directory -Force -Path "$env:LOCALAPPDATA\etw-mcp\sidecar\v0.5.0" | Out-Null
+# Option A — download the prebuilt asset
+New-Item -ItemType Directory -Force -Path "$env:LOCALAPPDATA\etw-mcp\sidecar\v0.6.0" | Out-Null
 Invoke-WebRequest `
   -Uri "https://github.com/nijosmsft/etw-mcp/releases/download/v0.6.0/etw-extract.exe" `
-  -OutFile "$env:LOCALAPPDATA\etw-mcp\sidecar\v0.5.0\etw-extract.exe"
-```
+  -OutFile "$env:LOCALAPPDATA\etw-mcp\sidecar\v0.6.0\etw-extract.exe"
 
-**Or** build it from source (no .NET runtime required for the resulting binary; only for the build):
-
-```powershell
+# Option B — build from source (no .NET runtime required for the resulting binary; only for the build)
 cd <repo>\dotnet
 dotnet publish -c Release -r win-x64 --self-contained -o publish\win-x64
 # Then either set ETW_MCP_DOTNET_SIDECAR to the published path or copy
 # it into %LOCALAPPDATA%\etw-mcp\sidecar\v<wheel-version>\
 ```
 
-To force this mode unconditionally (and fail loudly when the binary is unavailable instead of silently degrading), set `ETW_MCP_MODE=dotnet` or pass `mode="dotnet"` to `load_trace`. With the explicit form, the server raises a `ValueError` (naming the env var) if the binary cannot be resolved.
-
-Example MCP config — no `ETW_MCP_DOTNET_SIDECAR` env var needed; the wheel will auto-fetch on first use:
-
-```json
-{
-  "mcpServers": {
-    "etw-trace-analyzer": {
-      "type": "stdio",
-      "command": "uv",
-      "args": ["run", "--no-project", "--with", "https://github.com/nijosmsft/etw-mcp/releases/download/v0.6.0/etw_mcp-0.6.0-py3-none-any.whl", "python", "-m", "etw_analyzer.server"],
-      "env": {
-        "_NT_SYMBOL_PATH": "srv*C:\\symbols*https://msdl.microsoft.com/download/symbols"
-      }
-    }
-  }
-}
-```
-
-Cache manifests record `producer="dotnet"`. Two strategies are available: `materialized-small` (default, fastest) and `event-store-streaming` (bounded RSS for very large traces). Full build + run docs live in [`dotnet/README.md`](dotnet/README.md); supervisor / debugging notes in [`src/etw_analyzer/native/SIDECAR.md`](src/etw_analyzer/native/SIDECAR.md).
-
----
-
-#### Native mode — in-process Python consumer
-
-**What it is.** An in-process `OpenTraceW` + `tdh.dll` consumer that decodes ETW events directly in Python via `advapi32`. Decodes manifest providers (TCPIP, AFD, MsQuic, HTTP.sys) that xperf can't enumerate. No subprocess, no separate binary.
-
-**When to use it.** When the .NET sidecar isn't available (no `dotnet publish` access, restricted machine, etc.) but the native consumer bindings load. Best fallback in the `auto` chain.
-
-**How to enable it.**
-
-1. Nothing to install — it's bundled with the Python server. Verify the consumer is available on your host:
-
-   ```powershell
-   uv run python -c "from etw_analyzer.native.consumer import is_available; print(is_available())"
-   ```
-
-2. Force it with `ETW_MCP_MODE=native` or `mode="native"`. With the explicit form, the server raises if the bindings can't load instead of falling back:
-
-   ```json
-   "env": {
-     "_NT_SYMBOL_PATH": "srv*C:\\symbols*https://msdl.microsoft.com/download/symbols",
-     "ETW_MCP_MODE": "native"
-   }
-   ```
-
-3. For ETLs larger than the safety guardrail (default 1 GB), also set `ETW_MCP_NATIVE_ALLOW_LARGE=1`. The native pipeline buffers events in pandas DataFrames in-process, so memory grows with trace size.
-
-Cache manifests record `producer="native"`. Same parquet schema as .NET mode, so caches are interchangeable.
-
----
-
-#### xperf mode — legacy WPA-based extraction
-
-**What it is.** A subprocess pipeline that shells out to `xperf.exe` from the Windows Performance Toolkit, running WPA-style actions (`profile`, `dpcisr`, `stack -butterfly`, `cswitch`, `sysconfig`, `process`, `diskio`, `tracestats`) plus `xperf -a dumper` for raw events.
-
-**When to use it.** When you hit a native-mode bug, need full WPA-style stack coverage, or you're on a machine where WPT is installed but you can't or don't want to run the .NET sidecar.
-
-**How to enable it.**
-
-1. Install the Windows Performance Toolkit (part of the Windows SDK or ADK). The server auto-detects `xperf.exe` at the standard install path:
-
-   ```
-   C:\Program Files (x86)\Windows Kits\10\Windows Performance Toolkit\xperf.exe
-   ```
-
-   Or put it on `PATH`.
-
-2. Force it with `ETW_MCP_MODE=xperf` or `mode="xperf"`. xperf is also the final fallback in the `auto` chain when neither the .NET sidecar nor the native consumer are available:
-
-   ```json
-   "env": {
-     "_NT_SYMBOL_PATH": "srv*C:\\symbols*https://msdl.microsoft.com/download/symbols",
-     "ETW_MCP_MODE": "xperf"
-   }
-   ```
-
-xperf mode is the slowest path but the broadest in tool coverage. Cache manifests for legacy xperf runs (pre-v3) may carry no producer field; the loader treats them as `producer="xperf"` on read.
-
----
+Two .NET-sidecar strategies are available: `materialized-small` (default, fastest) and `event-store-streaming` (bounded RSS for very large traces). Full build + run docs live in [`dotnet/README.md`](dotnet/README.md); supervisor / debugging notes in [`src/etw_analyzer/native/SIDECAR.md`](src/etw_analyzer/native/SIDECAR.md).
 
 #### Forcing re-extraction across modes
 
 All three pipelines write the same cache layout, so reloads can short-circuit even if you switch modes. Use `force=True` on `load_trace` when you need to re-extract with the selected mode (e.g. after rebuilding the .NET sidecar with a new event class).
-
-
-### Evidence federation (optional)
-
-The server can record per-host entities (modules, processes, CPU sample summaries) into a shared DuckDB so the [`wpr-mcp-evidence-query`](../wpr-mcp-evidence-query) MCP can correlate ETW evidence with crash-dump findings from the same machine. Enable with:
-
-```powershell
-uv sync --extra evidence                           # install evidence-store as optional dep
-$env:ETW_MCP_EVIDENCE_PATH = "C:\evidence"        # one DuckDB per machine under this root
-```
-
-Without the extra installed, or without `ETW_MCP_EVIDENCE_PATH` set, the integration short-circuits — `load_trace` behaves identically to a vanilla install. The library shape and identity contract live in [`wpr-mcp-evidence-store`](../wpr-mcp-evidence-store) (`docs/IDENTITY-SPEC.md`, `docs/PRODUCER-CONTRACT.md`). The read side runs as a separate MCP server, [`wpr-mcp-evidence-query`](../wpr-mcp-evidence-query).
 
 ### Parallel Analysis
 
@@ -604,11 +461,10 @@ AI Assistant ←stdio→ etw-mcp (Python)
                          │   Shared across all three modes — load once, reuse anywhere.
                          │
                          ├── pandas (aggregation + filtering)
-                         ├── (optional) evidence-store → DuckDB per machine
                          └── FastMCP (stdio transport)
 ```
 
-For end-to-end dataflow across the 5-repo MCP ecosystem (analyzer + sidecar + evidence-store + evidence-query + crash-dump-mcp-server), see [ARCHITECTURE.md](ARCHITECTURE.md).
+For end-to-end dataflow across the MCP ecosystem (analyzer + sidecar), see [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ### Performance
 
@@ -618,56 +474,6 @@ For end-to-end dataflow across the 5-repo MCP ecosystem (analyzer + sidecar + ev
 - **Subsequent loads:** Instant (reads from parquet cache, regardless of mode)
 - **Per-CPU queries:** First query parses all SampledProfile events, subsequent queries filter in-memory (<1s)
 - **Trace comparison:** Uses cache from both traces — instant if both were previously loaded
-
-## Project Structure
-
-```
-etw-mcp/
-├── pyproject.toml
-├── README.md                        ← this file
-├── ARCHITECTURE.md                  ← cross-repo dataflow + failure modes
-├── GETTING-STARTED.md               ← 30-minute onboarding
-├── CLAUDE.md                        ← AI-assistant operating notes
-├── LICENSE
-├── dotnet/                          ← .NET sidecar (etw-extract.exe)
-│   ├── README.md                    ← build + run docs for the sidecar
-│   ├── src/                         ← .NET 8 source
-│   ├── scripts/smoke-test.ps1
-│   └── publish/win-x64/             ← dotnet publish output (not checked in)
-├── docs/decisions/                  ← promoted decision/review docs
-├── tests/                           ← synthetic tests by default; gated fixture tests are opt-in
-└── src/etw_analyzer/
-    ├── server.py                    ← MCP server entry point
-    ├── app.py                       ← FastMCP instance + server instructions
-    ├── trace_state.py               ← Loaded trace registry + dumper cache
-    ├── native/                      ← in-process consumer + dotnet sidecar plumbing
-    │   ├── SIDECAR.md               ← supervisor / debugging notes for the .NET sidecar
-    │   ├── worker_supervisor.py     ← spawns the sidecar / native worker
-    │   ├── aggregation_worker.py    ← Layer-3 aggregators over staging parquets
-    │   └── config.py                ← resolve_mode, find_dotnet_sidecar
-    ├── tools/
-    │   ├── trace_mgmt.py            ← load_trace, list_traces, list_loaded_traces, check/resolve_symbols
-    │   ├── cpu_sampling.py          ← get_cpu_samples, get_hot_functions
-    │   ├── per_cpu.py               ← get_per_cpu_summary, get_cpu_timeline
-    │   ├── stack_analysis.py        ← get_hot_stacks, get_function_callers
-    │   ├── dpc_isr.py               ← get_dpc_summary, get_dpc_per_cpu
-    │   ├── context_switch.py        ← get_lock_contention
-    │   ├── memory.py                ← get_memory_pools
-    │   ├── network_events*.py       ← TCP/UDP/socket/throughput tools
-    │   ├── network_lenses.py        ← networking-focused hot functions/stacks/DPCs
-    │   ├── network_wait_chain.py    ← network wait-chain analysis
-    │   ├── packet_capture.py        ← NDIS PacketCapture and pktmon packet tools
-    │   ├── app_layer.py             ← HTTP.sys and MsQuic tools
-    │   ├── system_info.py           ← get_sysconfig, get_process_info, get_diskio_summary, get_trace_stats
-    │   ├── compare.py               ← compare_traces
-    │   └── summary.py               ← analyze, export_analysis
-    ├── parsing/
-    │   ├── wpa_exporter.py          ← xperf subprocess wrapper + output parsers
-    │   ├── csv_loader.py            ← CSV parsing + normalization
-    │   └── aggregator.py            ← Filters, group-by, percentiles
-    └── formatting/
-        └── markdown.py              ← Table formatting for MCP responses
-```
 
 ## Symbol Configuration
 
@@ -689,31 +495,9 @@ Multiple paths can be combined with semicolons. Add local PDB directories for yo
 _NT_SYMBOL_PATH=srv*C:\symbols*https://msdl.microsoft.com/download/symbols;C:\myproject\build\bin
 ```
 
-## Development
-
-### Running Tests
-
-```powershell
-uv run --group dev pytest tests/ -v
-```
-
-Default tests use synthetic data and don't require `xperf.exe` or ETL trace files. Gated fixture tests can generate ETLs and independent expected data when explicitly enabled; fixture generation requires Windows Performance Toolkit (`xperf.exe`/`wpr.exe`) and `pktmon.exe`, and may require elevation depending on local policy:
-
-```powershell
-uv run --group dev pytest tests\test_fixture_golden.py --run-fixture --run-golden --generate-fixture-etls -q
-```
-
-### Publishing a Release
-
-Maintainers can publish release wheels from GitHub Actions:
-
-1. Open **Actions** → **Manual release**.
-2. Run the workflow with a tag matching `pyproject.toml`, for example `v0.1.0`.
-3. The workflow validates the version, runs tests, builds wheel/sdist artifacts, and uploads them to the GitHub Release.
-
 ## Contributing
 
-Contributions welcome. Please open an issue first to discuss what you'd like to change.
+Contributions welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for the project structure, how to run tests, and how maintainers publish releases. Please [open an issue](https://github.com/nijosmsft/etw-mcp/issues) first to discuss what you'd like to change.
 
 ## License
 
