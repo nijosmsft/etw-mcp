@@ -171,7 +171,7 @@ def _build_pktmon_commands(output_path: str, duration_s: int) -> str:
         f"Get-Item '{output_path}' | Select-Object FullName, Length, LastWriteTime\n"
         "\n"
         "# Step 5 (optional) - Convert to pcapng for wireshark / tshark.\n"
-        f"# pktmon etl2pcapng '{output_path}' -o '{output_path}.pcapng'\n"
+        f"# pktmon etl2pcap '{output_path}' -o '{output_path}.pcapng'\n"
         "```\n"
     )
 
