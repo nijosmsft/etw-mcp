@@ -26,6 +26,7 @@ import etw_analyzer.tools.packet_capture  # noqa: F401, E402
 import etw_analyzer.tools.app_layer  # noqa: F401, E402
 import etw_analyzer.tools.evidence  # noqa: F401, E402  — optional evidence-store federation hook
 import etw_analyzer.tools.capture_profiles  # noqa: F401, E402  — trace-capture authoring (WPR + pktmon)
+import etw_analyzer.tools.symbol_diagnostics  # noqa: F401, E402  — diagnose_symbol_load, clean_stale_symbol_files
 
 
 def main():
