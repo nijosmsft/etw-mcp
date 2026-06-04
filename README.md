@@ -8,7 +8,7 @@ Works with any Windows performance trace: networking (tcpip.sys, NDIS, NIC drive
 
 ### Quick Install
 
-> **The snippet below is hard-coded to v0.5.0.** For the latest version, grab the wheel URL from <https://github.com/nijosmsft/etw-mcp/releases/latest> and substitute it in.
+> **The snippet below is hard-coded to v0.6.0.** For the latest version, grab the wheel URL from <https://github.com/nijosmsft/etw-mcp/releases/latest> and substitute it in.
 
 Copy-paste this into Claude Code, Copilot, or any AI assistant to install automatically.
 
@@ -39,7 +39,7 @@ Install the WPR trace analyzer MCP server on this Windows machine:
            "type": "stdio",
            "command": "uv",
            "args": ["run", "--no-project", "--with",
-                    "https://github.com/nijosmsft/etw-mcp/releases/download/v0.5.0/etw_mcp-0.5.0-py3-none-any.whl",
+                    "https://github.com/nijosmsft/etw-mcp/releases/download/v0.6.0/etw_mcp-0.6.0-py3-none-any.whl",
                     "python", "-m", "etw_analyzer.server"],
            "env": {
              "_NT_SYMBOL_PATH": "srv*C:\\symbols*https://msdl.microsoft.com/download/symbols"
@@ -50,8 +50,8 @@ Install the WPR trace analyzer MCP server on this Windows machine:
 
 4. Verify the wheel imports cleanly (does NOT hang; exits with "OK"):
      uv run --no-project `
-       --with https://github.com/nijosmsft/etw-mcp/releases/download/v0.5.0/etw_mcp-0.5.0-py3-none-any.whl `
-       python -c "import etw_analyzer.server; print('OK - etw-mcp v0.5.0 importable')"
+       --with https://github.com/nijosmsft/etw-mcp/releases/download/v0.6.0/etw_mcp-0.6.0-py3-none-any.whl `
+       python -c "import etw_analyzer.server; print('OK - etw-mcp v0.6.0 importable')"
 
 Expect the first `load_trace` call to:
   - Download the matching .NET sidecar (~40 MB) to %LOCALAPPDATA%\etw-mcp\sidecar\v0.5.0\
@@ -94,7 +94,7 @@ winget install --id Microsoft.WindowsADK --override "/features OptionId.WindowsP
                                          # The --override flag installs just the ~150 MB WPT feature instead of the full ~5 GB ADK.
 
 # 2. Verify the latest release wheel starts (Ctrl+C to stop)
-uv run --no-project --with https://github.com/nijosmsft/etw-mcp/releases/download/v0.5.0/etw_mcp-0.5.0-py3-none-any.whl python -m etw_analyzer.server
+uv run --no-project --with https://github.com/nijosmsft/etw-mcp/releases/download/v0.6.0/etw_mcp-0.6.0-py3-none-any.whl python -m etw_analyzer.server
 ```
 
 - **uv** automatically downloads Python, creates a virtual environment, and installs all dependencies on first run. No separate Python install needed.
@@ -118,7 +118,7 @@ Add to your `.mcp.json` (project root or `~/.claude/.mcp.json`):
     "etw-trace-analyzer": {
       "type": "stdio",
       "command": "uv",
-      "args": ["run", "--no-project", "--with", "https://github.com/nijosmsft/etw-mcp/releases/download/v0.5.0/etw_mcp-0.5.0-py3-none-any.whl", "python", "-m", "etw_analyzer.server"],
+      "args": ["run", "--no-project", "--with", "https://github.com/nijosmsft/etw-mcp/releases/download/v0.6.0/etw_mcp-0.6.0-py3-none-any.whl", "python", "-m", "etw_analyzer.server"],
       "env": {
         "_NT_SYMBOL_PATH": "srv*C:\\symbols*https://msdl.microsoft.com/download/symbols"
       }
@@ -139,7 +139,7 @@ Add to `.vscode/mcp.json` (workspace) or `%APPDATA%\Code\User\mcp.json` (user-sc
     "etw-trace-analyzer": {
       "type": "stdio",
       "command": "uv",
-      "args": ["run", "--no-project", "--with", "https://github.com/nijosmsft/etw-mcp/releases/download/v0.5.0/etw_mcp-0.5.0-py3-none-any.whl", "python", "-m", "etw_analyzer.server"],
+      "args": ["run", "--no-project", "--with", "https://github.com/nijosmsft/etw-mcp/releases/download/v0.6.0/etw_mcp-0.6.0-py3-none-any.whl", "python", "-m", "etw_analyzer.server"],
       "env": {
         "_NT_SYMBOL_PATH": "srv*C:\\symbols*https://msdl.microsoft.com/download/symbols"
       }
@@ -158,7 +158,7 @@ Add to `%APPDATA%\Claude\claude_desktop_config.json` (top-level key: `mcpServers
     "etw-trace-analyzer": {
       "type": "stdio",
       "command": "uv",
-      "args": ["run", "--no-project", "--with", "https://github.com/nijosmsft/etw-mcp/releases/download/v0.5.0/etw_mcp-0.5.0-py3-none-any.whl", "python", "-m", "etw_analyzer.server"],
+      "args": ["run", "--no-project", "--with", "https://github.com/nijosmsft/etw-mcp/releases/download/v0.6.0/etw_mcp-0.6.0-py3-none-any.whl", "python", "-m", "etw_analyzer.server"],
       "env": {
         "_NT_SYMBOL_PATH": "srv*C:\\symbols*https://msdl.microsoft.com/download/symbols"
       }
@@ -177,7 +177,7 @@ Add to `%USERPROFILE%\.copilot\mcp-config.json` (top-level key: `mcpServers`):
     "etw-trace-analyzer": {
       "type": "stdio",
       "command": "uv",
-      "args": ["run", "--no-project", "--with", "https://github.com/nijosmsft/etw-mcp/releases/download/v0.5.0/etw_mcp-0.5.0-py3-none-any.whl", "python", "-m", "etw_analyzer.server"],
+      "args": ["run", "--no-project", "--with", "https://github.com/nijosmsft/etw-mcp/releases/download/v0.6.0/etw_mcp-0.6.0-py3-none-any.whl", "python", "-m", "etw_analyzer.server"],
       "env": {
         "_NT_SYMBOL_PATH": "srv*C:\\symbols*https://msdl.microsoft.com/download/symbols"
       }
@@ -453,7 +453,7 @@ You can pre-populate the cache by manually downloading the release asset or buil
 ```powershell
 New-Item -ItemType Directory -Force -Path "$env:LOCALAPPDATA\etw-mcp\sidecar\v0.5.0" | Out-Null
 Invoke-WebRequest `
-  -Uri "https://github.com/nijosmsft/etw-mcp/releases/download/v0.5.0/etw-extract.exe" `
+  -Uri "https://github.com/nijosmsft/etw-mcp/releases/download/v0.6.0/etw-extract.exe" `
   -OutFile "$env:LOCALAPPDATA\etw-mcp\sidecar\v0.5.0\etw-extract.exe"
 ```
 
@@ -476,7 +476,7 @@ Example MCP config — no `ETW_MCP_DOTNET_SIDECAR` env var needed; the wheel wil
     "etw-trace-analyzer": {
       "type": "stdio",
       "command": "uv",
-      "args": ["run", "--no-project", "--with", "https://github.com/nijosmsft/etw-mcp/releases/download/v0.5.0/etw_mcp-0.5.0-py3-none-any.whl", "python", "-m", "etw_analyzer.server"],
+      "args": ["run", "--no-project", "--with", "https://github.com/nijosmsft/etw-mcp/releases/download/v0.6.0/etw_mcp-0.6.0-py3-none-any.whl", "python", "-m", "etw_analyzer.server"],
       "env": {
         "_NT_SYMBOL_PATH": "srv*C:\\symbols*https://msdl.microsoft.com/download/symbols"
       }
