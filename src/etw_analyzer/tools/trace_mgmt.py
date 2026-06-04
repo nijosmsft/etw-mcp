@@ -2372,9 +2372,15 @@ def check_symbols(trace_id: str) -> str:
 
     Reports:
     - Each path in _NT_SYMBOL_PATH: exists/accessible, contains PDBs
-    - Per-module symbol resolution: resolved vs Unknown functions
+    - Per-module symbol resolution split into three honest categories:
+      **From PDB** (real PDB hit), **From Export** (PE export-table
+      nearest-neighbour guess, low confidence), and **Unknown** (no
+      resolution at all). New ``EXPORT_ONLY`` status flags modules
+      whose names came entirely from the export-table fallback - the
+      function names there are heuristic and should not be trusted.
     - Top unresolved modules (likely missing PDBs)
-    - Recommendations for fixing symbol issues
+    - Recommendations for fixing symbol issues, including
+      ``diagnose_symbol_load`` pointers for EXPORT_ONLY modules.
 
     Args:
         trace_id: ID returned by load_trace.
@@ -2410,36 +2416,107 @@ def check_symbols(trace_id: str) -> str:
         lines.append("")
 
         weight_col = "Weight" if "Weight" in cpu_df.columns else None
+        has_source = "SymbolSource" in cpu_df.columns
 
-        # Group by module, check resolved vs unknown
+        if not has_source:
+            # Pre-v0.6 cache: SymbolSource was added in this release but
+            # parquet caches written by older builds don't have it. Fall
+            # back to the legacy "resolved vs unknown" heuristic and
+            # document the limitation so users know to re-run
+            # ``load_trace(..., force=True)`` for honest classification.
+            lines.append(
+                "_Note: this trace cache predates SymbolSource tracking "
+                "(v0.6). Module status is computed from the legacy "
+                "resolved-vs-unknown heuristic which cannot distinguish "
+                "real PDB hits from PE export-table guesses. Reload with "
+                "`force=True` for the honest 3-category classification._"
+            )
+            lines.append("")
+
+        # Group by module, classify into pdb / export / unknown buckets.
+        # When SymbolSource is present we use it directly; otherwise we
+        # derive a 2-bucket (resolved / unknown) view that maps onto the
+        # legacy OK / PARTIAL / MISSING shape.
         rows = []
         for module, group in cpu_df.groupby("Module", dropna=False):
             mod_str = str(module)
             total_funcs = len(group)
-            unknown = group["Function"].astype(str).str.contains(
-                r"^Unknown$|^\*\*\*unknown\*\*\*$|^$", case=False, na=True
-            ).sum()
-            resolved = total_funcs - unknown
-            pct_resolved = (resolved / total_funcs * 100) if total_funcs > 0 else 0
-
             mod_weight = int(group[weight_col].sum()) if weight_col else total_funcs
 
-            if pct_resolved >= 90:
-                status_icon = "OK"
-            elif pct_resolved > 0:
-                status_icon = "PARTIAL"
-            else:
-                status_icon = "MISSING"
+            if has_source:
+                source_col = group["SymbolSource"].astype(str)
+                if weight_col:
+                    # Weight-weighted classification — a module mostly hit
+                    # by export-table guesses should report that way even
+                    # if it has a handful of PDB rows.
+                    w = group[weight_col].astype(float)
+                    pdb_weight = float(w[source_col == "pdb"].sum())
+                    export_weight = float(w[source_col == "export"].sum())
+                    unknown_weight = float(w[source_col.isin(["unknown", ""])].sum())
+                    denom = pdb_weight + export_weight + unknown_weight
+                else:
+                    pdb_weight = float((source_col == "pdb").sum())
+                    export_weight = float((source_col == "export").sum())
+                    unknown_weight = float(source_col.isin(["unknown", ""]).sum())
+                    denom = total_funcs
 
-            rows.append({
-                "Module": mod_str,
-                "Functions": total_funcs,
-                "Resolved": resolved,
-                "Unknown": unknown,
-                "% Resolved": f"{pct_resolved:.0f}%",
-                "Weight": mod_weight,
-                "Status": status_icon,
-            })
+                if denom <= 0:
+                    pct_pdb = pct_export = pct_unknown = 0.0
+                else:
+                    pct_pdb = pdb_weight / denom * 100.0
+                    pct_export = export_weight / denom * 100.0
+                    pct_unknown = unknown_weight / denom * 100.0
+
+                # Honest 3-category status. EXPORT_ONLY is the new bucket
+                # that tells users "yes, function names appear in the
+                # output, but they are nearest-export guesses - the PDB
+                # is missing or stale and the names should not be
+                # trusted." Threshold mirrors the spec: export >= 90 AND
+                # pdb < 10.
+                if pct_pdb >= 90:
+                    status_icon = "OK"
+                elif pct_export >= 90 and pct_pdb < 10:
+                    status_icon = "EXPORT_ONLY"
+                elif pct_pdb + pct_export > 0:
+                    status_icon = "PARTIAL"
+                else:
+                    status_icon = "MISSING"
+
+                rows.append({
+                    "Module": mod_str,
+                    "Functions": total_funcs,
+                    "From PDB": int(round(pdb_weight)) if weight_col else int(pdb_weight),
+                    "From Export": int(round(export_weight)) if weight_col else int(export_weight),
+                    "Unknown": int(round(unknown_weight)) if weight_col else int(unknown_weight),
+                    "% PDB": f"{pct_pdb:.0f}%",
+                    "% Export": f"{pct_export:.0f}%",
+                    "Weight": mod_weight,
+                    "Status": status_icon,
+                })
+            else:
+                # Legacy 2-bucket fallback.
+                unknown = group["Function"].astype(str).str.contains(
+                    r"^Unknown$|^\*\*\*unknown\*\*\*$|^$", case=False, na=True
+                ).sum()
+                resolved = total_funcs - unknown
+                pct_resolved = (resolved / total_funcs * 100) if total_funcs > 0 else 0
+
+                if pct_resolved >= 90:
+                    status_icon = "OK"
+                elif pct_resolved > 0:
+                    status_icon = "PARTIAL"
+                else:
+                    status_icon = "MISSING"
+
+                rows.append({
+                    "Module": mod_str,
+                    "Functions": total_funcs,
+                    "Resolved": resolved,
+                    "Unknown": unknown,
+                    "% Resolved": f"{pct_resolved:.0f}%",
+                    "Weight": mod_weight,
+                    "Status": status_icon,
+                })
 
         result_df = pd.DataFrame(rows)
         result_df = result_df.sort_values("Weight", ascending=False).reset_index(drop=True)
@@ -2454,11 +2531,39 @@ def check_symbols(trace_id: str) -> str:
 
         lines.append("**Summary:**")
         lines.append(f"- Total modules: {len(result_df)}")
-        lines.append(f"- Fully resolved: {len(result_df[result_df['Status'] == 'OK'])}")
+        lines.append(f"- Fully resolved (PDB): {len(result_df[result_df['Status'] == 'OK'])}")
+        if has_source:
+            export_only_df = result_df[result_df["Status"] == "EXPORT_ONLY"]
+            lines.append(f"- Export-only (no PDB, names heuristic): {len(export_only_df)}")
         lines.append(f"- Partially resolved: {len(result_df[result_df['Status'] == 'PARTIAL'])}")
         lines.append(f"- No symbols: {len(missing_df)}")
         lines.append(f"- Unresolved weight: {missing_pct:.1f}% of total CPU samples")
         lines.append("")
+
+        if has_source:
+            export_only_df = result_df[result_df["Status"] == "EXPORT_ONLY"]
+            if not export_only_df.empty:
+                lines.append("**Export-only modules (false-positive risk):**")
+                lines.append("")
+                lines.append(
+                    "These modules' function names came from the PE export "
+                    "table - dbghelp could not find a matching PDB. The "
+                    "names you see in `get_hot_functions` for these "
+                    "modules are nearest-neighbour guesses, not actual "
+                    "PDB symbols. The function called at a hot address "
+                    "could be ANY internal (non-exported) function near "
+                    "that export. Treat these rows as low-confidence and "
+                    "use `diagnose_symbol_load(trace_id, '<module>')` to "
+                    "investigate why the PDB is missing or stale."
+                )
+                lines.append("")
+                top_export = export_only_df.head(10)
+                for _, row in top_export.iterrows():
+                    lines.append(
+                        f"- `{row['Module']}` - {row['Weight']:,} weight "
+                        f"({row['Weight']/total_weight*100:.1f}%)"
+                    )
+                lines.append("")
 
         if not missing_df.empty:
             lines.append("**Top Unresolved Modules (need PDBs):**")
