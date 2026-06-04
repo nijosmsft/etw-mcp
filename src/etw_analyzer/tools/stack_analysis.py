@@ -10,6 +10,10 @@ from etw_analyzer.app import mcp
 from etw_analyzer.trace_state import TraceData, require_trace
 from etw_analyzer.parsing.aggregator import apply_filters, parse_cpu_filter
 from etw_analyzer.tools.cpu_sampling import _get_sampling_df, _find_col
+from etw_analyzer.tools._symbol_annotation import (
+    annotate_export_fallback,
+    export_fallback_footnote,
+)
 from etw_analyzer.formatting.markdown import format_table, format_pct
 
 import pandas as pd
@@ -424,6 +428,10 @@ def _render_butterfly_stacks(
         result["Exclusive"] = df["Exclusive"]
         result[f"Excl {pct_label}"] = df["Exclusive"].apply(lambda v: _pct_of(float(v), denominator_weight))
 
+    # Annotate rows whose modules came from PE export-table fallback so
+    # the caller knows the names are nearest-neighbour guesses.
+    result, any_annotated = annotate_export_fallback(result, trace)
+
     header_parts = ["**Hot Functions (with inclusive/exclusive weight)**"]
     if module_filter:
         header_parts.append(f"Module: {module_filter}")
@@ -431,7 +439,10 @@ def _render_butterfly_stacks(
         header_parts.append(f"Function: {function_filter}")
     header = "\n".join(header_parts)
 
-    return f"{header}\n\n{format_table(result, max_rows=max_rows)}"
+    output = f"{header}\n\n{format_table(result, max_rows=max_rows)}"
+    if any_annotated:
+        output += "\n\n" + export_fallback_footnote()
+    return output
 
 
 @mcp.tool()
