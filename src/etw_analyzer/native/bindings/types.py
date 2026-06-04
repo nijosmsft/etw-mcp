@@ -481,6 +481,54 @@ class SYMBOL_INFOW(ctypes.Structure):
     ]
 
 
+# ---------------------------------------------------------------------------
+# IMAGEHLP_MODULEW64 — returned by SymGetModuleInfoW64.
+#
+# Layout matches ``DbgHelp.h`` SDK 10.0.22621 — full size is 1680 bytes.
+# We populate ``SizeOfStruct`` with this size so dbghelp can detect that
+# the trailing CV/PDB telemetry fields are available. The struct tells
+# us which PDB file dbghelp actually loaded for a given module base,
+# whether the symbols are export-table only, and the PDB GUID+Age so we
+# can compare against what the EXE/PDB on disk advertise. This is what
+# ``diagnose_symbol_load`` uses to surface "stale PDB in SymCache"
+# situations to the user.
+#
+# ``CVData`` holds the path of the PDB dbghelp actually opened. ``PdbSig70``
+# + ``PdbAge`` are the identity dbghelp matched against. ``SymType`` tells
+# us whether dbghelp loaded a real PDB (SymPdb / SymDeferred) or fell
+# back to exports (SymExport). ``LoadedPdbName`` is the same as ``CVData``
+# on modern dbghelp builds.
+# ---------------------------------------------------------------------------
+class IMAGEHLP_MODULEW64(ctypes.Structure):
+    _fields_ = [
+        ("SizeOfStruct", wintypes.DWORD),
+        ("BaseOfImage", ctypes.c_ulonglong),
+        ("ImageSize", wintypes.DWORD),
+        ("TimeDateStamp", wintypes.DWORD),
+        ("CheckSum", wintypes.DWORD),
+        ("NumSyms", wintypes.DWORD),
+        ("SymType", wintypes.DWORD),  # SYM_TYPE enum
+        ("ModuleName", wintypes.WCHAR * 32),
+        ("ImageName", wintypes.WCHAR * 256),
+        ("LoadedImageName", wintypes.WCHAR * 256),
+        ("LoadedPdbName", wintypes.WCHAR * 256),
+        ("CVSig", wintypes.DWORD),
+        ("CVData", wintypes.WCHAR * (3 * 256)),  # MAX_PATH * 3
+        ("PdbSig", wintypes.DWORD),
+        ("PdbSig70", GUID),
+        ("PdbAge", wintypes.DWORD),
+        ("PdbUnmatched", wintypes.BOOL),
+        ("DbgUnmatched", wintypes.BOOL),
+        ("LineNumbers", wintypes.BOOL),
+        ("GlobalSymbols", wintypes.BOOL),
+        ("TypeInfo", wintypes.BOOL),
+        ("SourceIndexed", wintypes.BOOL),
+        ("Publics", wintypes.BOOL),
+        ("MachineType", wintypes.DWORD),
+        ("Reserved", wintypes.DWORD),
+    ]
+
+
 __all__ = [
     "GUID",
     "guid_string",
@@ -503,4 +551,5 @@ __all__ = [
     "TRACE_EVENT_INFO",
     "PROPERTY_DATA_DESCRIPTOR",
     "SYMBOL_INFOW",
+    "IMAGEHLP_MODULEW64",
 ]

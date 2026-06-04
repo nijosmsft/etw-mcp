@@ -20,7 +20,7 @@ from __future__ import annotations
 import ctypes
 from ctypes import POINTER, wintypes
 
-from .types import SYMBOL_INFOW
+from .types import SYMBOL_INFOW, IMAGEHLP_MODULEW64
 
 
 # ---------------------------------------------------------------------------
@@ -36,6 +36,19 @@ SYMOPT_LOAD_LINES           = 0x00000010  # capture line-number records
 SYMOPT_FAIL_CRITICAL_ERRORS = 0x00000200  # suppress error dialogs
 SYMOPT_AUTO_PUBLICS         = 0x00010000  # search publics by default
 SYMOPT_DEBUG                = 0x80000000
+
+
+# ---------------------------------------------------------------------------
+# SYMBOL_INFOW.Flags bits we care about. See DbgHelp.h ``SYMFLAG_*``.
+#
+# When SymFromAddrW succeeds with no matching PDB symbol it still returns
+# the nearest PE export-table entry and sets ``SYMFLAG_EXPORT`` on Flags.
+# That is dbghelp telling us "this name came from the PE export table, not
+# from a PDB" — the result is a heuristic, not a real symbol. We surface
+# that bit so check_symbols / get_hot_functions can distinguish "PDB-quality
+# function name" from "export-table nearest-neighbour guess".
+# ---------------------------------------------------------------------------
+SYMFLAG_EXPORT              = 0x00000200
 
 
 # Maximum symbol-name length we ever request from dbghelp. The SDK header
@@ -115,6 +128,58 @@ SymFromAddrW.argtypes = [
 SymFromAddrW.restype = wintypes.BOOL
 
 
+# ``SymGetModuleInfoW64(hProcess, dwAddr, ModuleInfo)`` → BOOL
+#
+# Caller must populate ``ModuleInfo.SizeOfStruct = sizeof(IMAGEHLP_MODULEW64)``
+# before the call. Returns FALSE if dbghelp has no module loaded that
+# covers ``dwAddr``. ``ModuleInfo.SymType`` distinguishes a real PDB
+# load (SymPdb / SymDeferred) from a PE export-table fallback (SymExport)
+# - the central evidence ``diagnose_symbol_load`` reports to the user.
+SymGetModuleInfoW64 = _dbghelp.SymGetModuleInfoW64
+SymGetModuleInfoW64.argtypes = [
+    wintypes.HANDLE,                  # hProcess
+    ctypes.c_ulonglong,               # dwAddr
+    POINTER(IMAGEHLP_MODULEW64),      # ModuleInfo
+]
+SymGetModuleInfoW64.restype = wintypes.BOOL
+
+
+# SYM_TYPE enum values for IMAGEHLP_MODULEW64.SymType. See DbgHelp.h.
+# ``SymExport`` is the smoking gun for "PDB missing - dbghelp fell back
+# to PE exports". ``SymDeferred`` means SYMOPT_DEFERRED_LOADS was set
+# and dbghelp hasn't actually loaded the PDB yet; force a SymFromAddr
+# call into the module's address range to commit the load before
+# inspecting the type. ``SymNone`` means no symbols at all.
+SymNone     = 0
+SymCoff     = 1
+SymCv       = 2
+SymPdb      = 3
+SymExport   = 4
+SymDeferred = 5
+SymSym      = 6
+SymDia      = 7
+SymVirtual  = 8
+
+
+# Helper for callers to render SymType as a readable string.
+_SYM_TYPE_NAMES = {
+    SymNone: "SymNone",
+    SymCoff: "SymCoff",
+    SymCv: "SymCv",
+    SymPdb: "SymPdb",
+    SymExport: "SymExport",
+    SymDeferred: "SymDeferred",
+    SymSym: "SymSym",
+    SymDia: "SymDia",
+    SymVirtual: "SymVirtual",
+}
+
+
+def sym_type_name(sym_type: int) -> str:
+    """Return the SDK identifier name for a SYM_TYPE value."""
+    return _SYM_TYPE_NAMES.get(int(sym_type), f"Unknown({sym_type})")
+
+
 __all__ = [
     "SYMOPT_CASE_INSENSITIVE",
     "SYMOPT_UNDNAME",
@@ -123,6 +188,7 @@ __all__ = [
     "SYMOPT_FAIL_CRITICAL_ERRORS",
     "SYMOPT_AUTO_PUBLICS",
     "SYMOPT_DEBUG",
+    "SYMFLAG_EXPORT",
     "MAX_SYM_NAME",
     "SymInitializeW",
     "SymCleanup",
@@ -131,4 +197,15 @@ __all__ = [
     "SymLoadModuleExW",
     "SymUnloadModule64",
     "SymFromAddrW",
+    "SymGetModuleInfoW64",
+    "SymNone",
+    "SymCoff",
+    "SymCv",
+    "SymPdb",
+    "SymExport",
+    "SymDeferred",
+    "SymSym",
+    "SymDia",
+    "SymVirtual",
+    "sym_type_name",
 ]

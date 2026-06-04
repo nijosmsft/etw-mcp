@@ -95,9 +95,29 @@ def aggregate_cpu_sampling(trace: "TraceData") -> Optional[pd.DataFrame]:
 
     symbolizer = getattr(trace, "symbolizer", None)
     ip_to_label: dict[int, str] = {}
+    ip_to_source: dict[int, str] = {}
     if symbolizer is not None and unique_ips:
         try:
-            ip_to_label = symbolizer.bulk_resolve(unique_ips)
+            # bulk_resolve_with_source is the v0.6 API that tags each
+            # resolved address with the source dbghelp pulled it from:
+            # "pdb"     — real PDB symbol hit (high confidence)
+            # "export"  — fell back to PE export table (heuristic)
+            # "unknown" — neither; address is module+RVA or unknown+RVA
+            # We use the source downstream in check_symbols (item 63b)
+            # and the get_hot_functions / get_hot_stacks annotators
+            # (item 63c). Older trace caches loaded from parquet won't
+            # have the SymbolSource column; tools that read it must
+            # tolerate its absence.
+            ip_to_pair = symbolizer.bulk_resolve_with_source(unique_ips)
+            ip_to_label = {k: v[0] for k, v in ip_to_pair.items()}
+            ip_to_source = {k: v[1] for k, v in ip_to_pair.items()}
+        except AttributeError:
+            # Symbolizer is a stub / mock that predates v0.6 — fall
+            # back to the legacy path so existing tests keep working.
+            try:
+                ip_to_label = symbolizer.bulk_resolve(unique_ips)
+            except Exception:
+                ip_to_label = {}
         except Exception:
             ip_to_label = {}
 
@@ -126,6 +146,14 @@ def aggregate_cpu_sampling(trace: "TraceData") -> Optional[pd.DataFrame]:
     modules = modules.fillna("").replace("", "unknown")
     functions = functions.fillna("")
 
+    # Per-row symbol source. Defaults to "" when the symbolizer didn't
+    # provide one (back-compat with mocks). Otherwise map InstructionPointer
+    # -> source via ip_to_source.
+    if ip_to_source:
+        symbol_source = df["InstructionPointer"].map(ip_to_source).fillna("unknown")
+    else:
+        symbol_source = pd.Series([""] * len(df))
+
     # Resolve process name. Native SampledProfile carries the sampled
     # thread ID, not a trustworthy event-header PID; the enrichment above
     # maps PayloadThreadId -> ProcessId and then PID -> process name from
@@ -152,9 +180,10 @@ def aggregate_cpu_sampling(trace: "TraceData") -> Optional[pd.DataFrame]:
         "Weight": df[weight_col].values if weight_col in df.columns else 1,
         "Module": modules.astype(str).values,
         "Function": functions.astype(str).values,
+        "SymbolSource": symbol_source.astype(str).values,
     })
 
-    group_cols = ["Process Name", "PID", "Module", "Function"]
+    group_cols = ["Process Name", "PID", "Module", "Function", "SymbolSource"]
     agg = (
         agg_input.groupby(group_cols, dropna=False, sort=False)["Weight"]
         .sum()
@@ -170,7 +199,7 @@ def aggregate_cpu_sampling(trace: "TraceData") -> Optional[pd.DataFrame]:
     )
     total = float(agg["Weight"].sum()) or 1.0
     agg["% Weight"] = (agg["Weight"] / total) * 100.0
-    agg = agg[["Process Name", "PID", "Weight", "% Weight", "Module", "Function"]]
+    agg = agg[["Process Name", "PID", "Weight", "% Weight", "Module", "Function", "SymbolSource"]]
     agg = agg.sort_values("Weight", ascending=False).reset_index(drop=True)
     return agg
 
@@ -205,6 +234,7 @@ def _synthesize_idle_row_when_reliable(
         "Weight": idle_weight,
         "Module": "<Heuristic Low Power State>",
         "Function": "<C3>",
+        "SymbolSource": "",
     }
     return pd.concat([agg, pd.DataFrame([idle_row])], ignore_index=True)
 

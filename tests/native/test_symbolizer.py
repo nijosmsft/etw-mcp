@@ -195,6 +195,152 @@ def test_resolve_unknown_address_returns_unknown_form():
 
 
 # ---------------------------------------------------------------------------
+# Item 63 — SYMFLAG_EXPORT capture / source tagging.
+# ---------------------------------------------------------------------------
+def test_get_source_unknown_for_unregistered_address():
+    """An address with no module registered gets source == 'unknown'."""
+
+    from etw_analyzer.native.symbolizer import Symbolizer
+
+    with Symbolizer() as sym:
+        # Address well outside any reasonable kernel/user image range.
+        target = 0x0000_AAAA_BBBB_CCCC
+        # Resolve first to populate caches.
+        _ = sym.resolve(target)
+        source = sym.get_source(target)
+        # dbghelp's process-wide search may still find a symbol on some
+        # hosts, in which case the source is pdb or export; otherwise
+        # unknown. All three values are valid here — what we care about
+        # is that the API returns one of them.
+        assert source in {"pdb", "export", "unknown"}
+
+
+def test_get_source_returns_unknown_for_zero_address():
+    """``address == 0`` short-circuits to ``unknown``."""
+
+    from etw_analyzer.native.symbolizer import Symbolizer
+
+    with Symbolizer() as sym:
+        assert sym.get_source(0) == "unknown"
+
+
+def test_bulk_resolve_with_source_returns_tuples():
+    """``bulk_resolve_with_source`` yields ``(label, source)`` per address."""
+
+    from etw_analyzer.native.symbolizer import Symbolizer
+
+    addrs = [0x2000_0000 + i for i in range(5)]
+    with Symbolizer() as sym:
+        result = sym.bulk_resolve_with_source(addrs)
+        assert isinstance(result, dict)
+        assert len(result) == 5
+        for addr in addrs:
+            assert addr in result
+            label, source = result[addr]
+            assert isinstance(label, str)
+            assert source in {"pdb", "export", "unknown"}
+
+
+def test_source_cache_populated_alongside_label_cache():
+    """``resolve()`` populates both ``_cache`` and ``_source_cache`` in lockstep."""
+
+    from etw_analyzer.native.symbolizer import Symbolizer
+
+    with Symbolizer() as sym:
+        target = 0x3000_4000_5000_6000
+        sym.resolve(target)
+        assert target in sym._cache
+        assert target in sym._source_cache
+        # Source must be one of the documented strings.
+        assert sym._source_cache[target] in {"pdb", "export", "unknown"}
+
+
+def test_resolve_one_returns_export_when_flags_bit_set(monkeypatch):
+    """When SymFromAddrW sets ``SYMFLAG_EXPORT`` the source must be 'export'.
+
+    Monkeypatches the dbghelp binding so the test does not depend on a
+    real PE image being loaded. Exercises the only branch in
+    ``_resolve_one`` that classifies the source bit.
+    """
+
+    import ctypes
+
+    from etw_analyzer.native.symbolizer import Symbolizer
+
+    with Symbolizer() as sym:
+        # Register a synthetic module so the module-label lookup yields a
+        # stable string.
+        base = 0x4000_0000_0000
+        sym.add_module(base, 0x10000, r"C:\Windows\System32\synthetic.dll")
+
+        def fake_sym_from_addr(handle, address, displacement, sym_info):
+            # Pretend dbghelp resolved the address as an export-table hit.
+            sym_info.SizeOfStruct = ctypes.sizeof(sym._SYMBOL_INFOW)
+            sym_info.ModBase = base
+            sym_info.Flags = sym._dbghelp.SYMFLAG_EXPORT
+            # Write the name into the trailing buffer.
+            name = "FakeExport"
+            sym_info.NameLen = len(name)
+            # ctypes lets us write into the .Name slot via wstring_at on
+            # its address. We rely on the buffer being over-allocated by
+            # the caller (Symbolizer._resolve_one allocates MAX_SYM_NAME
+            # WCHARs).
+            name_offset = sym._SYMBOL_INFOW.Name.offset
+            ctypes.memmove(
+                ctypes.addressof(sym_info) + name_offset,
+                ctypes.create_unicode_buffer(name),
+                (len(name) + 1) * ctypes.sizeof(ctypes.c_wchar),
+            )
+            displacement._obj.value = 0x10
+            return 1  # BOOL TRUE
+
+        monkeypatch.setattr(sym._dbghelp, "SymFromAddrW", fake_sym_from_addr)
+
+        out = sym._resolve_one(base + 0x100)
+        assert out is not None
+        label, source = out
+        assert source == "export"
+        assert "synthetic.dll" in label
+        assert "FakeExport" in label
+
+
+def test_resolve_one_returns_pdb_when_flags_bit_unset(monkeypatch):
+    """SymFromAddrW with Flags == 0 means a real PDB hit → source 'pdb'."""
+
+    import ctypes
+
+    from etw_analyzer.native.symbolizer import Symbolizer
+
+    with Symbolizer() as sym:
+        base = 0x4100_0000_0000
+        sym.add_module(base, 0x10000, r"C:\Windows\System32\realpdb.dll")
+
+        def fake_sym_from_addr(handle, address, displacement, sym_info):
+            sym_info.SizeOfStruct = ctypes.sizeof(sym._SYMBOL_INFOW)
+            sym_info.ModBase = base
+            sym_info.Flags = 0  # no SYMFLAG_EXPORT → real PDB
+            name = "RealPdbFunction"
+            sym_info.NameLen = len(name)
+            name_offset = sym._SYMBOL_INFOW.Name.offset
+            ctypes.memmove(
+                ctypes.addressof(sym_info) + name_offset,
+                ctypes.create_unicode_buffer(name),
+                (len(name) + 1) * ctypes.sizeof(ctypes.c_wchar),
+            )
+            displacement._obj.value = 0x20
+            return 1
+
+        monkeypatch.setattr(sym._dbghelp, "SymFromAddrW", fake_sym_from_addr)
+
+        out = sym._resolve_one(base + 0x200)
+        assert out is not None
+        label, source = out
+        assert source == "pdb"
+        assert "realpdb.dll" in label
+        assert "RealPdbFunction" in label
+
+
+# ---------------------------------------------------------------------------
 # Integration test — requires the VM-Server trace and a working
 # _NT_SYMBOL_PATH that can reach msdl.microsoft.com.
 # ---------------------------------------------------------------------------

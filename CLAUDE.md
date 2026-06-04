@@ -15,6 +15,7 @@ src/etw_analyzer/
   trace_state.py         ← TraceData dataclass + registry (make_trace_id, register/get/require_trace, list_loaded_trace_ids)
   tools/                 ← one module per tool group; each calls @mcp.tool() at import time
     trace_mgmt.py        ← list_traces, load_trace, list_loaded_traces, unload_trace, trace_info, check_symbols, resolve_symbols
+    symbol_diagnostics.py ← diagnose_symbol_load, clean_stale_symbol_files
     cpu_sampling.py      ← get_cpu_samples, get_hot_functions
     per_cpu.py           ← get_per_cpu_summary, get_cpu_timeline
     stack_analysis.py    ← get_hot_stacks, get_function_callers, walk_stack, count_stacks, butterfly_chain

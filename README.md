@@ -308,8 +308,10 @@ Run the LabLink agent elevated, or under an account with permission to start ETW
 | `list_loaded_traces` | Show trace IDs currently loaded in memory |
 | `unload_trace` | Remove a loaded trace from memory |
 | `trace_info` | Show loaded trace metadata by `trace_id` |
-| `check_symbols` | Check symbol resolution status by `trace_id`, identify missing PDBs |
-| `resolve_symbols` | Download PDBs from symbol servers and reload trace by `trace_id` |
+| `check_symbols` | Check symbol resolution by `trace_id` with honest 3-category classification (OK / EXPORT_ONLY / MISSING). Accepts `extra_symbol_paths` to append local PDB dirs. |
+| `resolve_symbols` | Download PDBs from symbol servers and reload trace by `trace_id`. Accepts `extra_symbol_paths`. |
+| `diagnose_symbol_load` | Explain why a module is EXPORT_ONLY / MISSING by reconciling the EXE's RSDS record, all candidate PDBs on disk, and what dbghelp actually loaded. |
+| `clean_stale_symbol_files` | Remove stale `C:\SymCache\<pdb>\<GUID+Age>\` subfolders that don't match the current EXE's RSDS record (dry_run by default). |
 
 #### Analysis
 

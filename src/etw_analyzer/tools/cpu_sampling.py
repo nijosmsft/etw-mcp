@@ -6,6 +6,10 @@ from etw_analyzer.app import mcp
 from etw_analyzer.trace_state import TraceData, require_trace
 from etw_analyzer.parsing.aggregator import apply_filters, group_and_sum, parse_cpu_filter
 from etw_analyzer.formatting.markdown import format_table, format_pct
+from etw_analyzer.tools._symbol_annotation import (
+    annotate_export_fallback,
+    export_fallback_footnote,
+)
 
 import re
 
@@ -404,6 +408,13 @@ def get_hot_functions(
     result = result.head(max_rows)
     result["% Weight"] = result["% Weight"].apply(lambda x: format_pct(x))
 
+    # Annotate rows from EXPORT_ONLY modules with ``*`` so callers know
+    # the function names are PE-export-table guesses, not real PDB
+    # hits. Footnote is only emitted when at least one row was tagged.
+    result, any_annotated = annotate_export_fallback(
+        result, trace, module_col=module_col, function_col=function_col
+    )
+
     if target_modules:
         header = "**Hot Functions** (filtered modules)"
     else:
@@ -414,6 +425,9 @@ def get_hot_functions(
     header += f"\nDenominator ({denominator}): {denominator_weight:,.0f}"
 
     output = f"{header}\n\n{format_table(result, max_rows=max_rows)}"
+
+    if any_annotated:
+        output += "\n\n" + export_fallback_footnote()
 
     if analysis_lines:
         output += "\n\n**CPUMAP Bottleneck Analysis:**\n" + "\n".join(analysis_lines)

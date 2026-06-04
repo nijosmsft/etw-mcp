@@ -37,6 +37,17 @@ class _FakeSymbolizer:
             if int(addr) in {HIGH_ADDRESS, HIGH_ADDRESS + 0x20}
         }
 
+    def bulk_resolve_with_source(self, addrs):
+        # v0.6: parallel to bulk_resolve but tags each address with a
+        # symbol source ("pdb" | "export" | "unknown"). Fake all hits
+        # as PDB so streaming-vs-dataframe parity tests still pass.
+        labels = self.bulk_resolve(addrs)
+        return {
+            int(addr): (labels[int(addr)], "pdb") if int(addr) in labels
+            else ("", "unknown")
+            for addr in addrs
+        }
+
 
 @pytest.fixture(autouse=True)
 def _clean_registry():

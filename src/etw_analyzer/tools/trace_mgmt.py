@@ -30,6 +30,55 @@ from etw_analyzer.formatting.markdown import format_table
 import pandas as pd
 
 
+def _resolve_sym_path(
+    symbol_path: str | None,
+    extra_symbol_paths: list[str] | None,
+) -> str | None:
+    """Build the effective ``_NT_SYMBOL_PATH`` for a tool call.
+
+    Precedence:
+
+    1. ``symbol_path`` REPLACES the ``_NT_SYMBOL_PATH`` environment
+       variable when given (preserves the pre-v0.6 behaviour — passing
+       ``symbol_path=...`` used to clobber the env var, and existing
+       callers rely on that).
+    2. ``extra_symbol_paths`` are APPENDED to whatever base was chosen
+       (either ``symbol_path`` or the env var). This is the new escape
+       hatch — callers can add local build outputs without losing the
+       symbol server entries from .mcp.json.
+
+    Returns the combined semicolon-joined path, or ``None`` if no entry
+    was provided.
+
+    Examples:
+
+        _NT_SYMBOL_PATH = "srv*C:\\symbols*https://msdl..."
+
+        _resolve_sym_path(None, None)
+            -> "srv*C:\\symbols*https://msdl..."   (env wins)
+        _resolve_sym_path("srv*D:\\custom", None)
+            -> "srv*D:\\custom"                     (arg replaces env)
+        _resolve_sym_path(None, ["C:\\build\\Release"])
+            -> "srv*C:\\symbols*...;C:\\build\\Release"  (env + extra)
+        _resolve_sym_path("srv*D:\\custom", ["C:\\build\\Release"])
+            -> "srv*D:\\custom;C:\\build\\Release"  (arg + extra)
+    """
+    base = symbol_path if symbol_path is not None else os.environ.get("_NT_SYMBOL_PATH")
+    entries: list[str] = []
+    if base:
+        entries.append(base.strip())
+    if extra_symbol_paths:
+        for raw in extra_symbol_paths:
+            if raw is None:
+                continue
+            entry = str(raw).strip()
+            if entry:
+                entries.append(entry)
+    if not entries:
+        return None
+    return ";".join(entries)
+
+
 @mcp.tool()
 def list_traces(directory: str = r"C:\traces", pattern: str = "*.etl") -> str:
     """List ETL trace files in a directory.
@@ -69,6 +118,7 @@ def load_trace(
     timeout_seconds: int = 300,
     force: bool = False,
     mode: str = "auto",
+    extra_symbol_paths: list[str] | None = None,
 ) -> str:
     """Load an ETL trace file for analysis.
 
@@ -82,7 +132,8 @@ def load_trace(
     Args:
         etl_path: Full path to the .etl file.
         symbol_path: NT symbol path (e.g. 'srv*C:\\symbols*https://msdl.microsoft.com/download/symbols').
-                     If not set, uses _NT_SYMBOL_PATH env var.
+                     When set, REPLACES the ``_NT_SYMBOL_PATH`` env var.
+                     If not set, uses ``_NT_SYMBOL_PATH``.
         timeout_seconds: Max seconds per xperf invocation. Default: 300.
                          Native ETW extraction currently runs to completion;
                          non-default timeout values require mode="xperf".
@@ -103,6 +154,12 @@ def load_trace(
               dotnet pipelines are fast paths for a curated event /
               aggregation subset; use ``mode="xperf"`` for broadest
               coverage.
+        extra_symbol_paths: Additional symbol path entries APPENDED to
+              whatever base was chosen (``symbol_path`` or the env var).
+              Use this to add local build outputs (e.g. your private
+              .exe + .pdb directory) without losing the symbol server
+              entries from ``_NT_SYMBOL_PATH``. Each entry is joined
+              with ``;``.
     """
     path = Path(etl_path)
     if not path.exists():
@@ -170,8 +227,11 @@ def load_trace(
             "enforcement, or leave timeout_seconds at its default for native."
         )
 
-    # Resolve symbol path
-    sym_path = symbol_path or os.environ.get("_NT_SYMBOL_PATH")
+    # Resolve symbol path. ``symbol_path`` REPLACES the env var when
+    # given (preserves pre-v0.6 behaviour). ``extra_symbol_paths`` are
+    # APPENDED so callers can add local build outputs without losing
+    # the symbol server entries from .mcp.json.
+    sym_path = _resolve_sym_path(symbol_path, extra_symbol_paths)
     load_notices: list[str] = [guardrail_notice] if guardrail_notice else []
 
     # Export directory next to the ETL file
@@ -1438,7 +1498,10 @@ def _synthesize_native_cpu_sampling(trace: TraceData) -> None:
 
     # Match the xperf schema. Process Name, PID are already there;
     # Module / Function are empty strings on the native path; Weight
-    # comes from the per-sample Count.
+    # comes from the per-sample Count. SymbolSource is empty for this
+    # fallback path because no symbolization was attempted — keep the
+    # column for schema parity with aggregate_cpu_sampling so consumers
+    # don't need to special-case the absence (item 63).
     group_cols = ["Process Name", "PID", "Module", "Function"]
     agg = (
         dumper_df.groupby(group_cols, dropna=False)["Weight"]
@@ -1447,10 +1510,11 @@ def _synthesize_native_cpu_sampling(trace: TraceData) -> None:
     )
     total = agg["Weight"].sum() or 1
     agg["% Weight"] = (agg["Weight"] / total) * 100.0
+    agg["SymbolSource"] = ""
 
     # Reorder columns to match xperf for downstream tools that index by
     # name/position.
-    agg = agg[["Process Name", "PID", "Weight", "% Weight", "Module", "Function"]]
+    agg = agg[["Process Name", "PID", "Weight", "% Weight", "Module", "Function", "SymbolSource"]]
 
     with trace.lock:
         trace.raw_csv["cpu_sampling"] = agg
@@ -2363,23 +2427,40 @@ def unload_trace(trace_id: str) -> str:
 
 
 @mcp.tool()
-def check_symbols(trace_id: str) -> str:
+def check_symbols(
+    trace_id: str,
+    extra_symbol_paths: list[str] | None = None,
+) -> str:
     """Check symbol resolution status for a trace.
 
     Reports:
     - Each path in _NT_SYMBOL_PATH: exists/accessible, contains PDBs
-    - Per-module symbol resolution: resolved vs Unknown functions
+    - Per-module symbol resolution split into three honest categories:
+      **From PDB** (real PDB hit), **From Export** (PE export-table
+      nearest-neighbour guess, low confidence), and **Unknown** (no
+      resolution at all). New ``EXPORT_ONLY`` status flags modules
+      whose names came entirely from the export-table fallback - the
+      function names there are heuristic and should not be trusted.
     - Top unresolved modules (likely missing PDBs)
-    - Recommendations for fixing symbol issues
+    - Recommendations for fixing symbol issues, including
+      ``diagnose_symbol_load`` pointers for EXPORT_ONLY modules.
 
     Args:
         trace_id: ID returned by load_trace.
+        extra_symbol_paths: Additional symbol path entries APPENDED to
+            the trace's saved symbol path (or ``_NT_SYMBOL_PATH``)
+            when computing the reported path. Use to preview the
+            effect of adding a local build directory without
+            re-loading the trace.
     """
     trace = require_trace(trace_id)
     lines: list[str] = ["**Symbol Resolution Check**", ""]
 
     # 1. Symbol path analysis
-    sym_path = trace.symbol_path or os.environ.get("_NT_SYMBOL_PATH", "")
+    sym_path = _resolve_sym_path(
+        trace.symbol_path or os.environ.get("_NT_SYMBOL_PATH", ""),
+        extra_symbol_paths,
+    ) or ""
     lines.append("**Symbol Path (`_NT_SYMBOL_PATH`):**")
     if not sym_path:
         lines.append("- **NOT SET** — xperf cannot resolve function names without symbols")
@@ -2406,36 +2487,107 @@ def check_symbols(trace_id: str) -> str:
         lines.append("")
 
         weight_col = "Weight" if "Weight" in cpu_df.columns else None
+        has_source = "SymbolSource" in cpu_df.columns
 
-        # Group by module, check resolved vs unknown
+        if not has_source:
+            # Pre-v0.6 cache: SymbolSource was added in this release but
+            # parquet caches written by older builds don't have it. Fall
+            # back to the legacy "resolved vs unknown" heuristic and
+            # document the limitation so users know to re-run
+            # ``load_trace(..., force=True)`` for honest classification.
+            lines.append(
+                "_Note: this trace cache predates SymbolSource tracking "
+                "(v0.6). Module status is computed from the legacy "
+                "resolved-vs-unknown heuristic which cannot distinguish "
+                "real PDB hits from PE export-table guesses. Reload with "
+                "`force=True` for the honest 3-category classification._"
+            )
+            lines.append("")
+
+        # Group by module, classify into pdb / export / unknown buckets.
+        # When SymbolSource is present we use it directly; otherwise we
+        # derive a 2-bucket (resolved / unknown) view that maps onto the
+        # legacy OK / PARTIAL / MISSING shape.
         rows = []
         for module, group in cpu_df.groupby("Module", dropna=False):
             mod_str = str(module)
             total_funcs = len(group)
-            unknown = group["Function"].astype(str).str.contains(
-                r"^Unknown$|^\*\*\*unknown\*\*\*$|^$", case=False, na=True
-            ).sum()
-            resolved = total_funcs - unknown
-            pct_resolved = (resolved / total_funcs * 100) if total_funcs > 0 else 0
-
             mod_weight = int(group[weight_col].sum()) if weight_col else total_funcs
 
-            if pct_resolved >= 90:
-                status_icon = "OK"
-            elif pct_resolved > 0:
-                status_icon = "PARTIAL"
-            else:
-                status_icon = "MISSING"
+            if has_source:
+                source_col = group["SymbolSource"].astype(str)
+                if weight_col:
+                    # Weight-weighted classification — a module mostly hit
+                    # by export-table guesses should report that way even
+                    # if it has a handful of PDB rows.
+                    w = group[weight_col].astype(float)
+                    pdb_weight = float(w[source_col == "pdb"].sum())
+                    export_weight = float(w[source_col == "export"].sum())
+                    unknown_weight = float(w[source_col.isin(["unknown", ""])].sum())
+                    denom = pdb_weight + export_weight + unknown_weight
+                else:
+                    pdb_weight = float((source_col == "pdb").sum())
+                    export_weight = float((source_col == "export").sum())
+                    unknown_weight = float(source_col.isin(["unknown", ""]).sum())
+                    denom = total_funcs
 
-            rows.append({
-                "Module": mod_str,
-                "Functions": total_funcs,
-                "Resolved": resolved,
-                "Unknown": unknown,
-                "% Resolved": f"{pct_resolved:.0f}%",
-                "Weight": mod_weight,
-                "Status": status_icon,
-            })
+                if denom <= 0:
+                    pct_pdb = pct_export = pct_unknown = 0.0
+                else:
+                    pct_pdb = pdb_weight / denom * 100.0
+                    pct_export = export_weight / denom * 100.0
+                    pct_unknown = unknown_weight / denom * 100.0
+
+                # Honest 3-category status. EXPORT_ONLY is the new bucket
+                # that tells users "yes, function names appear in the
+                # output, but they are nearest-export guesses - the PDB
+                # is missing or stale and the names should not be
+                # trusted." Threshold mirrors the spec: export >= 90 AND
+                # pdb < 10.
+                if pct_pdb >= 90:
+                    status_icon = "OK"
+                elif pct_export >= 90 and pct_pdb < 10:
+                    status_icon = "EXPORT_ONLY"
+                elif pct_pdb + pct_export > 0:
+                    status_icon = "PARTIAL"
+                else:
+                    status_icon = "MISSING"
+
+                rows.append({
+                    "Module": mod_str,
+                    "Functions": total_funcs,
+                    "From PDB": int(round(pdb_weight)) if weight_col else int(pdb_weight),
+                    "From Export": int(round(export_weight)) if weight_col else int(export_weight),
+                    "Unknown": int(round(unknown_weight)) if weight_col else int(unknown_weight),
+                    "% PDB": f"{pct_pdb:.0f}%",
+                    "% Export": f"{pct_export:.0f}%",
+                    "Weight": mod_weight,
+                    "Status": status_icon,
+                })
+            else:
+                # Legacy 2-bucket fallback.
+                unknown = group["Function"].astype(str).str.contains(
+                    r"^Unknown$|^\*\*\*unknown\*\*\*$|^$", case=False, na=True
+                ).sum()
+                resolved = total_funcs - unknown
+                pct_resolved = (resolved / total_funcs * 100) if total_funcs > 0 else 0
+
+                if pct_resolved >= 90:
+                    status_icon = "OK"
+                elif pct_resolved > 0:
+                    status_icon = "PARTIAL"
+                else:
+                    status_icon = "MISSING"
+
+                rows.append({
+                    "Module": mod_str,
+                    "Functions": total_funcs,
+                    "Resolved": resolved,
+                    "Unknown": unknown,
+                    "% Resolved": f"{pct_resolved:.0f}%",
+                    "Weight": mod_weight,
+                    "Status": status_icon,
+                })
 
         result_df = pd.DataFrame(rows)
         result_df = result_df.sort_values("Weight", ascending=False).reset_index(drop=True)
@@ -2450,11 +2602,39 @@ def check_symbols(trace_id: str) -> str:
 
         lines.append("**Summary:**")
         lines.append(f"- Total modules: {len(result_df)}")
-        lines.append(f"- Fully resolved: {len(result_df[result_df['Status'] == 'OK'])}")
+        lines.append(f"- Fully resolved (PDB): {len(result_df[result_df['Status'] == 'OK'])}")
+        if has_source:
+            export_only_df = result_df[result_df["Status"] == "EXPORT_ONLY"]
+            lines.append(f"- Export-only (no PDB, names heuristic): {len(export_only_df)}")
         lines.append(f"- Partially resolved: {len(result_df[result_df['Status'] == 'PARTIAL'])}")
         lines.append(f"- No symbols: {len(missing_df)}")
         lines.append(f"- Unresolved weight: {missing_pct:.1f}% of total CPU samples")
         lines.append("")
+
+        if has_source:
+            export_only_df = result_df[result_df["Status"] == "EXPORT_ONLY"]
+            if not export_only_df.empty:
+                lines.append("**Export-only modules (false-positive risk):**")
+                lines.append("")
+                lines.append(
+                    "These modules' function names came from the PE export "
+                    "table - dbghelp could not find a matching PDB. The "
+                    "names you see in `get_hot_functions` for these "
+                    "modules are nearest-neighbour guesses, not actual "
+                    "PDB symbols. The function called at a hot address "
+                    "could be ANY internal (non-exported) function near "
+                    "that export. Treat these rows as low-confidence and "
+                    "use `diagnose_symbol_load(trace_id, '<module>')` to "
+                    "investigate why the PDB is missing or stale."
+                )
+                lines.append("")
+                top_export = export_only_df.head(10)
+                for _, row in top_export.iterrows():
+                    lines.append(
+                        f"- `{row['Module']}` - {row['Weight']:,} weight "
+                        f"({row['Weight']/total_weight*100:.1f}%)"
+                    )
+                lines.append("")
 
         if not missing_df.empty:
             lines.append("**Top Unresolved Modules (need PDBs):**")
@@ -2488,7 +2668,12 @@ def check_symbols(trace_id: str) -> str:
 
 
 @mcp.tool()
-def resolve_symbols(trace_id: str, modules: str | None = None) -> str:
+@mcp.tool()
+def resolve_symbols(
+    trace_id: str,
+    modules: str | None = None,
+    extra_symbol_paths: list[str] | None = None,
+) -> str:
     """Build symbol cache for a trace using xperf.
 
     Runs xperf -a symcache -build which uses dbghelp.dll to download PDBs
@@ -2499,14 +2684,22 @@ def resolve_symbols(trace_id: str, modules: str | None = None) -> str:
         trace_id: ID returned by load_trace.
         modules: Comma-separated module names to focus on (e.g. 'ntoskrnl.exe,ndis.sys').
                  Default: all modules in the trace.
+        extra_symbol_paths: Additional symbol path entries APPENDED to
+            the trace's saved symbol path (or ``_NT_SYMBOL_PATH``) for
+            this run only. Use this to point xperf at a local PDB
+            directory without re-loading the trace.
     """
     try:
-        return _resolve_symbols_impl(trace_id, modules)
+        return _resolve_symbols_impl(trace_id, modules, extra_symbol_paths)
     except Exception as e:
         return f"Symbol resolution failed: {e}"
 
 
-def _resolve_symbols_impl(trace_id: str, modules: str | None) -> str:
+def _resolve_symbols_impl(
+    trace_id: str,
+    modules: str | None,
+    extra_symbol_paths: list[str] | None = None,
+) -> str:
     import re
     from etw_analyzer.parsing.wpa_exporter import find_xperf, _run_xperf
 
@@ -2516,7 +2709,10 @@ def _resolve_symbols_impl(trace_id: str, modules: str | None) -> str:
     if not path.exists():
         return f"File not found: {path}"
 
-    sym_path = trace.symbol_path or os.environ.get("_NT_SYMBOL_PATH", "")
+    sym_path = _resolve_sym_path(
+        trace.symbol_path or os.environ.get("_NT_SYMBOL_PATH", ""),
+        extra_symbol_paths,
+    ) or ""
     lines = ["**Symbol Resolver**", ""]
     lines.append(f"Trace: `{path.name}`")
     lines.append(f"Trace ID: `{trace.trace_id}`")

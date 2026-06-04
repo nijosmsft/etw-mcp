@@ -137,6 +137,17 @@ class Symbolizer:
         # bounding the cache.
         self._cache: dict[int, str] = {}
 
+        # Parallel per-address symbol-source cache: "pdb" | "export" |
+        # "unknown". Populated alongside ``_cache`` by ``_resolve_one``.
+        # "pdb" means SymFromAddrW returned a result without
+        # ``SYMFLAG_EXPORT`` set — i.e. dbghelp matched a real PDB
+        # symbol. "export" means SymFromAddrW returned a name from the
+        # PE export table (nearest-neighbour heuristic, no PDB hit).
+        # "unknown" covers misses where we fell back to ``module+0xRVA``
+        # or ``unknown+0xADDR``. Lets check_symbols and the hot-function
+        # tools report resolution honesty (item 63).
+        self._source_cache: dict[int, str] = {}
+
         # Lock guards _modules + _cache for thread-safe symbol calls.
         # dbghelp itself is *not* thread-safe across all APIs — see
         # https://learn.microsoft.com/en-us/windows/win32/debug/calling-the-dbghelp-library
@@ -219,8 +230,16 @@ class Symbolizer:
             return None
         return self._modules.get(base)
 
-    def _resolve_one(self, address: int) -> Optional[str]:
-        """Single ``SymFromAddrW`` call. Returns ``None`` on miss.
+    def _resolve_one(self, address: int) -> Optional[tuple[str, str]]:
+        """Single ``SymFromAddrW`` call. Returns ``(label, source)`` on success
+        or ``None`` on miss.
+
+        ``source`` is ``"pdb"`` when the resolved name came from a PDB and
+        ``"export"`` when dbghelp fell back to the PE export table
+        (``SYMFLAG_EXPORT`` bit set on ``SYMBOL_INFOW.Flags``). The export
+        case is a nearest-neighbour heuristic — the name + offset that come
+        back may not correspond to the actual function the address belongs
+        to. Callers should treat ``"export"`` rows as low-confidence.
 
         Caller already holds ``self._lock``.
         """
@@ -257,7 +276,9 @@ class Symbolizer:
             module_entry = self._find_module_for_address(address)
         module_label = _module_label(module_entry) if module_entry else "unknown"
 
-        return f"{module_label}!{name_str}+0x{displacement.value:x}"
+        label = f"{module_label}!{name_str}+0x{displacement.value:x}"
+        source = "export" if (int(sym.Flags) & d.SYMFLAG_EXPORT) else "pdb"
+        return (label, source)
 
     # -- public API ----------------------------------------------------
     def add_module(
@@ -340,47 +361,61 @@ class Symbolizer:
             if cached is not None:
                 return cached
 
-            # Fast path: ask dbghelp directly.
-            result = self._resolve_one(address)
-
-            # Deferred-load case (§6.3): dbghelp's SYMOPT_DEFERRED_LOADS
-            # means the first lookup against a module triggers symsrv;
-            # if SymFromAddrW returned a miss but the address is inside
-            # a registered module range, force a probe and retry.
-            if result is None:
-                module = self._find_module_for_address(address)
-                if module is not None:
-                    base = module["ImageBase"]
-                    # Re-register to make sure dbghelp has it. This is a
-                    # no-op if already loaded; if the first add_module
-                    # silently failed (e.g. NT-form path) we get a
-                    # second chance with whatever path normalization we
-                    # could derive.
-                    d = self._dbghelp
-                    d.SymLoadModuleExW(
-                        self._handle, None,
-                        module.get("DbgHelpPath") or module.get("FileName"),
-                        None,
-                        ctypes.c_ulonglong(base),
-                        wintypes.DWORD(module.get("ImageSize", 0) & 0xFFFFFFFF),
-                        None, wintypes.DWORD(0),
-                    )
-                    # Probe near the image base to wake symsrv, then
-                    # retry the original address.
-                    _ = self._resolve_one(base + 0x1000)
-                    result = self._resolve_one(address)
-
-            if result is None:
-                module = self._find_module_for_address(address)
-                if module is not None:
-                    label = _module_label(module)
-                    rva = address - module["ImageBase"]
-                    result = f"{label}+0x{rva:x}"
-                else:
-                    result = f"unknown+0x{address:x}"
+            result, source = self._resolve_one_with_source(address)
 
             self._cache[address] = result
+            self._source_cache[address] = source
             return result
+
+    def _resolve_one_with_source(self, address: int) -> tuple[str, str]:
+        """Wrap ``_resolve_one`` with the deferred-load retry + module-RVA
+        fallback. Returns ``(label, source)`` where ``source`` is one of
+        ``"pdb"``, ``"export"``, or ``"unknown"``. Caller holds ``self._lock``.
+
+        Split out from ``resolve()`` so both ``resolve()`` and
+        ``get_source()``-style callers can populate the cache via the same
+        code path.
+        """
+
+        # Fast path: ask dbghelp directly.
+        result = self._resolve_one(address)
+
+        # Deferred-load case (§6.3): dbghelp's SYMOPT_DEFERRED_LOADS
+        # means the first lookup against a module triggers symsrv;
+        # if SymFromAddrW returned a miss but the address is inside
+        # a registered module range, force a probe and retry.
+        if result is None:
+            module = self._find_module_for_address(address)
+            if module is not None:
+                base = module["ImageBase"]
+                # Re-register to make sure dbghelp has it. This is a
+                # no-op if already loaded; if the first add_module
+                # silently failed (e.g. NT-form path) we get a
+                # second chance with whatever path normalization we
+                # could derive.
+                d = self._dbghelp
+                d.SymLoadModuleExW(
+                    self._handle, None,
+                    module.get("DbgHelpPath") or module.get("FileName"),
+                    None,
+                    ctypes.c_ulonglong(base),
+                    wintypes.DWORD(module.get("ImageSize", 0) & 0xFFFFFFFF),
+                    None, wintypes.DWORD(0),
+                )
+                # Probe near the image base to wake symsrv, then
+                # retry the original address.
+                _ = self._resolve_one(base + 0x1000)
+                result = self._resolve_one(address)
+
+        if result is None:
+            module = self._find_module_for_address(address)
+            if module is not None:
+                label = _module_label(module)
+                rva = address - module["ImageBase"]
+                return (f"{label}+0x{rva:x}", "unknown")
+            return (f"unknown+0x{address:x}", "unknown")
+
+        return result
 
     def bulk_resolve(self, addresses: Iterable[int]) -> dict[int, str]:
         """Resolve a batch of addresses.
@@ -396,6 +431,46 @@ class Symbolizer:
             if addr in out:
                 continue
             out[addr] = self.resolve(addr)
+        return out
+
+    def get_source(self, address: int) -> str:
+        """Return the symbol source for ``address``: ``"pdb"`` | ``"export"``
+        | ``"unknown"``.
+
+        Calls ``resolve()`` first if the address has not been seen, so the
+        return is always one of the three documented strings. Used by item
+        63 (honest ``check_symbols``) and the export-fallback annotators in
+        ``get_hot_functions`` / ``get_hot_stacks``.
+        """
+
+        if address == 0:
+            return "unknown"
+        cached = self._source_cache.get(address)
+        if cached is not None:
+            return cached
+        # Force a resolve to populate both caches; ignore the string.
+        _ = self.resolve(address)
+        return self._source_cache.get(address, "unknown")
+
+    def bulk_resolve_with_source(
+        self, addresses: Iterable[int]
+    ) -> dict[int, tuple[str, str]]:
+        """Resolve a batch and return ``addr -> (label, source)``.
+
+        Companion to :meth:`bulk_resolve` for callers that need to surface
+        whether each row came from a PDB or from the PE export-table
+        fallback (item 63). Reuses the same underlying cache so mixing the
+        two methods is free after the first hit.
+        """
+
+        addrs = list(addresses)
+        out: dict[int, tuple[str, str]] = {}
+        for addr in addrs:
+            if addr in out:
+                continue
+            label = self.resolve(addr)
+            source = self._source_cache.get(addr, "unknown")
+            out[addr] = (label, source)
         return out
 
     def close(self) -> None:
