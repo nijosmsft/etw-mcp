@@ -2,6 +2,13 @@
 
 An [MCP](https://modelcontextprotocol.io/) server that lets AI coding assistants analyze Windows WPR/ETW traces (`.etl` files). Load a trace, then ask questions in natural language — the server uses a self-contained .NET sidecar by default (auto-downloaded on first use), with a fast in-process ETW path and `xperf.exe` as fallbacks.
 
+> [!IMPORTANT]
+> **Personal hobby project — not endorsed by Microsoft.**
+>
+> This repository is a personal side project. It is not an official
+> Microsoft product, is not affiliated with or endorsed by Microsoft,
+> and carries no warranty or support guarantee. Use at your own risk.
+
 > New here? Start with [GETTING-STARTED.md](GETTING-STARTED.md) for a 30-minute clone-to-first-query walkthrough, then [ARCHITECTURE.md](ARCHITECTURE.md) for the cross-repo dataflow.
 
 Works with any Windows performance trace: networking (tcpip.sys, NDIS, NIC drivers, HTTP.sys), kernel (DPCs, ISRs, context switches), and application workloads.
