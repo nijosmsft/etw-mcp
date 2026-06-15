@@ -858,9 +858,9 @@ def _estimate_ordered_contains(trace: TraceData, contains: list[tuple[str | None
 @mcp.tool()
 def count_stacks(
     trace_id: str,
-    contains: list[tuple[str, str]],
+    contains: list[str | list[str]],
     contains_in_order: bool = True,
-    excludes: list[tuple[str, str]] | None = None,
+    excludes: list[str | list[str]] | None = None,
     cpu_filter: str | None = None,
     start_time: float | None = None,
     end_time: float | None = None,
@@ -869,9 +869,13 @@ def count_stacks(
 
     Args:
         trace_id: ID returned by load_trace.
-        contains: Ordered frames as [module, function] pairs.
+        contains: Ordered frames. Each frame may be either "module!function"
+            (e.g., "tcpip.sys!TcpReceive") or a 2-element list [module, function]
+            (e.g., ["tcpip.sys", "TcpReceive"]). A bare function name like
+            "TcpReceive" is also accepted and matches across all modules.
         contains_in_order: When true, adjacent frames are matched as caller edges.
-        excludes: Optional frames to subtract when present in the same aggregate chain.
+        excludes: Optional frames to subtract when present in the same aggregate
+            chain. Same per-frame format as `contains`.
         cpu_filter: Optional CPU filter for denominator only; butterfly stacks are trace-wide.
         start_time: Reserved for future raw-stack exports.
         end_time: Reserved for future raw-stack exports.
