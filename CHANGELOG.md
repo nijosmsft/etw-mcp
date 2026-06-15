@@ -4,6 +4,11 @@ All notable changes to etw-mcp are documented here. Format follows [Keep a Chang
 
 ## [Unreleased]
 
+## [0.6.2] - 2026-06-15
+
+### Fixed
+- `count_stacks` MCP tool rejected the natural JSON-array invocation shape with `Input should be a valid tuple [type=tuple_type, ...]`. The `contains` and `excludes` parameters were typed as `list[tuple[str, str]]`, but JSON arrays decode to Python lists, not tuples — Pydantic v2 refused to coerce a string or 2-element array into a tuple at the MCP boundary. Widen both parameters to `list[str | list[str]]` and document the three accepted per-frame forms in the docstring: `"module"`, `"module!function"`, and `["module", "function"]`. The internal `_split_stack_ref` helper already handled all three; only the MCP-facing type annotation needed widening.
+
 ## [0.6.1] - 2026-06-15
 
 ### Fixed

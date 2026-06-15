@@ -177,6 +177,46 @@ def test_count_stacks_estimates_ordered_chain():
     assert "aggregate-butterfly-estimate" in output
 
 
+def test_count_stacks_accepts_string_frames():
+    """Regression: MCP clients can't send Python tuples — JSON arrays decode
+    as lists, and bare module names like "afd.sys" come through as strings.
+    The signature must accept both shapes so the LLM-friendly form works."""
+    _register_stack_trace()
+
+    # Bare-string form: "module" only (matches every function in that module).
+    string_output = count_stacks(
+        "trace_stack",
+        contains=["KeAcquireInStackQueuedSpinLock"],
+    )
+    assert "Matching Samples" in string_output
+
+    # "module!function" string form.
+    bang_output = count_stacks(
+        "trace_stack",
+        contains=["ntoskrnl.exe!KeAcquireInStackQueuedSpinLock"],
+    )
+    assert "Matching Samples" in bang_output
+
+    # JSON-list form: [module, function] (what an LLM sends instead of a tuple).
+    list_output = count_stacks(
+        "trace_stack",
+        contains=[
+            ["ntoskrnl.exe", "KeAcquireInStackQueuedSpinLock"],
+            ["tcpip.sys", "IppResolveNeighbor"],
+        ],
+    )
+    assert "Matching Samples" in list_output
+    assert "700" in list_output
+
+    # Mixed string + list (excludes also tolerant).
+    mixed_output = count_stacks(
+        "trace_stack",
+        contains=["ntoskrnl.exe!KeAcquireInStackQueuedSpinLock"],
+        excludes=[["tcpip.sys", "IppResolveNeighbor"]],
+    )
+    assert "Matching Samples" in mixed_output
+
+
 def test_butterfly_chain_table_and_csv():
     _register_stack_trace()
 
