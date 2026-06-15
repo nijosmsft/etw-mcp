@@ -2,6 +2,16 @@ name: Manual release
 
 on:
   workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (must match pyproject.toml version, e.g. v0.6.1).'
+        required: true
+        type: string
+      prerelease:
+        description: 'Mark as a GitHub prerelease.'
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: write
