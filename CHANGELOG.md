@@ -4,6 +4,19 @@ All notable changes to etw-mcp are documented here. Format follows [Keep a Chang
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-06-15
+
+### Fixed
+- Dotnet-mode cache-hit loads now rebuild the per-trace `Symbolizer` from the on-disk image parquets. Previously, every cache hit left `trace.symbolizer = None` because the in-process dbghelp state could not be persisted across loads, and the rebuild path was unreachable. The user-visible symptom was every kernel-mode (and many user-mode) stack frame resolving to `unknown+0x...` even when ntoskrnl.exe, tcpip.sys, mlx5.sys, NDIS.SYS, etc. were present in the trace.
+- `build_symbolizer_from_dotnet_images` now also reads the combined `raw_csv["image"]` key (the cache-hit hydration shape) in addition to the canonical `Image/Load` and `Image/DCStart` keys.
+
+### Added
+- Load-time diagnostic: when `trace.symbolizer is None` despite image rows being present in `raw_csv`, the load summary appends a one-line note pointing operators at `load_trace(force=True)` to regenerate. Future regressions of this bug class are now immediately LLM-visible instead of silently producing `unknown+0x...` frames.
+- 7 regression tests covering the rebuild path: combined `"image"` source, canonical `Image/Load + Image/DCStart` source, dedup by ImageBase, kernel-PID rows registered, etc.
+
+### Operator note
+Any cached export dir under `.etw-export-<stem>/` from v0.6.0 already has the image parquets on disk; the next `load_trace` call after upgrading to v0.6.1 will rebuild the symbolizer from them automatically. Pre-computed aggregates like `cpu_sampling.parquet` still hold pre-fix labels — re-run with `load_trace(force=True)` once if those tables need refresh; tools that resolve live (`get_hot_stacks`, `get_dpc_summary`, anything calling `symbolizer.bulk_resolve`) pick up kernel modules from the next call without re-extracting.
+
 ## [0.6.0] - 2025
 
 ### Changed
