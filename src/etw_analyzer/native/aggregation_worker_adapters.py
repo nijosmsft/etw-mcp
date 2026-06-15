@@ -619,11 +619,18 @@ def build_symbolizer_from_dotnet_images(trace) -> bool:
     every module with the symbolizer so subsequent
     ``aggregate_stack_butterfly`` calls can resolve addresses.
 
+    On a dotnet cache hit, the sidecar's combined image parquet is keyed
+    by stem (``raw_csv["image"]``) rather than by canonical class name.
+    If neither canonical key has any rows, this function falls back to
+    ``raw_csv["image"]`` automatically. That combined form contains both
+    Load and DCStart rows; either is sufficient because only
+    (ImageBase, ImageSize, FileName) are needed for module registration.
+
     Returns True when a symbolizer was installed (already-present
     counts as success), False when:
       * the native Symbolizer module isn't importable (no Windows
         dbghelp, or a unit-test environment), OR
-      * neither Image/Load nor Image/DCStart has any rows.
+      * none of Image/Load, Image/DCStart, or image has any rows.
 
     This is the dotnet equivalent of trace_mgmt._build_symbolizer_from_images
     (which the native path calls during the in-process consumer's
@@ -648,6 +655,16 @@ def build_symbolizer_from_dotnet_images(trace) -> bool:
             continue
         for row in df.to_dict(orient="records"):
             rows.append(row)
+    if not rows:
+        # Cache-hit path: the sidecar's combined "image" parquet is keyed
+        # by stem rather than canonical class. It contains both Load and
+        # DCStart rows distinguished by the "Kind" column; either is fine
+        # for the symbolizer because we only need (ImageBase, ImageSize,
+        # FileName) and dedup by base.
+        combined = trace.raw_csv.get("image")
+        if combined is not None and not combined.empty:
+            for row in combined.to_dict(orient="records"):
+                rows.append(row)
 
     if not rows:
         return False
