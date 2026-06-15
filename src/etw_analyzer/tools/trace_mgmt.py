@@ -591,6 +591,22 @@ def _register_cached_trace(
     )
     _populate_metadata(trace)
     register_trace(trace)
+    # Rebuild the per-trace Symbolizer from on-disk image parquets. The
+    # Symbolizer holds process-local dbghelp state that cannot be cached;
+    # rebuilding it from raw_csv (which the cache rehydrate populated) is
+    # the only way kernel-mode addresses resolve correctly after a cache
+    # hit. Best-effort: a failure here is non-fatal — addresses will fall
+    # back to "unknown+0x..." just as they would today.
+    if resolved_mode in ("dotnet", "native") and getattr(trace, "symbolizer", None) is None:
+        try:
+            from etw_analyzer.native.aggregation_worker_adapters import (
+                build_symbolizer_from_dotnet_images,
+            )
+            build_symbolizer_from_dotnet_images(trace)
+        except Exception as exc:
+            trace.export_errors.append(
+                f"symbolizer rebuild from cache failed: {exc}"
+            )
     if resolved_mode == "xperf":
         _write_cache_manifest(
             trace.export_dir,
@@ -2345,6 +2361,20 @@ def _format_load_summary(trace: TraceData) -> str:
         lines.append(f"## Export errors ({len(trace.export_errors)})")
         for err in trace.export_errors:
             lines.append(f"- {err}")
+
+    if getattr(trace, "symbolizer", None) is None:
+        _image_keys = ("Image/Load", "Image/DCStart", "image")
+        _has_image_rows = any(
+            trace.raw_csv.get(k) is not None and not trace.raw_csv[k].empty
+            for k in _image_keys
+        )
+        if _has_image_rows:
+            lines.append("")
+            lines.append(
+                "Note: symbolizer not built -- kernel and user-mode addresses will "
+                "resolve to 'unknown+0x...' until the symbolizer is rebuilt. "
+                "Try load_trace(force=True) to regenerate."
+            )
 
     lines.append("")
     if trace.event_store is not None and _is_streaming_event_store_cache(trace.export_dir):
