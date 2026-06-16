@@ -57,6 +57,16 @@ internal sealed class ExtractRunner
     // post-pass (materialized mode) after source.Process() completes.
     private readonly Dictionary<(int ProcessID, ulong ImageBase), (string PdbGuid, int PdbAge, string PdbName)> _rsdsBuffer = new();
 
+    // ImageBase-only fallback index: mirrors the native Python path's
+    // _merge_rsds_into_image_rows fallback (extract.py line ~365).
+    // Used when the exact (ProcessID, ImageBase) key misses -- the common
+    // kernel-rundown case where the RSDS event carries ProcessID=4 (System)
+    // but the Image/DCStart event carries ProcessID=0 (or vice versa).
+    // First-seen RSDS record for a given ImageBase wins (same tie-break as
+    // native).  No kernel-range guard -- the native path applies it
+    // unconditionally on miss.
+    private readonly Dictionary<ulong, (string PdbGuid, int PdbAge, string PdbName)> _rsdsBaseOnly = new();
+
     public ExtractRunner(Request req, JsonlEmitter emit)
     {
         _req = req;
@@ -345,15 +355,22 @@ internal sealed class ExtractRunner
                 var pdbGuid = data.GuidSig.ToString("D").ToUpperInvariant();
                 var pdbName = Path.GetFileName(data.PdbFileName ?? "");
                 _rsdsBuffer[key] = (pdbGuid, data.Age, pdbName);
-                // Eagerly back-fill any image row already added with this (Pid, Base).
-                // Handles the rare case where Image/DCStart arrived before its RSDS.
-                // In materialized mode only (streaming rows have not shipped yet but
-                // are not addressable; the post-pass below handles them instead).
+                // Populate the ImageBase-only fallback index (first-seen wins).
+                // This mirrors the native path's fallback dict in extract.py.
+                var imageBase = (ulong)data.ImageBase;
+                if (!_rsdsBaseOnly.ContainsKey(imageBase))
+                    _rsdsBaseOnly[imageBase] = (pdbGuid, data.Age, pdbName);
+                // Eagerly back-fill any image row already added with this ImageBase.
+                // Handles the case where Image/DCStart arrived before its RSDS,
+                // including the PID-mismatch case (RSDS PID=4, Image PID=0).
+                // ApplyRsds is idempotent -- rows already set are re-confirmed.
+                // In materialized mode only (streaming rows are already on disk;
+                // the post-pass below handles them instead).
                 if (!Collector.Image.IsStreaming)
                 {
                     foreach (var row in Collector.Image.AsList())
                     {
-                        if ((int)row.Pid == data.ProcessID && row.ImageBase == (ulong)data.ImageBase)
+                        if (row.ImageBase == (ulong)data.ImageBase)
                             ApplyRsds(row);
                     }
                 }
@@ -990,10 +1007,15 @@ internal sealed class ExtractRunner
     }
 
     // Fills PdbGuid/PdbAge/PdbName on a row from the RSDS buffer if present.
+    // Join strategy mirrors the native path (_merge_rsds_into_image_rows):
+    //   1. Exact (ProcessID, ImageBase) -- primary key.
+    //   2. ImageBase alone (fallback) -- handles kernel-rundown PID mismatch
+    //      where RSDS fires with PID=4 (System) and Image fires with PID=0.
     // Safe to call multiple times (idempotent when already set).
     private void ApplyRsds(ImageRow row)
     {
-        if (_rsdsBuffer.TryGetValue(((int)row.Pid, row.ImageBase), out var rsds))
+        if (_rsdsBuffer.TryGetValue(((int)row.Pid, row.ImageBase), out var rsds)
+            || _rsdsBaseOnly.TryGetValue(row.ImageBase, out rsds))
         {
             row.PdbGuid = rsds.PdbGuid;
             row.PdbAge  = rsds.PdbAge;
