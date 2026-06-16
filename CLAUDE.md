@@ -58,9 +58,13 @@ load_trace(etl_path)               # mode defaults to "auto"
   → _start_background_dumper() launches the native pipeline in a thread:
        OpenTraceW + ProcessTrace decode every requested event class
        (SampledProfile, CSwitch, TCPIP, UDP, AFD, NDIS, HTTP.sys, MsQuic,
-        Image/Load, PerfInfo DPC/ISR, Process, DiskIo, SystemConfig)
+        Image/Load, Image/DCStart, ImageID/DbgID_RSDS (GUID b3e675d7),
+        PerfInfo DPC/ISR, Process, DiskIo, SystemConfig)
        events flow through native_handlers + text_adapter → EVENT_HANDLERS
-  → Symbolizer is built from Image/Load + Image/DCStart rows
+  → Image/Load + Image/DCStart rows carry PdbGuid/PdbAge/PdbName/TimeDateStamp
+       (populated from matched DbgID_RSDS records decoded in-process)
+  → Symbolizer is built from Image/Load + Image/DCStart rows, loading each PDB
+       via SymFindFileInPathW(SSRVOPT_GUIDPTR) with the RSDS identity
   → _run_native_aggregators() turns the per-event DataFrames into the
     xperf-equivalent aggregates (cpu_sampling, cpu_timeline, dpc_isr,
     stacks, stacks_callers, sysconfig, process_info, diskio, tracestats)
@@ -79,6 +83,9 @@ load_trace(etl_path)               # mode defaults to "auto"
        4. validate sidecar's v3 manifest (producer="dotnet")
        5. aggregation_worker.run_aggregation_worker(staging_dir, …):
             hydrate TraceData from sidecar parquets
+            image.parquet carries PdbGuid/PdbAge/PdbName/TimeDateStamp per row
+            build_symbolizer_from_dotnet_images() reads RSDS identity and loads
+              each PDB via SymFindFileInPathW(SSRVOPT_GUIDPTR)
             _run_native_aggregators(trace) ← Layer-3 outputs
             rewrite manifest in place with aggregator parquets added
        6. atomic promote staging_dir → final cache dir
@@ -104,6 +111,25 @@ load_trace(etl_path, mode="xperf")
 ```
 
 trace_id format: `"trace_<sha256[:12]>"` of (lowercase path | size | mtime_ns) — stable per ETL version. All three pipelines produce the same trace_id and parquet schema, so a trace loaded in one mode can rehydrate from cache in any other (subject to the schema-v3 manifest's `producer` field being preserved across reloads). The cache manifest is schema v3 with a `producer ∈ {dotnet, native, xperf}` field; v2 manifests still load and are back-filled to `producer="native"`.
+
+**Image schema (EVENT_SCHEMA_VERSION=2).** Since M2, every image row in `image.parquet` (and the in-process `Image/Load` + `Image/DCStart` DataFrames) carries four additional columns:
+- `PdbGuid` — the exact PDB GUID string from the DbgID_RSDS rundown record embedded in the ETL
+- `PdbAge` — PDB age integer from the same record
+- `PdbName` — PDB filename from the same record
+- `TimeDateStamp` — PE link timestamp
+
+These four columns are what `build_symbolizer_from_dotnet_images` and the native streaming aggregator read to construct the RSDS-identity table (`trace.pdb_identity`). `EVENT_SCHEMA_VERSION` was bumped from 1 to 2 for this change; v1 caches (`PdbGuid` absent) are invalidated on next load.
+
+**Symbolizer PDB loading.** `Symbolizer.load_module()` now follows a two-stage path:
+1. **RSDS identity path (M3):** when `pdb_guid` and `pdb_name` are provided, calls `SymFindFileInPathW(SSRVOPT_GUIDPTR)` with the exact GUID from the trace. dbghelp uses the symbol server to download and verify the PDB that matches the recorded trace binary, not the analyst box's local copy.
+2. **Fallback path:** when RSDS identity is absent (pre-v2 cache or xperf mode), falls back to `SymLoadModuleEx` with the local image path and accepts whatever PDB dbghelp finds.
+
+**dbghelp preference order.** `dbghelp.py::_load_dbghelp()` probes these locations in order and uses the first that exists:
+1. `C:\Debuggers\dbghelp.dll` + `C:\Debuggers\symsrv.dll` (WinDbg, v10.0.29507+, MSFZ-capable)
+2. `C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\dbghelp.dll` (WDK, usually older)
+3. System `dbghelp.dll` (v10.0.26100, MSFZ PDBs NOT supported)
+
+Users without a WinDbg installation will use the system dbghelp and will see EXPORT_ONLY for any module whose PDB is stored in MSFZ (compressed) format on the symbol server. Public `msdl.microsoft.com` PDBs use standard MSF7 format and are unaffected.
 
 require_trace(trace_id) raises ValueError listing loaded IDs when the ID is unknown — propagate that message, don't swallow it.
 

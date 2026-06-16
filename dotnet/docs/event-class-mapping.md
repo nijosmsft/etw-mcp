@@ -28,6 +28,7 @@ whichever the caller finds easiest. The sidecar `Want()` helper in
 | `UdpIp/Send`, `udp_send`                | `kernel.UdpIpSend` + `UdpIpSendIPV6`   | `UdpSend`                    | `udp_send.parquet`            | `UdpIp/Send`           |
 | `Process`, `process`                    | `kernel.ProcessStart/Stop/DCStart/Stop/Defunct`| `Process`                | `process.parquet` + per-opcode `process_{start,end,dcstart,dcend,defunct}.parquet` | *(aggregate in Py)*    |
 | `Image/Load`, `Image/DCStart`, `image`  | `kernel.ImageLoad`, `kernel.ImageDCStart` | `Image`                   | `image.parquet` + per-opcode `image_{load,dcstart}.parquet` | *(aggregate in Py)*    |
+| `ImageID`, `DbgID_RSDS`, `imageid_rsds` | `kernel.FileVersion` (MOF GUID `b3e675d7-...`) | `ImageId` (DbgID_RSDS opcode only) | populates `PdbGuid`/`PdbAge`/`PdbName` columns in `image.parquet` | *(merged into Image in Py)* |
 | `DiskIo`, `diskio`                      | `kernel.DiskIORead/Write/FlushBuffers` | `DiskIo`                     | `diskio.parquet` + per-opcode `diskio_{read,write,flushbuffers}.parquet` | *(aggregate in Py)*    |
 | `PerfInfo`, `dpcisr`, `dpc_isr`         | `kernel.PerfInfoDPC/ThreadedDPC/TimerDPC/ISR` | `DpcIsr`               | `dpc_isr.parquet` + per-opcode `perfinfo_{dpc,threaded_dpc,timer_dpc,isr}.parquet` | *(aggregate in Py)*    |
 | `Thread`, `thread`                      | `kernel.ThreadStart/Stop/DCStart/Stop`  | `Thread`                     | per-opcode `thread_{start,end,dcstart,dcend}.parquet` | *(Track P2 wiring)* |
