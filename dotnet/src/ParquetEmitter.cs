@@ -687,14 +687,18 @@ internal static class ParquetEmitter
         var fSize = Df<long>("ImageSize", false);
         var fTds = Df<long>("TimeDateStamp", false);
         var fName = DfStr("FileName");
-        var schema = new ParquetSchema(fEventSeq, fQpc, fCpu, fKind, fPid, fBase, fSize, fTds, fName);
+        var fPdbGuid = DfStr("PdbGuid");
+        var fPdbAge = Df<int>("PdbAge", true);
+        var fPdbName = DfStr("PdbName");
+        var schema = new ParquetSchema(fEventSeq, fQpc, fCpu, fKind, fPid, fBase, fSize, fTds, fName, fPdbGuid, fPdbAge, fPdbName);
         return await WriteRowGroupAsync(path, schema, async rg =>
         {
             int n = rows.Count;
             var es = new ulong[n]; var qpc = new long[n]; var cpu = new int[n];
             var kind = new string?[n]; var pid = new long[n]; var bs = new ulong[n];
             var sz = new long[n]; var tds = new long[n]; var nm = new string?[n];
-            for (int i = 0; i < n; i++) { var r = rows[i]; es[i] = r.EventSequence; qpc[i] = r.TimeStampQpc; cpu[i] = r.Cpu; kind[i] = r.Kind; pid[i] = r.Pid; bs[i] = r.ImageBase; sz[i] = r.ImageSize; tds[i] = r.TimeDateStamp; nm[i] = r.FileName; }
+            var pdbGuid = new string?[n]; var pdbAge = new int?[n]; var pdbName = new string?[n];
+            for (int i = 0; i < n; i++) { var r = rows[i]; es[i] = r.EventSequence; qpc[i] = r.TimeStampQpc; cpu[i] = r.Cpu; kind[i] = r.Kind; pid[i] = r.Pid; bs[i] = r.ImageBase; sz[i] = r.ImageSize; tds[i] = r.TimeDateStamp; nm[i] = r.FileName; pdbGuid[i] = r.PdbGuid; pdbAge[i] = r.PdbAge; pdbName[i] = r.PdbName; }
             await rg.WriteColumnAsync(new DataColumn(fEventSeq, es));
             await rg.WriteColumnAsync(new DataColumn(fQpc, qpc));
             await rg.WriteColumnAsync(new DataColumn(fCpu, cpu));
@@ -704,6 +708,9 @@ internal static class ParquetEmitter
             await rg.WriteColumnAsync(new DataColumn(fSize, sz));
             await rg.WriteColumnAsync(new DataColumn(fTds, tds));
             await rg.WriteColumnAsync(new DataColumn(fName, nm));
+            await rg.WriteColumnAsync(new DataColumn(fPdbGuid, pdbGuid));
+            await rg.WriteColumnAsync(new DataColumn(fPdbAge, pdbAge));
+            await rg.WriteColumnAsync(new DataColumn(fPdbName, pdbName));
         });
     }
 
@@ -723,7 +730,10 @@ internal static class ParquetEmitter
         var fSize = Df<long>("ImageSize", false);
         var fTds = Df<long>("TimeDateStamp", false);
         var fName = DfStr("FileName");
-        var schema = new ParquetSchema(fEventSeq, fQpc, fCpu, fPid, fBase, fSize, fTds, fName);
+        var fPdbGuid = DfStr("PdbGuid");
+        var fPdbAge = Df<int>("PdbAge", true);
+        var fPdbName = DfStr("PdbName");
+        var schema = new ParquetSchema(fEventSeq, fQpc, fCpu, fPid, fBase, fSize, fTds, fName, fPdbGuid, fPdbAge, fPdbName);
         var filtered = new List<ImageRow>(rows.Count);
         for (int i = 0; i < rows.Count; i++)
             if (string.Equals(rows[i].Kind, kind, StringComparison.Ordinal)) filtered.Add(rows[i]);
@@ -733,7 +743,8 @@ internal static class ParquetEmitter
             var es = new ulong[n]; var qpc = new long[n]; var cpu = new int[n];
             var pid = new long[n]; var bs = new ulong[n];
             var sz = new long[n]; var tds = new long[n]; var nm = new string?[n];
-            for (int i = 0; i < n; i++) { var r = filtered[i]; es[i] = r.EventSequence; qpc[i] = r.TimeStampQpc; cpu[i] = r.Cpu; pid[i] = r.Pid; bs[i] = r.ImageBase; sz[i] = r.ImageSize; tds[i] = r.TimeDateStamp; nm[i] = r.FileName; }
+            var pdbGuid = new string?[n]; var pdbAge = new int?[n]; var pdbName = new string?[n];
+            for (int i = 0; i < n; i++) { var r = filtered[i]; es[i] = r.EventSequence; qpc[i] = r.TimeStampQpc; cpu[i] = r.Cpu; pid[i] = r.Pid; bs[i] = r.ImageBase; sz[i] = r.ImageSize; tds[i] = r.TimeDateStamp; nm[i] = r.FileName; pdbGuid[i] = r.PdbGuid; pdbAge[i] = r.PdbAge; pdbName[i] = r.PdbName; }
             await rg.WriteColumnAsync(new DataColumn(fEventSeq, es));
             await rg.WriteColumnAsync(new DataColumn(fQpc, qpc));
             await rg.WriteColumnAsync(new DataColumn(fCpu, cpu));
@@ -742,6 +753,9 @@ internal static class ParquetEmitter
             await rg.WriteColumnAsync(new DataColumn(fSize, sz));
             await rg.WriteColumnAsync(new DataColumn(fTds, tds));
             await rg.WriteColumnAsync(new DataColumn(fName, nm));
+            await rg.WriteColumnAsync(new DataColumn(fPdbGuid, pdbGuid));
+            await rg.WriteColumnAsync(new DataColumn(fPdbAge, pdbAge));
+            await rg.WriteColumnAsync(new DataColumn(fPdbName, pdbName));
         });
     }
 

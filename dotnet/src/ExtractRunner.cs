@@ -3,6 +3,7 @@ using System.Net;
 using Microsoft.Diagnostics.Tracing;
 using Microsoft.Diagnostics.Tracing.Parsers;
 using Microsoft.Diagnostics.Tracing.Parsers.Kernel;
+using Microsoft.Diagnostics.Tracing.Parsers.Symbol;
 using EtwExtract.Rows;
 namespace EtwExtract;
 
@@ -50,6 +51,11 @@ internal sealed class ExtractRunner
     // (ProviderGuid, EventID) pairs already routed to a typed buffer; skip those in
     // the generic TraceLogging path so we don't double-record known events.
     private readonly HashSet<(Guid, int)> _consumedKeys = new();
+
+    // Buffer for DbgID/RSDS records keyed by (ProcessID, ImageBase). Populated
+    // during ProcessTrace; merged into image rows eagerly in AddImage and via
+    // post-pass (materialized mode) after source.Process() completes.
+    private readonly Dictionary<(int ProcessID, ulong ImageBase), (string PdbGuid, int PdbAge, string PdbName)> _rsdsBuffer = new();
 
     public ExtractRunner(Request req, JsonlEmitter emit)
     {
@@ -327,6 +333,31 @@ internal sealed class ExtractRunner
         {
             kernel.ImageLoad += (ImageLoadTraceData data) => Wrap(() => AddImage(data, "Load"));
             kernel.ImageDCStart += (ImageLoadTraceData data) => Wrap(() => AddImage(data, "DCStart"));
+
+            // Subscribe to the SymbolTraceEventParser to capture DbgID/RSDS records.
+            // These events carry the PDB GUID, Age, and PdbFileName for every image.
+            // The parser attaches to the same source and decodes the KernelTraceControl
+            // ImageID rundown that is already present in any standard WPR/xperf ETL.
+            var symParser = new SymbolTraceEventParser(source);
+            symParser.ImageIDDbgID_RSDS += (DbgIDRSDSTraceData data) => Wrap(() =>
+            {
+                var key = (data.ProcessID, (ulong)data.ImageBase);
+                var pdbGuid = data.GuidSig.ToString("D").ToUpperInvariant();
+                var pdbName = Path.GetFileName(data.PdbFileName ?? "");
+                _rsdsBuffer[key] = (pdbGuid, data.Age, pdbName);
+                // Eagerly back-fill any image row already added with this (Pid, Base).
+                // Handles the rare case where Image/DCStart arrived before its RSDS.
+                // In materialized mode only (streaming rows have not shipped yet but
+                // are not addressable; the post-pass below handles them instead).
+                if (!Collector.Image.IsStreaming)
+                {
+                    foreach (var row in Collector.Image.AsList())
+                    {
+                        if ((int)row.Pid == data.ProcessID && row.ImageBase == (ulong)data.ImageBase)
+                            ApplyRsds(row);
+                    }
+                }
+            });
         }
         if (_wantDiskIo)
         {
@@ -603,6 +634,17 @@ internal sealed class ExtractRunner
             EventsLost = source.EventsLost;
         }
         if (fatalError != null) throw fatalError;
+
+        // Post-pass: merge any RSDS records that arrived AFTER their Image row
+        // (rare but possible in interleaved rundown ordering). Only possible in
+        // materialized mode; in streaming mode the eager apply in AddImage and
+        // the back-fill in the RSDS callback cover all orderings, and the image
+        // chunk size (256K) guarantees no partial flush occurred during processing.
+        if (_wantImage && !Collector.Image.IsStreaming)
+        {
+            foreach (var row in Collector.Image.AsList())
+                ApplyRsds(row);
+        }
     }
 
     // ----- TcpIp / UdpIp helpers (MOF kernel) -----
@@ -930,7 +972,7 @@ internal sealed class ExtractRunner
 
     private void AddImage(ImageLoadTraceData data, string kind)
     {
-        Collector.Image.Add(new ImageRow
+        var row = new ImageRow
         {
             EventSequence = Collector.NextSeq(),
             TimeStampQpc = data.TimeStampQPC,
@@ -941,7 +983,22 @@ internal sealed class ExtractRunner
             ImageSize = data.ImageSize,
             TimeDateStamp = data.TimeDateStamp,
             FileName = data.FileName,
-        });
+        };
+        // Eagerly apply RSDS identity if already captured for this (Pid, ImageBase).
+        ApplyRsds(row);
+        Collector.Image.Add(row);
+    }
+
+    // Fills PdbGuid/PdbAge/PdbName on a row from the RSDS buffer if present.
+    // Safe to call multiple times (idempotent when already set).
+    private void ApplyRsds(ImageRow row)
+    {
+        if (_rsdsBuffer.TryGetValue(((int)row.Pid, row.ImageBase), out var rsds))
+        {
+            row.PdbGuid = rsds.PdbGuid;
+            row.PdbAge  = rsds.PdbAge;
+            row.PdbName = rsds.PdbName;
+        }
     }
 
     private void AddDiskIo(DiskIOTraceData data, string kind)
