@@ -4,6 +4,41 @@ All notable changes to etw-mcp are documented here. Format follows [Keep a Chang
 
 ## [Unreleased]
 
+### Fixed
+
+- **Bundled capture profiles: kernel ImageLoad rundown now survives on Windows
+  Server 2025 build 29614** (Bug E).
+  Traces captured with any etw-mcp .wprp profile on Server 2025 29614 were
+  missing the kernel Image/DCStart rundown burst so kernel modules could not be
+  attributed or symbolized -- even though each profile's SystemProvider has the
+  Loader keyword set.
+
+  Two root causes addressed (see commits for full analysis):
+
+  1. **cpu.wprp SystemCollector undersized** (VERIFIED): the original
+     128 x 1024 KB = 128 MB allocation yields ~1.6 buffers per CPU on an
+     80-CPU server -- below the ETW minimum-buffers recommendation of
+     >= 2 x NumberOfProcessors (160 for 80 CPUs).  At session start the
+     kernel Image/DCStart + ProcessThread rundown burst can exhaust the initial
+     pool before file-mode draining begins, silently dropping the events.
+     Fix: bumped to 320 x 4096 KB = 1.28 GB, matching all other profiles.
+
+  2. **All profiles missing TraceMergeProperties** (PROPOSED / well-grounded):
+     the built-in WPR "CPU" profile injects ImageID/DbgID_RSDS records at
+     wpr -stop via its hardcoded merge properties (confirmed: 13 104 events in
+     the reference wpa5 trace, GUID b3e675d7...).  Custom .wprp files on Server
+     2025 build 29614 do NOT receive this injection by default; without an
+     explicit <TraceMergeProperties> section the final ETL lacks the RSDS
+     identity the etw-mcp consumer needs for kernel PDB lookup.
+     Fix: added <TraceMergeProperties><TraceMergeProperty><CustomEvents>
+     <CustomEvent Value="ImageId"/></CustomEvents></TraceMergeProperty>
+     </TraceMergeProperties> to all nine bundled .wprp files, matching the
+     merge-time injection that built-in WPR profiles perform.
+
+  **Static validation only.** End-to-end confirmation (capturing on Server 2025
+  build 29614 and verifying the DCStart rundown lands in the ETL) requires lab
+  hardware and has NOT been performed here.
+
 ## [0.7.0] - 2026-06-15
 
 ### Fixed
