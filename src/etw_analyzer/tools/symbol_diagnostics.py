@@ -286,9 +286,11 @@ def parse_symbol_path(sym_path: str) -> list[tuple[str, Path]]:
     ``kind`` is one of:
     - ``"symcache"``  - a ``cache*<dir>`` or implicit symstore cache
     - ``"local"``     - a plain directory
-    - ``"server"``    - a ``srv*<cache>*<url>`` server cache (returns
-                        only the cache directory; the URL is reported
-                        as kind ``"url"``)
+    - ``"server"``    - the local cache dir of a ``srv*<cache>*...`` entry
+    - ``"store"``     - an upstream filesystem store (UNC or drive-letter
+                        path) from a ``srv*<cache>*<upstream>`` entry;
+                        http(s):// and ``symweb`` upstreams are skipped
+                        since they are not locally globbable.
 
     Unparseable entries are skipped silently — the caller should treat
     the absence of an entry as "this part of _NT_SYMBOL_PATH isn't
@@ -304,9 +306,21 @@ def parse_symbol_path(sym_path: str) -> list[tuple[str, Path]]:
         lower = entry.lower()
         if lower.startswith("srv*") or lower.startswith("symsrv*"):
             parts = entry.split("*")
-            # srv*<cache>*<url> → cache is parts[1], url is parts[2:]
+            # srv*<cache>*<upstream1>*<upstream2>...
+            # parts[1] is the local cache dir
             if len(parts) >= 2 and parts[1]:
                 out.append(("server", Path(parts[1])))
+            # parts[2:] are upstream stores — include filesystem paths
+            # (UNC \\... or drive-letter); skip http(s):// and symweb.
+            for upstream in parts[2:]:
+                if not upstream:
+                    continue
+                up_lower = upstream.lower()
+                if up_lower.startswith("http://") or up_lower.startswith("https://"):
+                    continue
+                if up_lower == "symweb" or up_lower.startswith("symweb/"):
+                    continue
+                out.append(("store", Path(upstream)))
             continue
         if lower.startswith("cache*"):
             parts = entry.split("*", 1)
@@ -316,6 +330,77 @@ def parse_symbol_path(sym_path: str) -> list[tuple[str, Path]]:
         # Plain directory.
         out.append(("local", Path(entry)))
     return out
+
+
+def _resolve_file_ptr(ptr_file: Path) -> Path | None:
+    """Read a symstore file.ptr and return the target PDB path, or None.
+
+    Handles three content forms:
+    - ``PATH:<path>``          : strip the ``PATH:`` prefix
+    - bare relative path       : resolved relative to the GUID+Age folder
+    - bare absolute / UNC path : used as-is
+
+    Returns ``None`` if the file is unreadable, empty, or the resolved
+    target does not exist on disk. Never raises.
+    """
+    try:
+        content = ptr_file.read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return None
+    if not content:
+        return None
+    if content.upper().startswith("PATH:"):
+        target = Path(content[5:].strip())
+    else:
+        target = Path(content)
+    if not target.is_absolute():
+        # Resolve relative to the GUID+Age folder (ptr_file's parent).
+        target = (ptr_file.parent / target).resolve()
+    try:
+        return target if target.is_file() else None
+    except OSError:
+        return None
+
+
+def _iter_candidates(
+    sym_path: str,
+    module_name: str,
+    pdb_name: str,
+) -> Iterable[tuple[Path, str | None]]:
+    """Yield (pdb_path, redirect_description_or_None) for each candidate PDB.
+
+    ``redirect_description`` is set when the candidate was reached via a
+    ``file.ptr`` redirect; it is ``None`` for direct (literal) matches.
+    """
+    for _kind, dir_path in parse_symbol_path(sym_path):
+        if not dir_path.exists():
+            continue
+        # Flat layout
+        flat = dir_path / pdb_name
+        if flat.is_file():
+            yield (flat, None)
+        # Symstore layout: <dir>/<pdb_name>/<GUID+Age>/<pdb_name>
+        sym_root = dir_path / pdb_name
+        if sym_root.is_dir():
+            try:
+                for sub in sorted(sym_root.iterdir()):
+                    if not sub.is_dir():
+                        continue
+                    # Literal PDB file in the GUID+Age subfolder.
+                    candidate = sub / pdb_name
+                    if candidate.is_file():
+                        yield (candidate, None)
+                    # file.ptr redirect (pointer-indexed symstore).
+                    ptr = sub / "file.ptr"
+                    if ptr.is_file():
+                        target = _resolve_file_ptr(ptr)
+                        if target is not None:
+                            yield (
+                                target,
+                                f"via file.ptr redirect: {ptr} -> {target}",
+                            )
+            except OSError:
+                continue
 
 
 def candidate_pdb_paths(
@@ -332,28 +417,12 @@ def candidate_pdb_paths(
     We can't enumerate the GUID+Age subfolders without knowing them
     ahead of time, so we glob ``D\\<pdb_name>\\*\\<pdb_name>`` for each
     directory and return whatever exists.
+
+    Also follows ``file.ptr`` redirects written by pointer-indexed
+    symbol stores (``D\\<pdb_name>\\<GUID+Age>\\file.ptr`` whose
+    content resolves to the real PDB path).
     """
-    out: list[Path] = []
-    for _kind, dir_path in parse_symbol_path(sym_path):
-        if not dir_path.exists():
-            continue
-        # Flat layout
-        flat = dir_path / pdb_name
-        if flat.is_file():
-            out.append(flat)
-        # Symstore layout: <dir>/<pdb_name>/<GUID+Age>/<pdb_name>
-        sym_root = dir_path / pdb_name
-        if sym_root.is_dir():
-            try:
-                for sub in sorted(sym_root.iterdir()):
-                    if not sub.is_dir():
-                        continue
-                    candidate = sub / pdb_name
-                    if candidate.is_file():
-                        out.append(candidate)
-            except OSError:
-                continue
-    return out
+    return [path for path, _ in _iter_candidates(sym_path, module_name, pdb_name)]
 
 
 # ---------------------------------------------------------------------------
@@ -507,30 +576,33 @@ def diagnose_symbol_load(
 
     # Walk candidate PDB paths.
     pdb_name = Path(rsds.pdb_path).name if rsds.pdb_path else f"{Path(module).stem}.pdb"
-    candidates = candidate_pdb_paths(sym_path, module, pdb_name)
+    candidate_entries = list(_iter_candidates(sym_path, module, pdb_name))
     lines.append(f"**Candidate PDBs on disk** (searching for `{pdb_name}`):")
-    if not candidates:
+    if not candidate_entries:
         lines.append("- None found in any symbol path entry.")
     else:
+        has_redirects = any(rd is not None for _, rd in candidate_entries)
         rows = []
-        for cand in candidates:
+        for cand, redirect_desc in candidate_entries:
             sig = read_pdb_signature(cand)
-            if sig is None:
-                rows.append({
-                    "Path": str(cand),
-                    "GUID": "(unreadable)",
-                    "Age": "?",
-                    "Match": "NO",
-                })
-                continue
-            guid, age = sig
-            match = (guid == rsds.guid_string) and (age == rsds.age)
-            rows.append({
+            row: dict = {
                 "Path": str(cand),
-                "GUID": guid,
-                "Age": str(age),
-                "Match": "YES" if match else "NO",
-            })
+                "GUID": "(unreadable)" if sig is None else sig[0],
+                "Age": "?" if sig is None else str(sig[1]),
+                "Match": "NO" if sig is None else (
+                    "YES" if (sig[0] == rsds.guid_string and sig[1] == rsds.age) else "NO"
+                ),
+            }
+            if has_redirects:
+                if redirect_desc:
+                    # Show just the file.ptr file; the resolved path is in "Path".
+                    ptr_path = redirect_desc.split(" -> ")[0].replace(
+                        "via file.ptr redirect: ", ""
+                    )
+                    row["Redirect"] = f"file.ptr: {ptr_path}"
+                else:
+                    row["Redirect"] = ""
+            rows.append(row)
         df = pd.DataFrame(rows)
         lines.append("")
         lines.append(format_table(df, max_rows=25))
@@ -567,7 +639,7 @@ def diagnose_symbol_load(
     # Actionable next steps.
     lines.append("**Next steps:**")
     if rsds is not None and any(
-        (read_pdb_signature(c) == (rsds.guid_string, rsds.age)) for c in candidates
+        (read_pdb_signature(c) == (rsds.guid_string, rsds.age)) for c, _ in candidate_entries
     ):
         lines.append(
             "- A matching PDB exists on disk. If dbghelp still reports "

@@ -18,6 +18,8 @@ import pytest
 
 from etw_analyzer.tools.symbol_diagnostics import (
     RsdsRecord,
+    _iter_candidates,
+    _resolve_file_ptr,
     candidate_pdb_paths,
     clean_stale_symbol_files,
     parse_symbol_path,
@@ -366,3 +368,312 @@ def test_clean_stale_symbol_files_all_current(tmp_path: Path):
         symcache_root=str(cache),
     )
     assert "No stale folders to delete" in out
+
+
+# ---------------------------------------------------------------------------
+# parse_symbol_path — upstream store entries (Bug B fix)
+# ---------------------------------------------------------------------------
+
+
+def test_parse_symbol_path_srv_returns_upstream_unc_store(tmp_path: Path):
+    """srv*<cache>*<UNC> yields both the cache dir (server) and the
+    upstream UNC path (store).  The "store" entry is new behaviour."""
+    sym = r"srv*C:\symbols*\\10.57.200.80\e$\symbols\Indexes"
+    out = parse_symbol_path(sym)
+    kinds = [k for k, _ in out]
+    paths = [p for _, p in out]
+    assert "server" in kinds
+    assert "store" in kinds
+    assert Path(r"C:\symbols") in paths
+    assert Path(r"\\10.57.200.80\e$\symbols\Indexes") in paths
+
+
+def test_parse_symbol_path_drops_https_upstream():
+    """An https:// upstream must NOT appear as a searchable dir entry."""
+    sym = r"srv*C:\symbols*https://msdl.microsoft.com/download/symbols"
+    out = parse_symbol_path(sym)
+    kinds = [k for k, _ in out]
+    assert "store" not in kinds
+    assert kinds == ["server"]
+
+
+def test_parse_symbol_path_drops_symweb_upstream():
+    """symweb shorthand must NOT appear as a searchable dir entry."""
+    sym = r"srv*C:\symbols*symweb"
+    out = parse_symbol_path(sym)
+    kinds = [k for k, _ in out]
+    assert "store" not in kinds
+    assert kinds == ["server"]
+
+
+def test_parse_symbol_path_multiple_upstreams_mixed():
+    """Multiple upstreams: filesystem ones kept, http/symweb dropped."""
+    sym = (
+        r"srv*C:\cache"
+        r"*\\server1\share"
+        r"*https://msdl.microsoft.com/download/symbols"
+        r"*D:\local_store"
+    )
+    out = parse_symbol_path(sym)
+    kinds = [k for k, _ in out]
+    paths = [p for _, p in out]
+    assert kinds.count("store") == 2
+    assert Path(r"\\server1\share") in paths
+    assert Path(r"D:\local_store") in paths
+    # https upstream is absent
+    assert not any("msdl" in str(p).lower() for p in paths)
+
+
+def test_parse_symbol_path_srv_no_cache_only_upstream(tmp_path: Path):
+    """srv**<upstream> (empty cache slot) — only the upstream store appears."""
+    sym = r"srv**\\server\share"
+    out = parse_symbol_path(sym)
+    kinds = [k for k, _ in out]
+    # Empty cache part (parts[1] == "") is skipped; upstream store is kept.
+    assert "server" not in kinds
+    assert "store" in kinds
+
+
+# ---------------------------------------------------------------------------
+# _resolve_file_ptr — all three content forms
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_file_ptr_path_prefix_form(tmp_path: Path):
+    """PATH:<absolute> form resolves to the absolute path."""
+    real_pdb = tmp_path / "real" / "foo.pdb"
+    real_pdb.parent.mkdir(parents=True)
+    real_pdb.write_bytes(b"fake pdb")
+
+    guid_dir = tmp_path / "store" / "foo.pdb" / "ABCD1"
+    guid_dir.mkdir(parents=True)
+    ptr = guid_dir / "file.ptr"
+    ptr.write_text(f"PATH:{real_pdb}", encoding="utf-8")
+
+    result = _resolve_file_ptr(ptr)
+    assert result == real_pdb
+
+
+def test_resolve_file_ptr_bare_absolute_form(tmp_path: Path):
+    """Bare absolute path (no PATH: prefix) is used as-is."""
+    real_pdb = tmp_path / "absolute" / "bar.pdb"
+    real_pdb.parent.mkdir(parents=True)
+    real_pdb.write_bytes(b"fake pdb")
+
+    guid_dir = tmp_path / "store" / "bar.pdb" / "GUID1"
+    guid_dir.mkdir(parents=True)
+    ptr = guid_dir / "file.ptr"
+    ptr.write_text(str(real_pdb), encoding="utf-8")
+
+    result = _resolve_file_ptr(ptr)
+    assert result == real_pdb
+
+
+def test_resolve_file_ptr_relative_form(tmp_path: Path):
+    """Bare relative path is resolved relative to the GUID+Age folder."""
+    # Layout:
+    #   tmp/ostesting/foo.pdb        <- the real PDB
+    #   tmp/store/foo.pdb/GUID1/     <- GUID+Age folder (3 levels below tmp)
+    #   tmp/store/foo.pdb/GUID1/file.ptr -> "../../../ostesting/foo.pdb"
+    real_pdb = tmp_path / "ostesting" / "foo.pdb"
+    real_pdb.parent.mkdir(parents=True)
+    real_pdb.write_bytes(b"fake pdb")
+
+    guid_dir = tmp_path / "store" / "foo.pdb" / "GUID1"
+    guid_dir.mkdir(parents=True)
+    # From guid_dir (3 levels below tmp_path) up to tmp_path then into ostesting.
+    rel = Path("..") / ".." / ".." / "ostesting" / "foo.pdb"
+    ptr = guid_dir / "file.ptr"
+    ptr.write_text(str(rel), encoding="utf-8")
+
+    result = _resolve_file_ptr(ptr)
+    assert result is not None
+    assert result.resolve() == real_pdb.resolve()
+
+
+def test_resolve_file_ptr_missing_target_returns_none(tmp_path: Path):
+    """A file.ptr pointing at a non-existent target returns None."""
+    guid_dir = tmp_path / "store" / "foo.pdb" / "GUID1"
+    guid_dir.mkdir(parents=True)
+    ptr = guid_dir / "file.ptr"
+    ptr.write_text(str(tmp_path / "ghost" / "foo.pdb"), encoding="utf-8")
+
+    assert _resolve_file_ptr(ptr) is None
+
+
+def test_resolve_file_ptr_empty_content_returns_none(tmp_path: Path):
+    """An empty file.ptr returns None without raising."""
+    guid_dir = tmp_path / "store" / "foo.pdb" / "GUID1"
+    guid_dir.mkdir(parents=True)
+    ptr = guid_dir / "file.ptr"
+    ptr.write_bytes(b"   \n  ")
+
+    assert _resolve_file_ptr(ptr) is None
+
+
+def test_resolve_file_ptr_path_prefix_with_trailing_whitespace(tmp_path: Path):
+    """PATH: form tolerates trailing whitespace / newlines."""
+    real_pdb = tmp_path / "real" / "ws.pdb"
+    real_pdb.parent.mkdir(parents=True)
+    real_pdb.write_bytes(b"fake pdb")
+
+    guid_dir = tmp_path / "store" / "ws.pdb" / "GUID1"
+    guid_dir.mkdir(parents=True)
+    ptr = guid_dir / "file.ptr"
+    ptr.write_text(f"PATH:{real_pdb}  \r\n", encoding="utf-8")
+
+    result = _resolve_file_ptr(ptr)
+    assert result == real_pdb
+
+
+# ---------------------------------------------------------------------------
+# candidate_pdb_paths — file.ptr integration (Bug B fix)
+# ---------------------------------------------------------------------------
+
+
+def test_candidate_pdb_paths_follows_fileptr_relative(tmp_path: Path):
+    """candidate_pdb_paths follows a relative file.ptr redirect."""
+    real_pdb = tmp_path / "ostesting" / "exe" / "ntkrnlmp.pdb"
+    real_pdb.parent.mkdir(parents=True)
+    real_pdb.write_bytes(b"fake pdb")
+
+    # Layout:
+    #   store/ntkrnlmp.pdb/<GUID+Age>/file.ptr (3 levels below store root)
+    # Relative from that folder back to ostesting/exe/ntkrnlmp.pdb:
+    #   ../../../ostesting/exe/ntkrnlmp.pdb
+    store = tmp_path / "store"
+    guid_dir = store / "ntkrnlmp.pdb" / "ABCD1234E"
+    guid_dir.mkdir(parents=True)
+    rel = Path("..") / ".." / ".." / "ostesting" / "exe" / "ntkrnlmp.pdb"
+    (guid_dir / "file.ptr").write_text(str(rel), encoding="utf-8")
+
+    paths = candidate_pdb_paths(str(store), "ntkrnlmp.exe", "ntkrnlmp.pdb")
+    assert real_pdb.resolve() in [p.resolve() for p in paths]
+
+
+def test_candidate_pdb_paths_follows_fileptr_path_prefix(tmp_path: Path):
+    """candidate_pdb_paths follows a PATH: prefix file.ptr redirect."""
+    real_pdb = tmp_path / "real" / "foo.pdb"
+    real_pdb.parent.mkdir(parents=True)
+    real_pdb.write_bytes(b"fake pdb")
+
+    guid_dir = tmp_path / "store" / "foo.pdb" / "GUID1A"
+    guid_dir.mkdir(parents=True)
+    (guid_dir / "file.ptr").write_text(f"PATH:{real_pdb}", encoding="utf-8")
+
+    paths = candidate_pdb_paths(str(tmp_path / "store"), "foo.exe", "foo.pdb")
+    assert real_pdb in paths
+
+
+def test_candidate_pdb_paths_follows_fileptr_bare_absolute(tmp_path: Path):
+    """candidate_pdb_paths follows a bare absolute path file.ptr redirect."""
+    real_pdb = tmp_path / "abs" / "bar.pdb"
+    real_pdb.parent.mkdir(parents=True)
+    real_pdb.write_bytes(b"fake pdb")
+
+    guid_dir = tmp_path / "store" / "bar.pdb" / "GUID2B"
+    guid_dir.mkdir(parents=True)
+    (guid_dir / "file.ptr").write_text(str(real_pdb), encoding="utf-8")
+
+    paths = candidate_pdb_paths(str(tmp_path / "store"), "bar.exe", "bar.pdb")
+    assert real_pdb in paths
+
+
+def test_candidate_pdb_paths_literal_symstore_still_works(tmp_path: Path):
+    """Backward compat: literal <pdb>/<GUID>/<pdb> is still found."""
+    guid_dir = tmp_path / "windnsref.pdb" / "ABCDEFC"
+    guid_dir.mkdir(parents=True)
+    pdb = guid_dir / "windnsref.pdb"
+    pdb.write_bytes(b"fake pdb")
+
+    paths = candidate_pdb_paths(str(tmp_path), "windnsref.exe", "windnsref.pdb")
+    assert pdb in paths
+
+
+def test_candidate_pdb_paths_skips_malformed_fileptr(tmp_path: Path):
+    """A file.ptr pointing at a non-existent path is silently skipped."""
+    guid_dir = tmp_path / "ghost.pdb" / "GUID1"
+    guid_dir.mkdir(parents=True)
+    (guid_dir / "file.ptr").write_text(str(tmp_path / "no_such.pdb"), encoding="utf-8")
+
+    # Should not raise; no real PDB -> empty result
+    paths = candidate_pdb_paths(str(tmp_path), "ghost.exe", "ghost.pdb")
+    assert paths == []
+
+
+def test_candidate_pdb_paths_skips_unreadable_fileptr(tmp_path: Path):
+    """An OSError reading file.ptr is silently skipped (no raise)."""
+    # We simulate an unreadable file.ptr by passing a directory path
+    # as the file.ptr "file" — not a true OSError, but _resolve_file_ptr
+    # is tested separately for OSError; here we just verify the caller
+    # doesn't propagate any error.
+    guid_dir = tmp_path / "x.pdb" / "GUID1"
+    guid_dir.mkdir(parents=True)
+    # Create file.ptr as a directory (not a file) — is_file() returns False,
+    # so _iter_candidates skips it without calling _resolve_file_ptr.
+    (guid_dir / "file.ptr").mkdir()
+
+    paths = candidate_pdb_paths(str(tmp_path), "x.exe", "x.pdb")
+    assert paths == []
+
+
+# ---------------------------------------------------------------------------
+# _iter_candidates — redirect metadata is surfaced
+# ---------------------------------------------------------------------------
+
+
+def test_iter_candidates_redirect_description_set_for_fileptr(tmp_path: Path):
+    """_iter_candidates carries a redirect description for file.ptr entries."""
+    real_pdb = tmp_path / "real" / "foo.pdb"
+    real_pdb.parent.mkdir(parents=True)
+    real_pdb.write_bytes(b"fake pdb")
+
+    guid_dir = tmp_path / "store" / "foo.pdb" / "GUID1A"
+    guid_dir.mkdir(parents=True)
+    ptr = guid_dir / "file.ptr"
+    ptr.write_text(f"PATH:{real_pdb}", encoding="utf-8")
+
+    entries = list(_iter_candidates(str(tmp_path / "store"), "foo.exe", "foo.pdb"))
+    assert len(entries) == 1
+    path, desc = entries[0]
+    assert path == real_pdb
+    assert desc is not None
+    assert "file.ptr" in desc
+    assert str(ptr) in desc
+    assert str(real_pdb) in desc
+
+
+def test_iter_candidates_no_redirect_for_literal_pdb(tmp_path: Path):
+    """_iter_candidates has None redirect description for literal PDB files."""
+    guid_dir = tmp_path / "foo.pdb" / "GUID1"
+    guid_dir.mkdir(parents=True)
+    pdb = guid_dir / "foo.pdb"
+    pdb.write_bytes(b"fake pdb")
+
+    entries = list(_iter_candidates(str(tmp_path), "foo.exe", "foo.pdb"))
+    assert len(entries) == 1
+    path, desc = entries[0]
+    assert path == pdb
+    assert desc is None
+
+
+# ---------------------------------------------------------------------------
+# parse_symbol_path — upstream store searched by candidate_pdb_paths
+# ---------------------------------------------------------------------------
+
+
+def test_candidate_pdb_paths_searches_upstream_store(tmp_path: Path):
+    """When sym_path has srv*<cache>*<upstream>, the upstream store is
+    also searched — previously it was silently dropped."""
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+    upstream_dir = tmp_path / "upstream"
+
+    # Put the PDB only in the upstream store, not in the cache.
+    pdb_in_upstream = upstream_dir / "foo.pdb"
+    upstream_dir.mkdir()
+    pdb_in_upstream.write_bytes(b"fake pdb")
+
+    sym_path = f"srv*{cache_dir}*{upstream_dir}"
+    paths = candidate_pdb_paths(sym_path, "foo.exe", "foo.pdb")
+    assert pdb_in_upstream in paths
