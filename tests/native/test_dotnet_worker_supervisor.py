@@ -407,3 +407,77 @@ def test_native_worker_path_unchanged(tmp_path: Path):
     )
     assert request["mode"] == "native"
     assert request["schema_version"] == native_cache.SCHEMA_VERSION
+
+
+# ---------------------------------------------------------------------------
+# Regression: _promote_staging_cache robustness on Windows (M6 review).
+# Prior to the fix, staging_dir.rename(export_dir) had no retry and would
+# immediately propagate WinError 5 (PermissionError) on Windows when an AV
+# scanner or the search indexer held a file in staging_dir open transiently.
+# ---------------------------------------------------------------------------
+
+def test_promote_staging_cache_replaces_existing_export_dir(tmp_path: Path):
+    """promote replaces an existing export_dir instead of failing."""
+    staging = tmp_path / "staging"
+    export = tmp_path / "export"
+    staging.mkdir()
+    (staging / "data.parquet").write_bytes(b"new")
+    # Pre-populate export_dir with old data — simulate a stale cache that
+    # force=True deleted at the load_trace level but where an interrupted
+    # prior run left a directory behind.
+    export.mkdir()
+    (export / "old.parquet").write_bytes(b"old")
+
+    worker_supervisor._promote_staging_cache(staging, export)
+
+    assert export.exists()
+    assert (export / "data.parquet").read_bytes() == b"new"
+    assert not (export / "old.parquet").exists()
+    assert not staging.exists()
+
+
+def test_promote_staging_cache_retries_on_permission_error(tmp_path: Path, monkeypatch):
+    """promote retries Path.rename on PermissionError and succeeds eventually."""
+    staging = tmp_path / "staging"
+    export = tmp_path / "export"
+    staging.mkdir()
+    (staging / "data.parquet").write_bytes(b"payload")
+
+    call_count = [0]
+    _real_rename = Path.rename
+
+    def flaky_rename(self, target):
+        call_count[0] += 1
+        # Fail the first two rename calls with PermissionError to simulate
+        # Windows AV/indexer holding a file handle transiently.
+        if call_count[0] <= 2:
+            raise PermissionError(5, "Access is denied")
+        return _real_rename(self, target)
+
+    monkeypatch.setattr(Path, "rename", flaky_rename)
+    monkeypatch.setattr(worker_supervisor, "_PROMOTE_RENAME_BACKOFF_S", 0.0)
+
+    worker_supervisor._promote_staging_cache(staging, export)
+
+    assert export.exists()
+    assert (export / "data.parquet").read_bytes() == b"payload"
+    assert call_count[0] == 3  # failed twice, succeeded on third attempt
+
+
+def test_promote_staging_cache_raises_after_all_retries_exhausted(tmp_path: Path, monkeypatch):
+    """promote re-raises PermissionError when all retries are exhausted."""
+    import pytest
+    staging = tmp_path / "staging"
+    export = tmp_path / "export"
+    staging.mkdir()
+    (staging / "data.parquet").write_bytes(b"payload")
+
+    def always_fail(self, target):
+        raise PermissionError(5, "Access is denied")
+
+    monkeypatch.setattr(Path, "rename", always_fail)
+    monkeypatch.setattr(worker_supervisor, "_PROMOTE_RENAME_RETRIES", 2)
+    monkeypatch.setattr(worker_supervisor, "_PROMOTE_RENAME_BACKOFF_S", 0.0)
+
+    with pytest.raises(PermissionError):
+        worker_supervisor._promote_staging_cache(staging, export)
