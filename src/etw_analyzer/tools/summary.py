@@ -13,7 +13,7 @@ from etw_analyzer.trace_state import require_trace
 from etw_analyzer.tools.cpu_sampling import _get_sampling_df, _find_col
 from etw_analyzer.tools.system_info import _metadata_summary
 from etw_analyzer.formatting.markdown import format_table, format_pct
-from etw_analyzer.parsing.aggregator import group_and_sum
+from etw_analyzer.parsing.aggregator import apply_filters, group_and_sum
 
 
 @mcp.tool()
@@ -21,6 +21,7 @@ def analyze(
     trace_id: str,
     start_time: float | None = None,
     end_time: float | None = None,
+    filter_query: str | None = None,
 ) -> str:
     """Run a comprehensive analysis of the loaded trace and return a consolidated report.
 
@@ -32,6 +33,11 @@ def analyze(
         trace_id: ID returned by load_trace.
         start_time: Start of analysis window (seconds from trace start).
         end_time: End of analysis window (seconds from trace start).
+        filter_query: Optional module or process name filter (substring match).
+                      Narrows the hot functions section to rows whose Module
+                      column contains this string. E.g. 'tcpip.sys' or 'xdp'.
+                      When omitted, defaults to the standard networking-stack
+                      module set.
     """
     trace = require_trace(trace_id)
     sections: list[str] = []
@@ -146,19 +152,27 @@ def analyze(
     # 3. Hot functions (top 15)
     cpu_df = trace.raw_csv.get("cpu_sampling")
     if cpu_df is not None and not cpu_df.empty:
-        sections.append("## Hot Functions (networking stack)\n")
+        section_title = (
+            f"## Hot Functions (filter: {filter_query})\n"
+            if filter_query
+            else "## Hot Functions (networking stack)\n"
+        )
+        sections.append(section_title)
 
         weight_col = _find_col(cpu_df, ["Weight"]) or "Weight"
         module_col = _find_col(cpu_df, ["Module"]) or "Module"
         function_col = _find_col(cpu_df, ["Function"]) or "Function"
 
         from etw_analyzer.tools.cpu_sampling import _DEFAULT_HOT_MODULES
-        target = [m.lower() for m in _DEFAULT_HOT_MODULES]
 
         if module_col in cpu_df.columns:
-            filtered = cpu_df[cpu_df[module_col].str.lower().apply(
-                lambda m: any(t in m for t in target)
-            )]
+            if filter_query:
+                filtered = apply_filters(cpu_df, module_filter=filter_query, module_col=module_col)
+            else:
+                target = [m.lower() for m in _DEFAULT_HOT_MODULES]
+                filtered = cpu_df[cpu_df[module_col].str.lower().apply(
+                    lambda m: any(t in m for t in target)
+                )]
         else:
             filtered = cpu_df
 
@@ -212,6 +226,7 @@ def export_analysis(
     output_path: str,
     start_time: float | None = None,
     end_time: float | None = None,
+    filter_query: str | None = None,
 ) -> str:
     """Export the trace analysis to a markdown file for sharing.
 
@@ -224,11 +239,13 @@ def export_analysis(
         output_path: Path for the output .md file (e.g. 'C:\\traces\\analysis.md').
         start_time: Start of analysis window (seconds from trace start).
         end_time: End of analysis window (seconds from trace start).
+        filter_query: Optional module or process name filter (substring match).
+                      Forwarded to the underlying analysis — see analyze() for details.
     """
     trace = require_trace(trace_id)
 
     # Generate the analysis
-    content = analyze(trace_id=trace_id, start_time=start_time, end_time=end_time)
+    content = analyze(trace_id=trace_id, start_time=start_time, end_time=end_time, filter_query=filter_query)
 
     # Add metadata header
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
