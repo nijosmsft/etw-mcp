@@ -257,3 +257,34 @@ class TestAggregateCpuSampling:
         assert result is not None
         assert "Idle" not in result["Process Name"].tolist()
         assert len(result) == 1
+
+    def test_kernel_space_uint64_ip_resolves_correctly(self):
+        # Regression: kernel-space IPs are uint64 > 2^63.  An earlier
+        # implementation cast InstructionPointer to int64 before collecting
+        # unique IPs, producing negative Python ints as dict keys in
+        # ip_to_label.  The subsequent .map() call on the original uint64
+        # column then failed to find those keys (unsigned 0xFFFFF... !=
+        # signed negative), so every kernel-mode sample fell through to
+        # Module="unknown".  The fix: collect IPs via int() which always
+        # returns the unsigned numeric value regardless of dtype.
+        KERNEL_IP = 0xFFFFF8057E601000  # typical ntoskrnl.exe IP, > 2^63
+        import numpy as np
+        dumper = pd.DataFrame([
+            {"TimeStamp": 1, "Process Name": "System", "PID": 4, "CPU": 0,
+             "Weight": 100, "Module": "", "Function": ""},
+        ])
+        # Explicit uint64 dtype so the column matches what the sidecar emits.
+        dumper["InstructionPointer"] = pd.array([KERNEL_IP], dtype="uint64")
+        sym = _FakeSymbolizer({KERNEL_IP: "ntoskrnl.exe!KiDpcInterrupt+0x0"})
+        trace = _make_trace(dumper, symbolizer=sym)
+
+        result = aggregate_cpu_sampling(trace)
+
+        assert result is not None
+        ntos = result[result["Module"] == "ntoskrnl.exe"]
+        assert not ntos.empty, (
+            "ntoskrnl.exe must resolve; got modules: "
+            + str(result["Module"].tolist())
+        )
+        assert ntos.iloc[0]["Function"] == "KiDpcInterrupt"
+        assert ntos.iloc[0]["SymbolSource"] == "pdb"
