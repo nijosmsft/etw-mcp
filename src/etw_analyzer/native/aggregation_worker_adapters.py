@@ -688,6 +688,26 @@ def build_symbolizer_from_dotnet_images(trace) -> bool:
         except (TypeError, ValueError):
             size = 0
         file_name = str(row.get("FileName", "") or "")
+
+        # M2: extract PDB identity columns emitted by the M1 sidecar.
+        # Store them on trace.pdb_identity for M3's extended add_module.
+        # Seam: trace.pdb_identity[ImageBase] = {pdb_guid, pdb_age,
+        # pdb_name, time_date_stamp}.  M2 still calls 3-arg add_module.
+        pdb_guid = row.get("PdbGuid") or None
+        pdb_age_raw = row.get("PdbAge")
+        pdb_age = int(pdb_age_raw) if pdb_age_raw is not None and str(pdb_age_raw) not in ("", "nan") else None
+        pdb_name = row.get("PdbName") or None
+        tds_raw = row.get("TimeDateStamp")
+        time_date_stamp = int(tds_raw) if tds_raw is not None and str(tds_raw) not in ("", "nan") else None
+        if any(v is not None for v in (pdb_guid, pdb_age, pdb_name, time_date_stamp)):
+            if base not in trace.pdb_identity:
+                trace.pdb_identity[base] = {
+                    "pdb_guid": str(pdb_guid) if pdb_guid else None,
+                    "pdb_age": pdb_age,
+                    "pdb_name": str(pdb_name) if pdb_name else None,
+                    "time_date_stamp": time_date_stamp,
+                }
+
         try:
             symbolizer.add_module(base, size, file_name)
         except Exception:

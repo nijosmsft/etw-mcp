@@ -8,7 +8,7 @@ from typing import Any, Iterable
 import pyarrow as pa
 
 
-EVENT_SCHEMA_VERSION = 1
+EVENT_SCHEMA_VERSION = 2  # bumped in M2: image schema gains PdbGuid/PdbAge/PdbName/TimeDateStamp
 
 
 @dataclass(frozen=True)
@@ -230,6 +230,14 @@ EVENT_SCHEMAS: dict[str, EventSchema] = {
             pa.field("ImageSize", pa.uint64()),
             pa.field("FileName", pa.string()),
             pa.field("Type", pa.string()),
+            # M2: PDB identity columns threaded from sidecar RSDS events.
+            # Populated by the .NET sidecar (M1) and carried through Python
+            # schema to every add_module call site (M3 wires them to dbghelp).
+            # Rows with no matching RSDS event leave these null.
+            pa.field("TimeDateStamp", pa.int64()),
+            pa.field("PdbGuid", pa.string()),
+            pa.field("PdbAge", pa.int64()),
+            pa.field("PdbName", pa.string()),
         ],
     ),
     "readythread": _schema(

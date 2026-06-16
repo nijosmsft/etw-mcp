@@ -91,6 +91,10 @@ def _write_minimal_native_cache(
     }
     if schema_version >= 3:
         manifest["producer"] = producer
+        # M2: include event_schema_version so _load_native_v2_from_cache
+        # accepts this synthetic manifest as a current-schema cache.
+        from etw_analyzer.native.schemas import EVENT_SCHEMA_VERSION
+        manifest["event_schema_version"] = EVENT_SCHEMA_VERSION
 
     (cache_dir / native_cache.MANIFEST_FILENAME).write_text(
         json.dumps(manifest, indent=2),

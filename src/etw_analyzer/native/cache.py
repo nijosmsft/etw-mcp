@@ -7,6 +7,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from etw_analyzer.native.schemas import EVENT_SCHEMA_VERSION
+
 
 # NOTE: The on-disk filename intentionally retains the "wpr-mcp-" prefix
 # even after the v0.4 etw-mcp rename. Renaming it would silently
@@ -157,6 +159,14 @@ class CacheManifest:
     # Schema v3 adds the producer field. For legacy v2 manifests this
     # is back-filled to "native" (the only producer that wrote v2).
     producer: str = DEFAULT_LEGACY_PRODUCER
+    # M2: event_schema_version tracks the native image-parquet schema so
+    # _load_native_v2_from_cache can reject caches written before M2 (which
+    # lack PdbGuid/PdbAge/PdbName/TimeDateStamp columns).  Defaults to the
+    # current EVENT_SCHEMA_VERSION so every CacheManifest built in-process
+    # carries the correct value automatically; old on-disk manifests that
+    # were written without this field default to 0 on read (see from_dict)
+    # and are therefore treated as stale by the cache loader.
+    event_schema_version: int = EVENT_SCHEMA_VERSION
 
     @classmethod
     def materialized_small(
@@ -248,6 +258,9 @@ class CacheManifest:
                 else None
             ),
             producer=producer,
+            # Old manifests lack this field; default 0 means "unknown/pre-M2"
+            # so the cache loader treats them as stale.
+            event_schema_version=int(data.get("event_schema_version", 0)),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -257,6 +270,7 @@ class CacheManifest:
             "producer": self.producer,
             "strategy": self.strategy,
             "complete": self.complete,
+            "event_schema_version": self.event_schema_version,
             "etl": self.etl.to_dict(),
             "datasets": [dataset.to_dict() for dataset in self.datasets],
         }

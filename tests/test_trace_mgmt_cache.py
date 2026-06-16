@@ -8,6 +8,7 @@ import pandas as pd
 import pytest
 
 from etw_analyzer.native import cache as native_cache
+from etw_analyzer.native.schemas import EVENT_SCHEMA_VERSION
 import etw_analyzer.native.config as native_config
 import etw_analyzer.parsing.wpa_exporter as wpa_exporter
 import etw_analyzer.tools.trace_mgmt as trace_mgmt
@@ -231,12 +232,18 @@ def test_legacy_xperf_cache_without_manifest_still_loads(tmp_path: Path):
     assert trace_mgmt._load_from_cache(cache, etl, mode="native") is None
 
 
-def test_legacy_native_v1_manifest_cache_still_loads(tmp_path: Path):
+def test_legacy_v1_manifest_without_event_schema_version_rejected(tmp_path: Path):
+    """M2: a flat native manifest that lacks event_schema_version is treated as
+    stale and must NOT rehydrate.  This enforces that caches written before the
+    image-identity schema bump (PdbGuid/PdbAge/PdbName/TimeDateStamp) are
+    re-extracted rather than silently loaded with missing identity columns.
+    """
     etl = _make_etl(tmp_path)
     cache = _cache_dir(etl)
     _cpu_sampling(cache, weight=17)
     _write_native_dumper_cache(cache)
     required_stems = sorted(stem for _, stem in trace_mgmt._DUMPER_EVENT_CLASSES.values())
+    # Deliberately omit event_schema_version to simulate a pre-M2 cache.
     manifest = {
         "schema_version": trace_mgmt._CACHE_SCHEMA_VERSION,
         "mode": "native",
@@ -254,8 +261,10 @@ def test_legacy_native_v1_manifest_cache_still_loads(tmp_path: Path):
 
     cached = trace_mgmt._load_from_cache(cache, etl, mode="native")
 
-    assert cached is not None
-    assert cached["cpu_sampling"]["Weight"].tolist() == [17]
+    assert cached is None, (
+        "pre-M2 cache lacking event_schema_version must be rejected and "
+        "trigger re-extraction; got a non-None result"
+    )
 
 
 def test_dumper_cache_stems_are_manifest_mode_scoped(tmp_path: Path):
@@ -389,3 +398,76 @@ def test_native_rejects_non_default_timeout(monkeypatch, tmp_path: Path):
 
     assert "timeout_seconds is only supported for mode='xperf'" in result
     assert list_loaded_trace_ids() == []
+
+
+# ---------------------------------------------------------------------------
+# M2: event_schema_version invalidation tests
+# ---------------------------------------------------------------------------
+
+def test_native_v2_manifest_without_event_schema_version_rejected(tmp_path: Path):
+    """M2: a native v2/v3 manifest that lacks event_schema_version (field absent
+    or value 0) must be treated as stale and cause _load_from_cache to return
+    None.  This validates that caches written before the PDB-identity schema
+    bump are rejected and trigger re-extraction.
+    """
+    etl = _make_etl(tmp_path)
+    cache = _cache_dir(etl)
+    _cpu_sampling(cache, weight=55)
+    _write_native_dumper_cache(cache)
+    datasets = [
+        native_cache.CacheDataset(
+            name="cpu_sampling",
+            kind="parquet",
+            path="cpu_sampling.parquet",
+            row_count=1,
+            materialize_on_load=True,
+        )
+    ]
+    for _, stem in trace_mgmt._DUMPER_EVENT_CLASSES.values():
+        datasets.append(native_cache.CacheDataset(
+            name=stem,
+            kind="dumper-parquet",
+            path=f"{stem}.parquet",
+            row_count=0,
+            materialize_on_load=False,
+        ))
+    # Write a valid v3 manifest, then remove event_schema_version to simulate
+    # a pre-M2 cache (CacheManifest.from_dict defaults missing field to 0).
+    manifest = native_cache.CacheManifest.materialized_small(etl, datasets)
+    native_cache.write_manifest(cache, manifest)
+    # Patch the written JSON: remove event_schema_version.
+    import json as _json
+    manifest_path = native_cache.manifest_path(cache)
+    data = _json.loads(manifest_path.read_text(encoding="utf-8"))
+    data.pop("event_schema_version", None)
+    manifest_path.write_text(_json.dumps(data, indent=2), encoding="utf-8")
+
+    cached = trace_mgmt._load_from_cache(cache, etl, mode="native")
+
+    assert cached is None, (
+        "native v2/v3 manifest without event_schema_version must be rejected"
+    )
+
+
+def test_native_v2_manifest_with_correct_event_schema_version_loads(tmp_path: Path):
+    """M2: a native manifest that includes the correct EVENT_SCHEMA_VERSION is
+    accepted and data rehydrates successfully.
+    """
+    etl = _make_etl(tmp_path)
+    cache = _cache_dir(etl)
+    df = _cpu_sampling(cache, weight=77)
+    _write_native_dumper_cache(cache)
+    trace_mgmt._write_cache_manifest(cache, etl, "native", {"cpu_sampling": df})
+
+    # Verify the written manifest carries the current event_schema_version.
+    import json as _json
+    data = _json.loads(trace_mgmt._cache_manifest_path(cache).read_text(encoding="utf-8"))
+    assert data.get("event_schema_version") == EVENT_SCHEMA_VERSION, (
+        f"manifest must carry event_schema_version={EVENT_SCHEMA_VERSION}, "
+        f"got {data.get('event_schema_version')!r}"
+    )
+
+    cached = trace_mgmt._load_from_cache(cache, etl, mode="native")
+
+    assert cached is not None, "valid manifest with correct event_schema_version must load"
+    assert cached["cpu_sampling"]["Weight"].tolist() == [77]

@@ -26,6 +26,7 @@ from etw_analyzer.parsing.wpa_exporter import (
 )
 from etw_analyzer.parsing.csv_loader import load_csv
 from etw_analyzer.formatting.markdown import format_table
+from etw_analyzer.native.schemas import EVENT_SCHEMA_VERSION as _EVENT_SCHEMA_VERSION
 
 import pandas as pd
 
@@ -1217,6 +1218,25 @@ def _build_symbolizer_from_images(
         seen_bases.add(base)
         size = int(row.get("ImageSize", 0) or 0)
         file_name = str(row.get("FileName", "") or "")
+
+        # M2: extract PDB identity columns present since M1 sidecar output.
+        # Store them on trace.pdb_identity for M3's extended add_module call.
+        # Still call the existing 3-arg add_module here; M3 extends it.
+        pdb_guid = row.get("PdbGuid") or None
+        pdb_age_raw = row.get("PdbAge")
+        pdb_age = int(pdb_age_raw) if pdb_age_raw is not None and str(pdb_age_raw) not in ("", "nan") else None
+        pdb_name = row.get("PdbName") or None
+        tds_raw = row.get("TimeDateStamp")
+        time_date_stamp = int(tds_raw) if tds_raw is not None and str(tds_raw) not in ("", "nan") else None
+        if any(v is not None for v in (pdb_guid, pdb_age, pdb_name, time_date_stamp)):
+            if base not in trace.pdb_identity:
+                trace.pdb_identity[base] = {
+                    "pdb_guid": str(pdb_guid) if pdb_guid else None,
+                    "pdb_age": pdb_age,
+                    "pdb_name": str(pdb_name) if pdb_name else None,
+                    "time_date_stamp": time_date_stamp,
+                }
+
         try:
             symbolizer.add_module(base, size, file_name)
         except Exception:
@@ -1873,6 +1893,7 @@ def _write_cache_manifest(
 
     manifest = {
         "schema_version": _CACHE_SCHEMA_VERSION,
+        "event_schema_version": _EVENT_SCHEMA_VERSION,
         "mode": mode,
         "complete": True,
         **identity,
@@ -1989,6 +2010,11 @@ def _load_native_v2_from_cache(
     mode: str,
     manifest_data: dict,
 ) -> dict[str, pd.DataFrame] | None:
+    # M2: reject caches written before the image-identity schema bump.
+    # CacheManifest.from_dict defaults event_schema_version to 0 when the
+    # field is absent; old caches therefore never match the current version.
+    if manifest_data.get("event_schema_version", 0) != _EVENT_SCHEMA_VERSION:
+        return None
     try:
         from etw_analyzer.native import cache as native_cache
         from etw_analyzer.native.event_store import (
@@ -2112,6 +2138,10 @@ def _load_from_cache(
         manifest_datasets: set[str] | None = None
     else:
         if manifest.get("schema_version") != _CACHE_SCHEMA_VERSION:
+            return None
+        # M2: reject caches written before the image-identity schema bump.
+        # Old manifests lack event_schema_version; default 0 != current version.
+        if manifest.get("event_schema_version", 0) != _EVENT_SCHEMA_VERSION:
             return None
         if manifest.get("mode") != mode:
             return None

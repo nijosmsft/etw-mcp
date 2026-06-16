@@ -76,6 +76,7 @@ class _FakeTrace:
         self.raw_csv = raw_csv
         self.symbolizer = None
         self.symbol_path = None
+        self.pdb_identity: dict = {}
 
 
 # ---------------------------------------------------------------------------

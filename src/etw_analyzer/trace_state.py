@@ -112,6 +112,13 @@ class TraceData:
     # when resolving SampledProfile stacks.
     symbolizer: Any = field(default=None, repr=False)
 
+    # M2: per-ImageBase PDB identity stashed by the three
+    # _build_symbolizer_from_images helpers so M3 can pass exact
+    # GUID/Age/Name to the extended add_module without re-reading parquets.
+    # Key: ImageBase (int); value: dict with keys
+    # pdb_guid, pdb_age, pdb_name, time_date_stamp (each may be None).
+    pdb_identity: dict[int, dict] = field(default_factory=dict, repr=False)
+
     # Phase 3 native large-ETL scaffolding: optional chunked event store.
     # This is opened from native cache-v2 manifests and is intentionally
     # separate from ``raw_csv`` so event chunks are not materialized on load.
