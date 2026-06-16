@@ -26,6 +26,7 @@ from etw_analyzer.tools.symbol_diagnostics import (
     _iter_candidates,
     _resolve_file_ptr,
     candidate_pdb_paths,
+    classify_pdb_container,
     clean_stale_symbol_files,
     diagnose_symbol_load,
     parse_symbol_path,
@@ -663,6 +664,20 @@ def test_iter_candidates_no_redirect_for_literal_pdb(tmp_path: Path):
     assert desc is None
 
 
+def test_classify_pdb_container_identifies_msfz_msf7_and_unknown(tmp_path: Path):
+    msfz = tmp_path / "msfz.pdb"
+    msfz.write_bytes(b"Microsoft MSFZ Container" + b"\x00" * 40)
+    assert classify_pdb_container(msfz) == "msfz"
+
+    msf7 = tmp_path / "msf7.pdb"
+    msf7.write_bytes(b"Microsoft C/C++ MSF 7.00\r\n\x1aDS\x00\x00" + b"\x00" * 32)
+    assert classify_pdb_container(msf7) == "msf7"
+
+    unknown = tmp_path / "unknown.pdb"
+    unknown.write_bytes(b"not a pdb" + b"\x00" * 55)
+    assert classify_pdb_container(unknown) == "unknown"
+
+
 # ---------------------------------------------------------------------------
 # parse_symbol_path — upstream store searched by candidate_pdb_paths
 # ---------------------------------------------------------------------------
@@ -854,3 +869,50 @@ def test_diagnose_trace_pdb_name_used_in_candidate_search(tmp_path: Path):
 
     # The trace PDB name (ntkrnlmp.pdb) must appear in the candidate search section.
     assert "ntkrnlmp.pdb" in out
+
+
+def test_diagnose_msfz_candidate_with_old_dbghelp_names_root_cause(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    trace = _register_trace_with_image(
+        tmp_path,
+        [
+            {
+                "FileName": r"\Windows\System32\ntoskrnl.exe",
+                "ImageBase": 0xFFFFF8057E600000,
+                "ImageSize": 0x900000,
+                "PdbGuid": _TRACE_GUID_UUID,
+                "PdbAge": 1,
+                "PdbName": "ntkrnlmp.pdb",
+                "TimeDateStamp": 0x6471A2C0,
+            }
+        ],
+        trace_id="trace_diag_msfz",
+    )
+    disk_exe = tmp_path / "ntoskrnl.exe"
+    disk_exe.write_bytes(_make_pe_with_rsds(_TRACE_PE_BYTES, age=1, pdb_path="ntkrnlmp.pdb"))
+
+    symbols = tmp_path / "symbols"
+    symbols.mkdir()
+    (symbols / "ntkrnlmp.pdb").write_bytes(
+        b"Microsoft MSFZ Container\r\n\x1aALD\x00\x00" + b"\x00" * 32
+    )
+    monkeypatch.setattr(
+        "etw_analyzer.tools.symbol_diagnostics._loaded_dbghelp_info",
+        lambda: (r"C:\Windows\System32\dbghelp.dll", "10.0.26100.8328", False),
+    )
+
+    out = diagnose_symbol_load(
+        trace.trace_id,
+        "ntoskrnl.exe",
+        exe_path=str(disk_exe),
+        extra_symbol_paths=[str(symbols)],
+    )
+
+    assert "Symbolizer dbghelp" in out
+    assert "10.0.26100.8328" in out
+    assert "MSFZ-capable: no" in out
+    assert "MSFZ-compressed PDB (GUID requires MSFZ-capable dbghelp)" in out
+    assert "ETW_MCP_DBGHELP" in out
+    assert "ETW_MCP_SYMSRV" in out
