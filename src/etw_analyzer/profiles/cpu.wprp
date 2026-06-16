@@ -18,12 +18,27 @@
 
     No EventProviders. No Strict="true". Hard-coded 0x7FFFFFFFFFFFFFFF for
     any future keyword fields, never all-bits-set (downlevel WPR bug).
+
+    Buffer sizing note (Bug E - Server 2025 29614):
+      The SystemCollector is intentionally sized at 320 x 4096 KB = 1.28 GB,
+      matching all other etw-mcp profiles.  The original 128 x 1024 KB (128 MB)
+      allocation is insufficient on 80-CPU Server 2025 boxes: with only ~1.6
+      buffers per CPU at session start, the kernel Image/DCStart + ProcessThread
+      rundown burst can exhaust the initial buffer pool before the file-mode
+      consumer drains it, silently dropping the rundown events.  The ETW
+      minimum-buffers recommendation is >= 2 x NumberOfProcessors; on an
+      80-CPU host that is 160 -- below the old 128 value.
 -->
 <WindowsPerformanceRecorder Version="1.0" Author="etw-mcp" Company="etw-mcp">
     <Profiles>
         <SystemCollector Id="SystemCollector_Cpu" Name="NT Kernel Logger">
-            <BufferSize Value="1024"/>
-            <Buffers Value="128"/>
+            <!--
+                4096 KB x 320 = 1.28 GB initial allocation matches the other
+                etw-mcp profiles and provides sufficient headroom for the
+                Image/DCStart rundown burst on busy Server 2025 boxes.
+            -->
+            <BufferSize Value="4096"/>
+            <Buffers Value="320"/>
         </SystemCollector>
 
         <SystemProvider Id="SystemProvider_Cpu">
@@ -46,4 +61,24 @@
             </Collectors>
         </Profile>
     </Profiles>
+
+    <!--
+        TraceMergeProperties: inject per-image PE + RSDS identity at wpr -stop.
+
+        CustomEvent "ImageId" causes WPR to walk every module visible at merge
+        time and emit ImageID/DbgID_RSDS records (event-class GUID b3e675d7...)
+        into the final merged ETL.  This is the same injection the built-in WPR
+        "CPU" profile performs via its hardcoded merge properties; it ensures the
+        etw-mcp consumer can resolve kernel modules even when the live
+        Image/DCStart rundown events were dropped during capture (Bug E --
+        Server 2025 build 29614 does not inject these by default for custom
+        .wprp files lacking this section).
+    -->
+    <TraceMergeProperties>
+        <TraceMergeProperty Id="TraceMerge_Default" Name="TraceMerge_Default">
+            <CustomEvents>
+                <CustomEvent Value="ImageId"/>
+            </CustomEvents>
+        </TraceMergeProperty>
+    </TraceMergeProperties>
 </WindowsPerformanceRecorder>

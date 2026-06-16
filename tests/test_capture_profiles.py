@@ -282,3 +282,60 @@ def test_profiles_table_invariants():
         assert meta.capture_tool == "wpr"
         # Smoke-load to make sure the resource is wheel-visible.
         assert load_wprp_text(scenario)
+
+
+# ---------------------------------------------------------------------------
+# Bug E -- Server 2025 build 29614 rundown-drop fixes
+# ---------------------------------------------------------------------------
+
+
+def test_cpu_wprp_system_collector_buffering():
+    """cpu.wprp must use 4096 KB x 320 buffers = 1.28 GB for the SystemCollector.
+
+    The original 128 x 1024 KB (128 MB) allocation was dangerously
+    underprovisioned for an 80-CPU Server 2025 box: ~1.6 buffers/CPU at
+    session start is below the ETW minimum-buffers recommendation of
+    >= 2 x NumberOfProcessors, causing the Image/DCStart rundown burst to
+    be dropped silently before the file-mode consumer can drain the ring.
+    """
+    import re
+
+    xml = load_wprp_text("cpu")
+    # Strip comments so we only test the live XML, not comment prose.
+    xml_no_comments = re.sub(r"<!--.*?-->", "", xml, flags=re.DOTALL)
+    assert '<BufferSize Value="4096"/>' in xml_no_comments, (
+        "cpu.wprp SystemCollector must use BufferSize 4096 KB (was 1024 KB) "
+        "to provide sufficient initial buffer headroom for the DCStart rundown "
+        "on Server 2025 boxes with 80+ CPUs."
+    )
+    assert '<Buffers Value="320"/>' in xml_no_comments, (
+        "cpu.wprp SystemCollector must use 320 buffers (was 128) to meet the "
+        "ETW recommendation of >= 2 x NumberOfProcessors on 80-CPU servers."
+    )
+
+
+@pytest.mark.parametrize("scenario", _WPR_SCENARIOS)
+def test_wprp_has_tracemergeproperty_imageid(scenario):
+    """Every WPR profile must include TraceMergeProperties / CustomEvent ImageId.
+
+    The built-in WPR 'CPU' profile injects ImageID/DbgID_RSDS records at
+    wpr -stop via its hardcoded merge properties, which is why traces captured
+    with it contain the RSDS identity (13 104 events in the reference trace).
+    Custom .wprp files on Windows Server 2025 build 29614 do NOT receive this
+    injection by default; without TraceMergeProperties the final merged ETL
+    lacks the image-identity records that the etw-mcp consumer relies on for
+    kernel symbolization (Bug E).
+    """
+    import re
+
+    xml = load_wprp_text(scenario)
+    # Strip comments to avoid matching comment prose about the rationale.
+    xml_no_comments = re.sub(r"<!--.*?-->", "", xml, flags=re.DOTALL)
+    assert "<TraceMergeProperties>" in xml_no_comments, (
+        f"{scenario}.wprp is missing <TraceMergeProperties>; without it WPR "
+        "on Server 2025 does not inject ImageID/DbgID_RSDS at merge time."
+    )
+    assert '<CustomEvent Value="ImageId"/>' in xml_no_comments, (
+        f"{scenario}.wprp TraceMergeProperties must include "
+        '<CustomEvent Value="ImageId"/> to ensure RSDS records land in the ETL.'
+    )
