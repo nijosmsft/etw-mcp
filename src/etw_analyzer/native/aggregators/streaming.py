@@ -526,6 +526,46 @@ def _load_dimensions(store: "NativeEventStore", *, batch_size: int) -> _Dimensio
                     "pdb_name": str(pdb_name) if pdb_name else None,
                     "time_date_stamp": tds,
                 }
+
+    # M5: read ImageID/DbgID_RSDS records and merge PDB identity into
+    # image_index.pdb_identity for bases the image-row pass left blank.
+    # Graceful for old event stores that lack "imageid_rsds": iter_batches
+    # returns immediately with no data (returns [] or empty batches).
+    rsds_fallback: dict[int, dict] = {}
+    for batch in store.iter_batches(
+        "imageid_rsds",
+        columns=["ProcessId", "ImageBase", "PdbGuid", "PdbAge", "PdbName"],
+        include_time=False,
+        batch_size=batch_size,
+    ):
+        if batch.empty:
+            continue
+        for row in batch.to_dict(orient="records"):
+            base_i = _safe_int(row.get("ImageBase"))
+            if base_i is None or base_i == 0:
+                continue
+            if base_i not in rsds_fallback:
+                rsds_fallback[base_i] = row
+
+    if rsds_fallback:
+        for interval in image_index.intervals:
+            base_i = interval.base
+            if base_i in image_index.pdb_identity:
+                continue
+            rsds = rsds_fallback.get(base_i)
+            if rsds is None:
+                continue
+            pdb_guid = rsds.get("PdbGuid") or None
+            pdb_age = _safe_int(rsds.get("PdbAge"))
+            pdb_name = rsds.get("PdbName") or None
+            if pdb_guid or pdb_name:
+                image_index.pdb_identity[base_i] = {
+                    "pdb_guid": str(pdb_guid) if pdb_guid else None,
+                    "pdb_age": pdb_age,
+                    "pdb_name": str(pdb_name) if pdb_name else None,
+                    "time_date_stamp": None,
+                }
+
     image_index.finalize()
 
     process_table = _process_table_from_rows(process_rows)

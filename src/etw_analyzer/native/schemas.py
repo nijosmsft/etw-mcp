@@ -240,6 +240,25 @@ EVENT_SCHEMAS: dict[str, EventSchema] = {
             pa.field("PdbName", pa.string()),
         ],
     ),
+    # M5: ImageID/DbgID_RSDS records carry PDB signature data (GUID, Age,
+    # PdbName).  These are stored in a separate dataset so they can survive in
+    # the event store independently of the "image" load/unload rows and be
+    # joined back at symbolizer-build time.  PdbFullPath is the raw field
+    # (potentially a full build path); PdbName is the basename.
+    "imageid_rsds": _schema(
+        "imageid_rsds",
+        [
+            pa.field("EventSequence", pa.uint64()),
+            pa.field("TimeStampQpc", pa.int64()),
+            pa.field("CPU", pa.int32()),
+            pa.field("ProcessId", pa.int64()),
+            pa.field("ImageBase", pa.uint64()),
+            pa.field("PdbGuid", pa.string()),
+            pa.field("PdbAge", pa.int64()),
+            pa.field("PdbName", pa.string()),
+            pa.field("PdbFullPath", pa.string()),
+        ],
+    ),
     "readythread": _schema(
         "readythread",
         [
@@ -373,6 +392,10 @@ _EVENT_CLASS_ALIAS_SETS: dict[str, tuple[str, ...]] = {
     ),
     "image": (
         "Image/Load", "Image/Unload", "Image/DCStart", "Image/DCEnd", "image",
+    ),
+    "imageid_rsds": (
+        "ImageID/DbgID_RSDS", "ImageID_DbgID_RSDS",
+        "ImageID/DbgIDRSDS", "imageid_rsds",
     ),
     "readythread": (
         "ReadyThread", "Thread/ReadyThread", "Thread/Ready",

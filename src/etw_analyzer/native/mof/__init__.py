@@ -30,7 +30,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from . import diskio, eventtrace, fileio, imageload, perfinfo, process
+from . import diskio, eventtrace, fileio, imageid, imageload, perfinfo, process
 from . import stackwalk, sysconfig, thread
 
 
@@ -51,6 +51,7 @@ _MODULES = (
     thread,
     process,
     imageload,
+    imageid,        # M5: ImageID/DbgID_RSDS rundown (PDB identity)
     diskio,
     fileio,
     eventtrace,
