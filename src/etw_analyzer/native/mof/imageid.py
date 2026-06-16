@@ -1,7 +1,16 @@
 """Binary MOF decoders for the ImageID/DbgID_RSDS provider.
 
-Provider GUID: ``b059b83f-d946-4b13-87ca-4292839dc2f2``
-(``Microsoft-Windows-Kernel-ImageID``)
+Provider GUID (EVENT_RECORD ProviderId): ``b3e675d7-2554-4f18-830b-2762732560de``
+
+This is the event-class GUID that Windows places in ``EventHeader.ProviderId``
+when delivering ImageID events through the kernel logger session under
+``PROCESS_TRACE_MODE_EVENT_RECORD``.  It differs from the manifest provider
+GUID ``b059b83f-d946-4b13-87ca-4292839dc2f2``
+(``Microsoft-Windows-Kernel-ImageID``) which is the GUID used by
+``wevtutil``/``EventRegister`` but is NOT the GUID seen in the EVENT_RECORD
+callback.  The probe on ``wpa5-1M-260615-143816.etl`` confirmed:
+  ProviderId in callback == b3e675d7...  (13 104 events)
+  ProviderId b059b83f...               == 0 events
 
 This provider emits per-image PDB debug-signature records that the kernel
 image-rundown logs at trace start.  The ``DbgID_RSDS`` opcode (36) carries
@@ -19,23 +28,30 @@ Decoded events:
 | 36     | ImageID/DbgID_RSDS       |
 +--------+--------------------------+
 
-``DbgID_RSDS`` payload layout (28-byte fixed prefix + null-terminated string)::
+``DbgID_RSDS`` payload layout (32-byte fixed prefix + null-terminated string)::
 
-    ImageBase   uint64     8 bytes  -- load address of the image
-    Guid        16 bytes   16 bytes -- Data1=u32LE, Data2=u16LE,
-                                       Data3=u16LE, Data4[8]=bytes
-    Age         uint32     4 bytes
-    PdbFileName variable   null-terminated ASCII/UTF-8
+    ImageBase   uint64     offset  0, 8 bytes -- load address of the image
+    Reserved    uint32     offset  8, 4 bytes -- always 0 for kernel images;
+                                                 may carry ProcessId for
+                                                 user-mode images (version 2)
+    Guid        16 bytes   offset 12, 16 bytes -- Data1=u32LE, Data2=u16LE,
+                                                  Data3=u16LE, Data4[8]=bytes
+    Age         uint32     offset 28, 4 bytes
+    PdbFileName variable   offset 32, null-terminated ASCII/UTF-8
                            (may be a full build path -- use basename only)
 
 ``ProcessId`` comes from the event header (EventHeader.ProcessId), not from
 the payload.  For kernel images this is typically 0 or 4 (System).
 
-Payload layout confirmed against the reference ETL
-(``wpa5-1M-260615-143816.etl``, first decoded record):
-  base=0xfffff8057e600000, GUID=AFB1E3B1-3754-8BA7-3B92-C060D6D5605F,
-  age=1, pdb=ntkrnlmp.pdb
-Synthetic bytes for this record reproduce the same values via unit tests.
+Payload layout confirmed by raw-byte probe on the reference ETL
+(``wpa5-1M-260615-143816.etl``, opcode=36 version=2, first record):
+  offset 0-7:   0000607e05f8ffff  (ImageBase  = 0xfffff8057e600000)
+  offset 8-11:  00000000          (Reserved   = 0)
+  offset 12-27: b1e3b1af5437a78b3b92c060d6d5605f
+                                  (GUID LE    = AFB1E3B1-3754-8BA7-3B92-C060D6D5605F)
+  offset 28-31: 01000000          (Age        = 1)
+  offset 32+:   6e746b726e6c6d702e70646200
+                                  (PdbFileName = "ntkrnlmp.pdb")
 """
 
 from __future__ import annotations
@@ -45,10 +61,10 @@ from pathlib import Path
 from typing import Optional
 
 
-PROVIDER_GUID = "b059b83f-d946-4b13-87ca-4292839dc2f2"
+PROVIDER_GUID = "b3e675d7-2554-4f18-830b-2762732560de"
 
-# ImageBase (u64) + GUID (16 bytes) + Age (u32) = 28 bytes.
-_FIXED_PREFIX = 8 + 16 + 4
+# ImageBase (u64) + Reserved (u32) + GUID (16 bytes) + Age (u32) = 32 bytes.
+_FIXED_PREFIX = 8 + 4 + 16 + 4
 
 # A 16-byte all-zero GUID is invalid (no real PDB has it).
 _ZERO_GUID = bytes(16)
@@ -91,8 +107,9 @@ def decode_dbgid_rsds(payload: bytes, hdr: dict) -> Optional[dict]:
         return None
 
     image_base = struct.unpack_from("<Q", payload, 0)[0]
-    guid_bytes = payload[8:24]
-    age = struct.unpack_from("<I", payload, 24)[0]
+    # 4-byte Reserved field at offset 8; skip it.
+    guid_bytes = payload[12:28]
+    age = struct.unpack_from("<I", payload, 28)[0]
 
     if guid_bytes == _ZERO_GUID:
         return None

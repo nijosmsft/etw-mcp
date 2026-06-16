@@ -48,13 +48,19 @@ _NTOSKRNL_PDB        = "ntkrnlmp.pdb"
 
 
 def _build_ntoskrnl_payload(pdb_name: bytes = b"ntkrnlmp.pdb\x00") -> bytes:
-    """Construct a synthetic DbgID_RSDS payload matching the reference record."""
+    """Construct a synthetic DbgID_RSDS payload matching the reference record.
+
+    Layout: ImageBase(8) + Reserved(4) + GUID(16) + Age(4) + PdbFileName.
+    The 4-byte Reserved field is zero for kernel images (version 2 on-wire layout
+    confirmed by raw-byte probe on wpa5-1M-260615-143816.etl).
+    """
     return (
-        struct.pack("<Q", _NTOSKRNL_IMAGE_BASE)          # ImageBase
-        + struct.pack("<IHH", 0xAFB1E3B1, 0x3754, 0x8BA7)  # GUID Data1/2/3 LE
-        + bytes([0x3B, 0x92, 0xC0, 0x60, 0xD6, 0xD5, 0x60, 0x5F])  # Data4
-        + struct.pack("<I", _NTOSKRNL_AGE)                # Age
-        + pdb_name                                        # PdbFileName
+        struct.pack("<Q", _NTOSKRNL_IMAGE_BASE)          # ImageBase  (offset 0)
+        + struct.pack("<I", 0)                            # Reserved   (offset 8, always 0)
+        + struct.pack("<IHH", 0xAFB1E3B1, 0x3754, 0x8BA7)  # GUID Data1/2/3 LE (offset 12)
+        + bytes([0x3B, 0x92, 0xC0, 0x60, 0xD6, 0xD5, 0x60, 0x5F])  # Data4 (offset 20)
+        + struct.pack("<I", _NTOSKRNL_AGE)                # Age        (offset 28)
+        + pdb_name                                        # PdbFileName (offset 32)
     )
 
 
@@ -173,21 +179,22 @@ def test_too_short_payload_returns_none():
     assert decode_dbgid_rsds(b"\x00" * 10, _NTOSKRNL_HDR) is None
 
 
-def test_exactly_27_bytes_returns_none():
-    """One byte short of the 28-byte fixed prefix must return None."""
-    assert decode_dbgid_rsds(b"\x01" * 27, _NTOSKRNL_HDR) is None
+def test_exactly_31_bytes_returns_none():
+    """One byte short of the 32-byte fixed prefix must return None."""
+    assert decode_dbgid_rsds(b"\x01" * 31, _NTOSKRNL_HDR) is None
 
 
-def test_exactly_28_bytes_with_empty_pdb_name():
-    """28 bytes (no PdbFileName bytes at all) is valid -- empty PdbName."""
+def test_exactly_32_bytes_with_empty_pdb_name():
+    """32 bytes (no PdbFileName bytes at all) is valid -- empty PdbName."""
     payload = (
         struct.pack("<Q", _NTOSKRNL_IMAGE_BASE)
+        + struct.pack("<I", 0)                            # Reserved
         + struct.pack("<IHH", 0xAFB1E3B1, 0x3754, 0x8BA7)
         + bytes([0x3B, 0x92, 0xC0, 0x60, 0xD6, 0xD5, 0x60, 0x5F])
         + struct.pack("<I", _NTOSKRNL_AGE)
         # No PdbFileName bytes
     )
-    assert len(payload) == 28
+    assert len(payload) == 32
     row = decode_dbgid_rsds(payload, _NTOSKRNL_HDR)
     # The GUID is valid so the row is produced with empty PdbName.
     assert row is not None
@@ -202,6 +209,7 @@ def test_zero_guid_returns_none():
     """All-zero GUID is not a valid PDB identity."""
     payload = (
         struct.pack("<Q", _NTOSKRNL_IMAGE_BASE)
+        + struct.pack("<I", 0)    # Reserved
         + bytes(16)               # zero GUID
         + struct.pack("<I", 1)    # Age
         + b"fake.pdb\x00"
@@ -229,7 +237,11 @@ def test_handlers_fn_is_callable():
 
 
 def test_provider_guid_value():
-    assert PROVIDER_GUID == "b059b83f-d946-4b13-87ca-4292839dc2f2"
+    # M5b fix: the actual EVENT_RECORD ProviderId for ImageID kernel events is
+    # b3e675d7-..., NOT b059b83f-... (the manifest provider GUID).
+    # Confirmed by raw-byte probe on wpa5-1M-260615-143816.etl: 13104 events
+    # under b3e675d7, 0 events under b059b83f.
+    assert PROVIDER_GUID == "b3e675d7-2554-4f18-830b-2762732560de"
 
 
 def test_handler_dispatches_correctly():
@@ -398,3 +410,76 @@ def test_kernel_images_not_filtered_by_pid_in_merge():
     assert len(rows_by_class["Image/Load"]) == len(pids)
     for i, row in enumerate(rows_by_class["Image/Load"]):
         assert row["PdbGuid"] == _NTOSKRNL_GUID_STR, f"Row {i} lost PdbGuid"
+
+
+# ---------------------------------------------------------------------------
+# 9. Dispatch-path regression (M5b fix)
+#    Verify that the corrected PROVIDER_GUID causes the event to route through
+#    the MOF dispatch table and produce the correct PDB identity.
+# ---------------------------------------------------------------------------
+
+def test_dispatch_guid_is_correct_event_class_guid():
+    """PROVIDER_GUID must be the event-class GUID seen in EVENT_RECORD.ProviderId.
+
+    b3e675d7-2554-4f18-830b-2762732560de is the GUID confirmed by raw-byte
+    probe (13 104 events).  b059b83f-... is the manifest provider GUID which
+    yields 0 events in the callback.
+    """
+    assert PROVIDER_GUID == "b3e675d7-2554-4f18-830b-2762732560de"
+    assert PROVIDER_GUID != "b059b83f-d946-4b13-87ca-4292839dc2f2"
+
+
+def test_dispatch_table_contains_correct_guid():
+    """_DISPATCH must have an entry keyed on (b3e675d7-..., 36, None)."""
+    from etw_analyzer.native.extract import _DISPATCH
+
+    key = ("b3e675d7-2554-4f18-830b-2762732560de", 36, None)
+    assert key in _DISPATCH, (
+        "ImageID/DbgID_RSDS not reachable: b3e675d7-... opcode=36 missing from _DISPATCH"
+    )
+    canonical, fn = _DISPATCH[key]
+    assert canonical == "ImageID/DbgID_RSDS"
+    assert fn is decode_dbgid_rsds
+
+
+def test_dispatch_table_does_not_have_old_guid():
+    """_DISPATCH must NOT have the manifest provider GUID b059b83f-... at opcode 36.
+
+    That GUID produced 0 hits in the EVENT_RECORD callback; adding it to the
+    dispatch table would be dead code and confuse future readers.
+    """
+    from etw_analyzer.native.extract import _DISPATCH
+
+    key = ("b059b83f-d946-4b13-87ca-4292839dc2f2", 36, None)
+    assert key not in _DISPATCH, (
+        "Dead-code dispatch entry for b059b83f-... should have been removed"
+    )
+
+
+def test_dispatch_path_decodes_ntoskrnl_guid():
+    """End-to-end: routing through _DISPATCH with correct GUID yields AFB1E3B1 GUID."""
+    from etw_analyzer.native.extract import _DISPATCH
+
+    key = ("b3e675d7-2554-4f18-830b-2762732560de", 36, None)
+    assert key in _DISPATCH
+    canonical, fn = _DISPATCH[key]
+    payload = _build_ntoskrnl_payload()
+    row = fn(payload, _NTOSKRNL_HDR)
+    assert row is not None
+    assert row["PdbGuid"] == _NTOSKRNL_GUID_STR
+    assert row["PdbAge"] == _NTOSKRNL_AGE
+    assert row["PdbName"] == _NTOSKRNL_PDB
+
+
+def test_kernel_provider_guids_contains_new_guid():
+    """b3e675d7-... must be in the kernel-provider set so TDH skips it."""
+    from etw_analyzer.native.mof import kernel_provider_guids
+
+    assert "b3e675d7-2554-4f18-830b-2762732560de" in kernel_provider_guids()
+
+
+def test_kernel_provider_guids_does_not_contain_old_guid():
+    """b059b83f-... must NOT be in the kernel-provider TDH-skip set."""
+    from etw_analyzer.native.mof import kernel_provider_guids
+
+    assert "b059b83f-d946-4b13-87ca-4292839dc2f2" not in kernel_provider_guids()

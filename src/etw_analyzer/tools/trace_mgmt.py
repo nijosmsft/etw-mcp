@@ -1131,6 +1131,7 @@ def _start_background_dumper(trace: TraceData) -> None:
                 wanted_with_aux = set(wanted)
                 wanted_with_aux.update({
                     "Image/Load", "Image/DCStart",
+                    "ImageID/DbgID_RSDS",           # M5b: PDB identity for kernel symbol resolution
                     "PerfInfo/DPC", "PerfInfo/ThreadedDPC",
                     "PerfInfo/TimerDPC", "PerfInfo/ISR",
                     "Process/Start", "Process/End",

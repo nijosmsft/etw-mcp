@@ -45,7 +45,7 @@ def test_kernel_provider_guids_includes_all_modules():
         "3d6fa8d1-fe05-11d0-9dda-00c04fd7ba7c",   # Thread
         "3d6fa8d0-fe05-11d0-9dda-00c04fd7ba7c",   # Process
         "2cb15d1d-5fc1-11d2-abe1-00a0c911f518",   # Image
-        "b059b83f-d946-4b13-87ca-4292839dc2f2",   # ImageID (M5)
+        "b3e675d7-2554-4f18-830b-2762732560de",   # ImageID (M5b: corrected event-class GUID)
         "3d6fa8d4-fe05-11d0-9dda-00c04fd7ba7c",   # DiskIo
         "90cbdc39-4a3e-11d1-84f4-0000f80464e3",   # FileIo
         "68fdd900-4a3e-11d1-84f4-0000f80464e3",   # EventTrace
