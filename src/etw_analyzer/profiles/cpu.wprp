@@ -27,7 +27,7 @@
       rundown burst can exhaust the initial buffer pool before the file-mode
       consumer drains it, silently dropping the rundown events.  The ETW
       minimum-buffers recommendation is >= 2 x NumberOfProcessors; on an
-      80-CPU host that is 160 -- below the old 128 value.
+      80-CPU host that is 160 - below the old 128 value.
 -->
 <WindowsPerformanceRecorder Version="1.0" Author="etw-mcp" Company="etw-mcp">
     <Profiles>
@@ -70,7 +70,7 @@
         into the final merged ETL.  This is the same injection the built-in WPR
         "CPU" profile performs via its hardcoded merge properties; it ensures the
         etw-mcp consumer can resolve kernel modules even when the live
-        Image/DCStart rundown events were dropped during capture (Bug E --
+        Image/DCStart rundown events were dropped during capture (Bug E -
         Server 2025 build 29614 does not inject these by default for custom
         .wprp files lacking this section).
     -->

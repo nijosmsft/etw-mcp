@@ -90,7 +90,7 @@
 
     <!--
         TraceMergeProperties: inject per-image PE + RSDS identity at wpr -stop.
-        See cpu.wprp for the full rationale (Bug E -- Server 2025 build 29614).
+        See cpu.wprp for the full rationale (Bug E - Server 2025 build 29614).
     -->
     <TraceMergeProperties>
         <TraceMergeProperty Id="TraceMerge_Default" Name="TraceMerge_Default">

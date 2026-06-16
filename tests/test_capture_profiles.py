@@ -239,6 +239,30 @@ def test_wprp_files_load_via_importlib_resources(scenario):
     assert "0xFFFFFFFFFFFFFFFF" not in xml
 
 
+@pytest.mark.parametrize("scenario", _WPR_SCENARIOS)
+def test_wprp_is_well_formed_xml(scenario):
+    """Every bundled .wprp must be well-formed XML so ``wpr -start`` accepts it.
+
+    Regression guard: a comment body containing ``--`` (illegal inside XML
+    comments) makes the profile malformed even though string-matching tests
+    still pass. wpr.exe parses the file strictly and would reject the capture.
+    """
+    import xml.etree.ElementTree as ET
+
+    text = load_wprp_text(scenario)
+    # Raises ET.ParseError on any malformed XML (incl. ``--`` in a comment).
+    root = ET.fromstring(text)
+    assert root.tag.endswith("WindowsPerformanceRecorder")
+    # Belt-and-suspenders: no ``--`` sequence inside a comment body. Strip the
+    # legal ``<!--`` / ``-->`` delimiters first, then assert no bare ``--``.
+    for raw_line in text.splitlines():
+        stripped = raw_line.replace("<!--", "").replace("-->", "")
+        assert "--" not in stripped, (
+            f"{scenario}.wprp has '--' inside a comment body "
+            f"(illegal XML, breaks wpr -start): {raw_line.strip()!r}"
+        )
+
+
 def test_strict_true_only_on_xdp_aware_profiles():
     import re
 
