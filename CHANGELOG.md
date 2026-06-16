@@ -4,6 +4,8 @@ All notable changes to etw-mcp are documented here. Format follows [Keep a Chang
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-06-16
+
 ### Fixed
 
 - **Bundled capture profiles: kernel ImageLoad rundown now survives on Windows
