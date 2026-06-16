@@ -31,6 +31,83 @@ from etw_analyzer.native.schemas import EVENT_SCHEMA_VERSION as _EVENT_SCHEMA_VE
 import pandas as pd
 
 
+def _find_trace_pdb_identity(trace, module_name: str) -> dict | None:
+    """Return the PDB identity captured in the trace for a given module filename.
+
+    Priority:
+    1. ``trace.raw_csv['image']`` DataFrame -- match by FileName basename.
+       This carries the authoritative DbgID_RSDS identity the sidecar/M1
+       captured from the trace, which may differ from the analyst box's
+       local copy of the same EXE (cross-machine case).
+    2. ``trace.pdb_identity`` dict (keyed by ImageBase) -- stem heuristic
+       fallback for old traces where the image DF may be absent.
+
+    Returns a dict with keys ``pdb_guid`` (UUID/dashed form or None),
+    ``pdb_age`` (int or None), ``pdb_name`` (str or None), or ``None``
+    when no identity is available for that module.
+    """
+    module_lower = module_name.lower()
+
+    for key in ("image", "Image/Load", "Image/DCStart"):
+        img_df = trace.raw_csv.get(key)
+        if img_df is None or img_df.empty:
+            continue
+        if "PdbGuid" not in img_df.columns:
+            continue
+        fname_col = next(
+            (c for c in ("FileName", "ImageFileName", "Image Name") if c in img_df.columns),
+            None,
+        )
+        if fname_col is None:
+            continue
+        match = img_df[
+            img_df[fname_col].astype(str).apply(
+                lambda x: Path(x).name.lower()
+            ) == module_lower
+        ]
+        if match.empty:
+            continue
+        row = match.iloc[0]
+        pdb_guid = row.get("PdbGuid")
+        pdb_age = row.get("PdbAge")
+        pdb_name = row.get("PdbName")
+        if pd.isna(pdb_guid):
+            continue
+        return {
+            "pdb_guid": str(pdb_guid) if pdb_guid is not None else None,
+            "pdb_age": int(pdb_age) if pdb_age is not None and not pd.isna(pdb_age) else None,
+            "pdb_name": str(pdb_name) if pdb_name is not None and not pd.isna(pdb_name) else None,
+        }
+
+    pdb_identity = getattr(trace, "pdb_identity", {})
+    if pdb_identity:
+        module_stem = Path(module_name).stem.lower()
+        for entry in pdb_identity.values():
+            pdb_name = entry.get("pdb_name") or ""
+            if Path(pdb_name).stem.lower() == module_stem:
+                guid = entry.get("pdb_guid")
+                age = entry.get("pdb_age")
+                return {
+                    "pdb_guid": str(guid) if guid else None,
+                    "pdb_age": int(age) if age is not None else None,
+                    "pdb_name": str(pdb_name) if pdb_name else None,
+                }
+    return None
+
+
+def _is_kernel_module(module_name: str) -> bool:
+    """Return True when ``module_name`` looks like a kernel-mode binary.
+
+    Heuristic: name ends with ``.sys``, or matches a small set of
+    well-known kernel executables that do not carry the ``.sys``
+    extension (ntoskrnl.exe, hal.dll, win32k.sys is already covered).
+    """
+    lower = Path(module_name).name.lower()
+    if lower.endswith(".sys"):
+        return True
+    return lower in ("ntoskrnl.exe", "ntkrnlmp.exe", "hal.dll")
+
+
 def _resolve_sym_path(
     symbol_path: str | None,
     extra_symbol_paths: list[str] | None,
@@ -2704,6 +2781,27 @@ def check_symbols(
                         f"- `{row['Module']}` - {row['Weight']:,} weight "
                         f"({row['Weight']/total_weight*100:.1f}%)"
                     )
+                    if _is_kernel_module(row["Module"]):
+                        identity = _find_trace_pdb_identity(trace, row["Module"])
+                        if identity and identity.get("pdb_guid"):
+                            lines.append(
+                                f"  - Kernel module resolved export-only -- "
+                                f"PDB not found for GUID `{identity['pdb_guid']}` "
+                                f"age `{identity['pdb_age']}` "
+                                f"(`{identity['pdb_name']}`). "
+                                f"Check `_NT_SYMBOL_PATH` includes a symbol server "
+                                f"with kernel PDBs and that a MSFZ-capable "
+                                f"`dbghelp.dll` is in use (Debugging Tools for "
+                                f"Windows, e.g. `C:\\Debuggers\\dbghelp.dll`)."
+                            )
+                        else:
+                            lines.append(
+                                f"  - Kernel module resolved export-only -- "
+                                f"PDB not found. Check `_NT_SYMBOL_PATH` and "
+                                f"that a MSFZ-capable `dbghelp.dll` is in use "
+                                f"(Debugging Tools for Windows, e.g. "
+                                f"`C:\\Debuggers\\dbghelp.dll`)."
+                            )
                 lines.append("")
 
         if not missing_df.empty:

@@ -14,14 +14,20 @@ from __future__ import annotations
 import struct
 from pathlib import Path
 
+import pandas as pd
 import pytest
 
+import etw_analyzer.native.config as native_config
+import etw_analyzer.tools.trace_mgmt as trace_mgmt
+from etw_analyzer.trace_state import clear_traces
 from etw_analyzer.tools.symbol_diagnostics import (
     RsdsRecord,
+    _guid_to_nodashes,
     _iter_candidates,
     _resolve_file_ptr,
     candidate_pdb_paths,
     clean_stale_symbol_files,
+    diagnose_symbol_load,
     parse_symbol_path,
     read_pe_rsds,
 )
@@ -677,3 +683,174 @@ def test_candidate_pdb_paths_searches_upstream_store(tmp_path: Path):
     sym_path = f"srv*{cache_dir}*{upstream_dir}"
     paths = candidate_pdb_paths(sym_path, "foo.exe", "foo.pdb")
     assert pdb_in_upstream in paths
+
+
+# ===========================================================================
+# M4: diagnose_symbol_load 3-way GUID reconciliation
+# ===========================================================================
+
+
+@pytest.fixture(autouse=True)
+def _isolate_traces_for_m4():
+    clear_traces()
+    native_config.reset_auto_cache()
+    yield
+    clear_traces()
+    native_config.reset_auto_cache()
+
+
+def _register_trace_with_image(
+    tmp_path: Path,
+    image_rows: list[dict],
+    *,
+    trace_id: str = "trace_diag_m4",
+) -> trace_mgmt.TraceData:
+    """Register a minimal TraceData with the given image DF."""
+    etl = tmp_path / f"{trace_id}.etl"
+    etl.write_bytes(b"synthetic")
+    t = trace_mgmt.TraceData(
+        trace_id=trace_id,
+        etl_path=etl,
+        export_dir=tmp_path / f".export-{trace_id}",
+        symbol_path=None,
+    )
+    if image_rows:
+        t.raw_csv["image"] = pd.DataFrame(image_rows)
+    trace_mgmt.register_trace(t)
+    return t
+
+
+# ---------------------------------------------------------------------------
+# PE GUID bytes for the two test identities.
+# Encoding: each 16-byte sequence produces a specific canonical GUID when
+# parsed by read_pe_rsds (little-endian for Data1/2/3, big-endian for Data4).
+#
+# TRACE_GUID  = "AFB1E3B1-3754-8BA7-3B92-C060D6D5605F"
+#   PE bytes  = B1 E3 B1 AF | 54 37 | A7 8B | 3B 92 C0 60 D6 D5 60 5F
+# DISK_GUID   = "11D7FE79-CC24-5612-0555-03EE86BB0E3E"
+#   PE bytes  = 79 FE D7 11 | 24 CC | 12 56 | 05 55 03 EE 86 BB 0E 3E
+# ---------------------------------------------------------------------------
+
+_TRACE_GUID_UUID = "AFB1E3B1-3754-8BA7-3B92-C060D6D5605F"
+_TRACE_GUID_NORM = "AFB1E3B137548BA73B92C060D6D5605F"
+_TRACE_PE_BYTES = bytes.fromhex("B1E3B1AF5437A78B3B92C060D6D5605F")
+
+_DISK_GUID_NORM = "11D7FE79CC24561205" + "5503EE86BB0E3E"  # 32-char no-dashes
+_DISK_PE_BYTES = bytes.fromhex("79FED71124CC1256055503EE86BB0E3E")
+
+
+def test_guid_to_nodashes_normalizes_uuid_form():
+    assert _guid_to_nodashes("AFB1E3B1-3754-8BA7-3B92-C060D6D5605F") == _TRACE_GUID_NORM
+    assert _guid_to_nodashes(_TRACE_GUID_NORM) == _TRACE_GUID_NORM
+    assert _guid_to_nodashes("") == ""
+    assert _guid_to_nodashes(None) == ""
+
+
+def test_diagnose_cross_machine_shows_both_guids_and_cross_machine_verdict(
+    tmp_path: Path,
+):
+    """trace GUID != disk GUID: output shows both, verdict says cross-machine."""
+    # Trace identity: ntoskrnl captured from a different build.
+    trace = _register_trace_with_image(
+        tmp_path,
+        [
+            {
+                "FileName": r"\Windows\System32\ntoskrnl.exe",
+                "ImageBase": 0xFFFFF8057E600000,
+                "ImageSize": 0x900000,
+                "PdbGuid": _TRACE_GUID_UUID,
+                "PdbAge": 1,
+                "PdbName": "ntkrnlmp.pdb",
+                "TimeDateStamp": 0x6471A2C0,
+            }
+        ],
+    )
+    # Disk image: analyst box's local ntoskrnl -- different build.
+    disk_exe = tmp_path / "ntoskrnl.exe"
+    disk_exe.write_bytes(_make_pe_with_rsds(_DISK_PE_BYTES, age=1, pdb_path="ntoskrnl.pdb"))
+
+    out = diagnose_symbol_load(trace.trace_id, "ntoskrnl.exe", exe_path=str(disk_exe))
+
+    # Both GUIDs must appear in the output.
+    assert _TRACE_GUID_UUID in out or _TRACE_GUID_NORM[:8] in out, f"trace GUID missing:\n{out}"
+    assert _DISK_GUID_NORM[:8] in out, f"disk GUID missing:\n{out}"
+
+    # The reconciliation verdict must explain this is expected.
+    assert "cross-machine" in out.lower() or "expected" in out.lower(), (
+        f"cross-machine verdict missing:\n{out}"
+    )
+
+    # The tool must frame it as NOT a failure.
+    assert "EXPECTED" in out or "expected" in out, f"expected-case framing missing:\n{out}"
+
+    # Trace identity section must be present.
+    assert "Trace identity" in out
+
+    # GUID reconciliation section must be present.
+    assert "GUID reconciliation" in out
+
+
+def test_diagnose_same_build_reports_guid_match(tmp_path: Path):
+    """trace GUID == disk GUID: output says they match (same-build case)."""
+    trace = _register_trace_with_image(
+        tmp_path,
+        [
+            {
+                "FileName": r"\Windows\System32\ntoskrnl.exe",
+                "ImageBase": 0xFFFFF8057E600000,
+                "ImageSize": 0x900000,
+                "PdbGuid": _TRACE_GUID_UUID,
+                "PdbAge": 1,
+                "PdbName": "ntkrnlmp.pdb",
+                "TimeDateStamp": 0x6471A2C0,
+            }
+        ],
+    )
+    # Disk image: same build, same GUID.
+    disk_exe = tmp_path / "ntoskrnl.exe"
+    disk_exe.write_bytes(_make_pe_with_rsds(_TRACE_PE_BYTES, age=1, pdb_path="ntkrnlmp.pdb"))
+
+    out = diagnose_symbol_load(trace.trace_id, "ntoskrnl.exe", exe_path=str(disk_exe))
+
+    assert "GUID reconciliation" in out
+    assert "match" in out.lower()
+    # Should NOT say cross-machine when they match.
+    assert "cross-machine" not in out.lower()
+
+
+def test_diagnose_no_trace_identity_says_not_available(tmp_path: Path):
+    """Old trace cache (no image DF): trace identity section says 'Not available'."""
+    trace = _register_trace_with_image(tmp_path, [])  # no image rows
+    disk_exe = tmp_path / "foo.sys"
+    disk_exe.write_bytes(_make_pe_with_rsds(_DISK_PE_BYTES, age=2, pdb_path="foo.pdb"))
+
+    out = diagnose_symbol_load(trace.trace_id, "foo.sys", exe_path=str(disk_exe))
+
+    assert "Trace identity" in out
+    assert "Not available" in out or "not available" in out
+
+
+def test_diagnose_trace_pdb_name_used_in_candidate_search(tmp_path: Path):
+    """When trace PDB name differs from disk PDB name, both are searched."""
+    trace = _register_trace_with_image(
+        tmp_path,
+        [
+            {
+                "FileName": r"\Windows\System32\ntoskrnl.exe",
+                "ImageBase": 0xFFFFF8057E600000,
+                "ImageSize": 0x900000,
+                "PdbGuid": _TRACE_GUID_UUID,
+                "PdbAge": 1,
+                # Trace says ntkrnlmp.pdb; disk says ntoskrnl.pdb
+                "PdbName": "ntkrnlmp.pdb",
+                "TimeDateStamp": 0x6471A2C0,
+            }
+        ],
+    )
+    disk_exe = tmp_path / "ntoskrnl.exe"
+    disk_exe.write_bytes(_make_pe_with_rsds(_DISK_PE_BYTES, age=1, pdb_path="ntoskrnl.pdb"))
+
+    out = diagnose_symbol_load(trace.trace_id, "ntoskrnl.exe", exe_path=str(disk_exe))
+
+    # The trace PDB name (ntkrnlmp.pdb) must appear in the candidate search section.
+    assert "ntkrnlmp.pdb" in out

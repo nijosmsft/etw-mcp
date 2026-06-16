@@ -50,7 +50,24 @@ import pandas as pd
 from etw_analyzer.app import mcp
 from etw_analyzer.formatting.markdown import format_table
 from etw_analyzer.trace_state import require_trace
-from etw_analyzer.tools.trace_mgmt import _resolve_sym_path
+from etw_analyzer.tools.trace_mgmt import _resolve_sym_path, _find_trace_pdb_identity
+
+
+# ---------------------------------------------------------------------------
+# GUID normalization helpers
+# ---------------------------------------------------------------------------
+
+
+def _guid_to_nodashes(guid: str | None) -> str:
+    """Normalize a GUID to uppercase 32-char hex without dashes.
+
+    Accepts both UUID form (``AFB1E3B1-3754-8BA7-3B92-C060D6D5605F``) and
+    the 32-char no-dashes form already used by ``RsdsRecord.guid_string``.
+    Returns ``""`` for None or empty input.
+    """
+    if not guid:
+        return ""
+    return guid.replace("-", "").upper()
 
 
 # ---------------------------------------------------------------------------
@@ -512,15 +529,16 @@ def diagnose_symbol_load(
     """Explain why a module resolved to PE export-table guesses (or
     not at all) and surface every candidate PDB on disk.
 
-    The output walks three independent sources of truth and compares
-    them so the user can see exactly where the mismatch is:
+    The output performs a 3-way reconciliation between:
 
-    1. **EXE on disk**: the RSDS (CV_INFO_PDB70) record embedded in
-       the PE debug directory tells us what GUID+Age the linker
-       stamped. This is the authoritative identity the PDB must match.
-    2. **Symbol path entries**: every directory in ``_NT_SYMBOL_PATH``
-       (plus ``extra_symbol_paths``) is walked. For each candidate
-       PDB we report its GUID+Age and whether they match the EXE.
+    1. **Trace identity** (authoritative): the RSDS (CV_INFO_PDB70) record
+       captured by the trace's DbgID_RSDS rundown. This is the GUID+Age
+       the Symbolizer (M3) uses for PDB lookup. On cross-machine traces
+       this will differ from the analyst box's local image -- that
+       difference is expected and not an error.
+    2. **Disk identity**: the RSDS record in the analyst box's local copy
+       of the EXE. Useful for local-build workflows; does NOT represent
+       ground truth on cross-machine traces.
     3. **Loaded state**: ``SymGetModuleInfoW64`` reports what dbghelp
        actually opened and whether ``SymType == SymExport`` (the
        smoking gun for "PDB missing, dbghelp fell back to exports").
@@ -549,53 +567,156 @@ def diagnose_symbol_load(
         lines.append("Symbol path: **(unset)** - no candidate PDBs can be found")
     lines.append("")
 
-    # Locate the EXE on disk.
+    # -----------------------------------------------------------------------
+    # Source 1: trace identity (authoritative -- from ETL RSDS rundown).
+    # -----------------------------------------------------------------------
+    trace_identity = _find_trace_pdb_identity(trace, module)
+    trace_guid_norm = _guid_to_nodashes(
+        trace_identity.get("pdb_guid") if trace_identity else None
+    )
+    trace_age = trace_identity.get("pdb_age") if trace_identity else None
+    trace_pdb_name = trace_identity.get("pdb_name") if trace_identity else None
+
+    lines.append("**Trace identity (from ETL RSDS rundown):**")
+    if trace_identity and trace_guid_norm:
+        lines.append(f"- PDB GUID: `{trace_identity['pdb_guid']}`")
+        lines.append(f"- PDB Age:  `{trace_age}` (0x{trace_age:X})" if trace_age is not None else "- PDB Age:  unknown")
+        lines.append(f"- PDB Name: `{trace_pdb_name}`" if trace_pdb_name else "- PDB Name: unknown")
+        lines.append("  (This is the identity the Symbolizer uses for exact-GUID PDB lookup.)")
+    else:
+        lines.append(
+            "- Not available (trace cache predates M2 identity columns or "
+            "module was not captured in the image rundown). "
+            "Re-load with `load_trace(..., force=True)` to populate."
+        )
+    lines.append("")
+
+    # -----------------------------------------------------------------------
+    # Source 2: disk identity (analyst box local image).
+    # -----------------------------------------------------------------------
     exe = Path(exe_path) if exe_path else _find_exe_for_module(trace, module)
     if exe is None or not exe.exists():
-        lines.append("**EXE on disk:** not found")
+        lines.append("**EXE on disk (analyst box):** not found")
         lines.append("")
         lines.append(
             "Pass ``exe_path=...`` pointing at the binary that was "
             "running when the trace was captured. Without the EXE we "
-            "cannot read the RSDS record and cannot tell which PDB on "
-            "disk is correct."
+            "cannot read the disk RSDS record."
         )
-        return "\n".join(lines)
-
-    lines.append(f"**EXE on disk:** `{exe}`")
-    rsds = read_pe_rsds(exe)
-    if rsds is None:
-        lines.append("- No RSDS record found - the binary may be stripped of debug info.")
+        rsds = None
+        disk_guid_norm = ""
+    else:
+        lines.append(f"**EXE on disk (analyst box):** `{exe}`")
+        rsds = read_pe_rsds(exe)
+        if rsds is None:
+            lines.append("- No RSDS record found - the binary may be stripped of debug info.")
+            disk_guid_norm = ""
+        else:
+            lines.append(f"- RSDS GUID: `{rsds.guid_string}`")
+            lines.append(f"- RSDS Age:  `{rsds.age}` (0x{rsds.age:X})")
+            lines.append(f"- PDB hint:  `{rsds.pdb_path}`")
+            lines.append(f"- SymCache key: `{rsds.symcache_folder_name}`")
+            disk_guid_norm = rsds.guid_string
         lines.append("")
-        return "\n".join(lines)
-    lines.append(f"- RSDS GUID: `{rsds.guid_string}`")
-    lines.append(f"- RSDS Age:  `{rsds.age}` (0x{rsds.age:X})")
-    lines.append(f"- PDB hint:  `{rsds.pdb_path}`")
-    lines.append(f"- SymCache key: `{rsds.symcache_folder_name}`")
+
+    # -----------------------------------------------------------------------
+    # GUID reconciliation (trace vs disk).
+    # -----------------------------------------------------------------------
+    lines.append("**GUID reconciliation (trace vs disk):**")
+    if trace_guid_norm and disk_guid_norm:
+        if trace_guid_norm == disk_guid_norm:
+            lines.append(
+                f"- Trace GUID and local image GUID match (`{trace_identity['pdb_guid']}`). "
+                "Same build as traced machine or a matching local copy."
+            )
+        else:
+            lines.append(
+                f"- Trace GUID:  `{trace_identity['pdb_guid']}` (from ETL rundown)"
+            )
+            lines.append(
+                f"- Disk GUID:   `{rsds.guid_string}` (analyst box local image)"
+            )
+            lines.append(
+                "- Verdict: cross-machine trace -- this is EXPECTED. The Symbolizer "
+                "(M3) resolves PDBs using the TRACE GUID, not the local image. "
+                "The local image is from a different build than the traced machine. "
+                "Candidate PDB search below uses the trace GUID."
+            )
+    elif trace_guid_norm and not disk_guid_norm:
+        lines.append(
+            f"- Trace GUID available (`{trace_identity['pdb_guid']}`); "
+            "local image GUID unavailable. Using trace GUID for PDB search."
+        )
+    elif disk_guid_norm and not trace_guid_norm:
+        lines.append(
+            f"- Disk GUID available (`{rsds.guid_string}`); "
+            "trace GUID unavailable (old cache -- re-load to populate). "
+            "PDB search uses disk GUID as fallback."
+        )
+    else:
+        lines.append("- Neither trace nor disk GUID available -- cannot search for PDB candidates.")
     lines.append("")
 
-    # Walk candidate PDB paths.
-    pdb_name = Path(rsds.pdb_path).name if rsds.pdb_path else f"{Path(module).stem}.pdb"
-    candidate_entries = list(_iter_candidates(sym_path, module, pdb_name))
-    lines.append(f"**Candidate PDBs on disk** (searching for `{pdb_name}`):")
-    if not candidate_entries:
+    if rsds is None and exe is not None and (not trace_identity or not trace_guid_norm):
+        return "\n".join(lines)
+
+    # -----------------------------------------------------------------------
+    # Walk candidate PDB paths.  Prefer trace PDB name when available; also
+    # search disk PDB name when it differs.
+    # -----------------------------------------------------------------------
+    search_guid_norm = trace_guid_norm or disk_guid_norm
+    search_age = trace_age if trace_guid_norm else (rsds.age if rsds else None)
+
+    # Determine PDB file name(s) to search for.
+    disk_pdb_name = (
+        Path(rsds.pdb_path).name if (rsds and rsds.pdb_path) else (
+            f"{Path(module).stem}.pdb" if rsds else None
+        )
+    )
+    pdb_names_to_search: list[str] = []
+    if trace_pdb_name:
+        pdb_names_to_search.append(trace_pdb_name)
+    if disk_pdb_name and disk_pdb_name.lower() != (trace_pdb_name or "").lower():
+        pdb_names_to_search.append(disk_pdb_name)
+    if not pdb_names_to_search and disk_pdb_name:
+        pdb_names_to_search.append(disk_pdb_name)
+
+    all_candidate_entries: list[tuple] = []
+    for pdb_name in pdb_names_to_search:
+        for cand, rd in _iter_candidates(sym_path, module, pdb_name):
+            all_candidate_entries.append((cand, rd, pdb_name))
+
+    search_label = trace_pdb_name or disk_pdb_name or f"{Path(module).stem}.pdb"
+    lines.append(f"**Candidate PDBs on disk** (searching for `{search_label}`):")
+    if not all_candidate_entries:
         lines.append("- None found in any symbol path entry.")
     else:
-        has_redirects = any(rd is not None for _, rd in candidate_entries)
+        has_redirects = any(rd is not None for _, rd, _ in all_candidate_entries)
         rows = []
-        for cand, redirect_desc in candidate_entries:
+        for cand, redirect_desc, searched_pdb_name in all_candidate_entries:
             sig = read_pdb_signature(cand)
+            if sig is None:
+                match_label = "NO (unreadable)"
+            else:
+                cand_guid_norm = _guid_to_nodashes(sig[0])
+                cand_age = sig[1]
+                if search_guid_norm and cand_guid_norm == search_guid_norm and cand_age == search_age:
+                    match_label = "YES (trace)" if trace_guid_norm else "YES (disk)"
+                elif disk_guid_norm and cand_guid_norm == disk_guid_norm and cand_age == (rsds.age if rsds else None):
+                    match_label = "YES (disk only)"
+                else:
+                    match_label = "NO"
+
             row: dict = {
                 "Path": str(cand),
                 "GUID": "(unreadable)" if sig is None else sig[0],
                 "Age": "?" if sig is None else str(sig[1]),
-                "Match": "NO" if sig is None else (
-                    "YES" if (sig[0] == rsds.guid_string and sig[1] == rsds.age) else "NO"
-                ),
+                "Match": match_label,
             }
+            if len(pdb_names_to_search) > 1:
+                row["Searched as"] = searched_pdb_name
             if has_redirects:
                 if redirect_desc:
-                    # Show just the file.ptr file; the resolved path is in "Path".
                     ptr_path = redirect_desc.split(" -> ")[0].replace(
                         "via file.ptr redirect: ", ""
                     )
@@ -608,7 +729,9 @@ def diagnose_symbol_load(
         lines.append(format_table(df, max_rows=25))
     lines.append("")
 
-    # Query dbghelp for the actually-loaded state.
+    # -----------------------------------------------------------------------
+    # Source 3: loaded state (dbghelp SymGetModuleInfoW64).
+    # -----------------------------------------------------------------------
     loaded = _query_loaded_module(trace, module)
     lines.append("**Loaded state (from dbghelp):**")
     if loaded is None:
@@ -619,6 +742,7 @@ def diagnose_symbol_load(
         lines.append(f"- PDB GUID:     `{loaded['pdb_guid']}`")
         lines.append(f"- PDB Age:      `{loaded['pdb_age']}`")
         lines.append(f"- PDB Unmatched flag: `{loaded['pdb_unmatched']}`")
+        loaded_guid_norm = _guid_to_nodashes(loaded.get("pdb_guid"))
         if loaded["sym_type"] == "SymExport":
             lines.append("")
             lines.append(
@@ -634,21 +758,56 @@ def diagnose_symbol_load(
                 "unmatched. The PDB GUID or Age does not match the EXE - "
                 "function names will be wrong."
             )
+        elif loaded["sym_type"] == "SymPdb" and trace_guid_norm and loaded_guid_norm == trace_guid_norm:
+            lines.append("")
+            lines.append(
+                "**Diagnosis:** resolved via trace RSDS identity (PDB matched trace GUID). "
+                "Symbol names are from the correct PDB."
+            )
     lines.append("")
 
-    # Actionable next steps.
+    # -----------------------------------------------------------------------
+    # Next steps (trace-GUID-aware).
+    # -----------------------------------------------------------------------
     lines.append("**Next steps:**")
-    if rsds is not None and any(
-        (read_pdb_signature(c) == (rsds.guid_string, rsds.age)) for c, _ in candidate_entries
-    ):
+    trace_pdb_found = search_guid_norm and any(
+        sig is not None and _guid_to_nodashes(sig[0]) == search_guid_norm and sig[1] == search_age
+        for sig in (read_pdb_signature(c) for c, _, _ in all_candidate_entries)
+    )
+    disk_pdb_found = rsds is not None and any(
+        read_pdb_signature(c) == (rsds.guid_string, rsds.age)
+        for c, _, _ in all_candidate_entries
+    )
+
+    cross_machine = bool(trace_guid_norm and disk_guid_norm and trace_guid_norm != disk_guid_norm)
+
+    if trace_pdb_found:
+        if cross_machine:
+            lines.append(
+                "- A PDB matching the TRACE GUID exists on disk. "
+                "The Symbolizer (M3) should resolve this module via the trace identity. "
+                "If it still reports SymExport, check that a MSFZ-capable dbghelp "
+                "is in use (Debugging Tools for Windows at C:\\Debuggers)."
+            )
+        else:
+            lines.append(
+                "- A matching PDB exists on disk. If dbghelp still reports "
+                "``SymExport``, an older stale PDB is shadowing it via the "
+                "SymCache search order. Run "
+                "``clean_stale_symbol_files('" + module + "', '" + str(exe) + "')`` "
+                "to list (and optionally delete) the stale entries."
+            )
+    elif trace_guid_norm:
+        pdb_label = trace_pdb_name or f"{Path(module).stem}.pdb"
         lines.append(
-            "- A matching PDB exists on disk. If dbghelp still reports "
-            "``SymExport``, an older stale PDB is shadowing it via the "
-            "SymCache search order. Run "
-            "``clean_stale_symbol_files('" + module + "', '" + str(exe) + "')`` "
-            "to list (and optionally delete) the stale entries."
+            f"- No PDB matching trace GUID `{trace_identity['pdb_guid']}` "
+            f"Age `{trace_age}` (`{pdb_label}`) was found in any symbol path entry. "
+            "Add the symbol server holding kernel PDBs to `_NT_SYMBOL_PATH`, e.g. "
+            "`srv*C:\\symbols*https://msdl.microsoft.com/download/symbols` or "
+            "`srv*C:\\symbols*https://symweb.azurefd.net` (internal). "
+            "Then re-run `load_trace(..., force=True)`."
         )
-    else:
+    elif rsds is not None and not disk_pdb_found:
         lines.append(
             f"- No PDB with GUID `{rsds.guid_string}` Age `{rsds.age}` "
             "was found in any symbol path entry. Build the PDB locally "

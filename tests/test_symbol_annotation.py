@@ -285,3 +285,51 @@ def test_export_fallback_footnote_text_is_actionable():
     assert "PE export table" in text
     assert "check_symbols" in text
     assert "diagnose_symbol_load" in text
+
+
+# ---------------------------------------------------------------------------
+# M4 Issue 5 smoke: after the fix, real PDB frames are NOT star-annotated.
+# ---------------------------------------------------------------------------
+
+
+def test_get_hot_functions_ntoskrnl_pdb_frames_not_annotated(tmp_path: Path):
+    """Smoke: ntoskrnl.exe frames resolved via PDB must NOT get the ``*``
+    prefix.  This asserts the annotation correctly fires for export rows
+    and correctly stays silent for PDB rows in the same trace."""
+    cpu_df = pd.DataFrame({
+        "Process Name": ["System"] * 6,
+        "PID": [4] * 6,
+        "Module": [
+            "ntoskrnl.exe", "ntoskrnl.exe", "ntoskrnl.exe",
+            "mswsock.dll", "mswsock.dll", "mswsock.dll",
+        ],
+        "Function": [
+            "KiInterruptDispatch", "KeWaitForSingleObject", "ExAllocatePool",
+            "WSARecv", "WSASend", "WSAConnect",
+        ],
+        "Weight": [1000, 800, 600, 400, 300, 200],
+        "% Weight": [30.3, 24.2, 18.2, 12.1, 9.1, 6.1],
+        "CPU": list(range(6)),
+        "TimeStamp": [0.1 * i for i in range(6)],
+        # ntoskrnl resolved from PDB; mswsock from export table.
+        "SymbolSource": ["pdb", "pdb", "pdb", "export", "export", "export"],
+    })
+    trace = _register_trace_with_cpu_df(tmp_path, cpu_df, trace_id="trace_ntoskrnl_smoke")
+
+    out = get_hot_functions(trace.trace_id, modules="all")
+
+    # PDB-resolved ntoskrnl frames must NOT have the star prefix.
+    assert "*KiInterruptDispatch" not in out
+    assert "*KeWaitForSingleObject" not in out
+    assert "*ExAllocatePool" not in out
+
+    # The real function names must appear WITHOUT a star.
+    assert "KiInterruptDispatch" in out
+    assert "KeWaitForSingleObject" in out
+
+    # Export-only mswsock frames MUST still have the star.
+    assert "*WSARecv" in out
+    assert "*WSASend" in out
+
+    # Footnote present because export rows exist.
+    assert "PE export table" in out
