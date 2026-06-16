@@ -200,6 +200,24 @@ def read_pe_rsds(exe_path: Path) -> Optional[RsdsRecord]:
     return None
 
 
+_PDB_MSF7_MAGIC = b"Microsoft C/C++ MSF 7.00"
+_PDB_MSFZ_MAGIC = b"Microsoft MSFZ Container"
+
+
+def classify_pdb_container(pdb_path: Path) -> str:
+    """Classify a PDB container as ``msf7``, ``msfz``, or ``unknown``."""
+    try:
+        with pdb_path.open("rb") as f:
+            head = f.read(64)
+    except OSError:
+        return "unknown"
+    if head.startswith(_PDB_MSF7_MAGIC):
+        return "msf7"
+    if head.startswith(_PDB_MSFZ_MAGIC):
+        return "msfz"
+    return "unknown"
+
+
 def read_pdb_signature(pdb_path: Path) -> Optional[tuple[str, int]]:
     """Read the PDB 7.0 stream-0 signature: (GUID hex string, age).
 
@@ -225,7 +243,7 @@ def read_pdb_signature(pdb_path: Path) -> Optional[tuple[str, int]]:
     try:
         with pdb_path.open("rb") as f:
             head = f.read(56)
-            if len(head) < 56 or not head.startswith(b"Microsoft C/C++ MSF 7.00"):
+            if len(head) < 56 or not head.startswith(_PDB_MSF7_MAGIC):
                 return None
             page_size = struct.unpack_from("<I", head, 32)[0]
             dir_size = struct.unpack_from("<I", head, 44)[0]
@@ -519,6 +537,27 @@ def _call_sym_get_module_info(symbolizer, address: int) -> Optional[dict]:
     }
 
 
+def _loaded_dbghelp_info() -> tuple[str | None, str | None, bool | None]:
+    """Return loaded dbghelp path, version, and MSFZ capability."""
+    try:
+        from etw_analyzer.native.bindings.dbghelp import (
+            LOADED_DBGHELP_PATH,
+            LOADED_DBGHELP_VERSION,
+            dbghelp_supports_msfz,
+        )
+    except OSError:
+        return (None, None, None)
+    return (LOADED_DBGHELP_PATH, LOADED_DBGHELP_VERSION, dbghelp_supports_msfz())
+
+
+def _format_capability(value: bool | None) -> str:
+    if value is True:
+        return "yes"
+    if value is False:
+        return "no"
+    return "unknown"
+
+
 @mcp.tool()
 def diagnose_symbol_load(
     trace_id: str,
@@ -685,18 +724,39 @@ def diagnose_symbol_load(
     for pdb_name in pdb_names_to_search:
         for cand, rd in _iter_candidates(sym_path, module, pdb_name):
             all_candidate_entries.append((cand, rd, pdb_name))
+    candidate_infos: list[dict] = []
+    for cand, redirect_desc, searched_pdb_name in all_candidate_entries:
+        container = classify_pdb_container(cand)
+        sig = read_pdb_signature(cand) if container == "msf7" else None
+        candidate_infos.append({
+            "path": cand,
+            "redirect": redirect_desc,
+            "searched_pdb_name": searched_pdb_name,
+            "container": container,
+            "signature": sig,
+        })
+    has_msfz_candidate = any(info["container"] == "msfz" for info in candidate_infos)
 
     search_label = trace_pdb_name or disk_pdb_name or f"{Path(module).stem}.pdb"
     lines.append(f"**Candidate PDBs on disk** (searching for `{search_label}`):")
-    if not all_candidate_entries:
+    if not candidate_infos:
         lines.append("- None found in any symbol path entry.")
     else:
-        has_redirects = any(rd is not None for _, rd, _ in all_candidate_entries)
+        has_redirects = any(info["redirect"] is not None for info in candidate_infos)
         rows = []
-        for cand, redirect_desc, searched_pdb_name in all_candidate_entries:
-            sig = read_pdb_signature(cand)
+        for info in candidate_infos:
+            cand = info["path"]
+            redirect_desc = info["redirect"]
+            searched_pdb_name = info["searched_pdb_name"]
+            container = info["container"]
+            sig = info["signature"]
             if sig is None:
-                match_label = "NO (unreadable)"
+                if container == "msfz":
+                    match_label = "NO (MSFZ-compressed)"
+                    guid_label = "MSFZ-compressed PDB (GUID requires MSFZ-capable dbghelp)"
+                else:
+                    match_label = "NO (unreadable)"
+                    guid_label = "(unreadable)"
             else:
                 cand_guid_norm = _guid_to_nodashes(sig[0])
                 cand_age = sig[1]
@@ -706,10 +766,11 @@ def diagnose_symbol_load(
                     match_label = "YES (disk only)"
                 else:
                     match_label = "NO"
+                guid_label = sig[0]
 
             row: dict = {
                 "Path": str(cand),
-                "GUID": "(unreadable)" if sig is None else sig[0],
+                "GUID": guid_label,
                 "Age": "?" if sig is None else str(sig[1]),
                 "Match": match_label,
             }
@@ -732,8 +793,15 @@ def diagnose_symbol_load(
     # -----------------------------------------------------------------------
     # Source 3: loaded state (dbghelp SymGetModuleInfoW64).
     # -----------------------------------------------------------------------
+    dbghelp_path, dbghelp_version, msfz_capable = _loaded_dbghelp_info()
     loaded = _query_loaded_module(trace, module)
     lines.append("**Loaded state (from dbghelp):**")
+    lines.append(
+        "- Symbolizer dbghelp: "
+        f"`{dbghelp_path or 'unknown'}` "
+        f"({dbghelp_version or 'version unknown'}, "
+        f"MSFZ-capable: {_format_capability(msfz_capable)})"
+    )
     if loaded is None:
         lines.append("- dbghelp has no module loaded for this image.")
     else:
@@ -771,15 +839,28 @@ def diagnose_symbol_load(
     # -----------------------------------------------------------------------
     lines.append("**Next steps:**")
     trace_pdb_found = search_guid_norm and any(
-        sig is not None and _guid_to_nodashes(sig[0]) == search_guid_norm and sig[1] == search_age
-        for sig in (read_pdb_signature(c) for c, _, _ in all_candidate_entries)
+        info["signature"] is not None
+        and _guid_to_nodashes(info["signature"][0]) == search_guid_norm
+        and info["signature"][1] == search_age
+        for info in candidate_infos
     )
     disk_pdb_found = rsds is not None and any(
-        read_pdb_signature(c) == (rsds.guid_string, rsds.age)
-        for c, _, _ in all_candidate_entries
+        info["signature"] == (rsds.guid_string, rsds.age)
+        for info in candidate_infos
     )
 
     cross_machine = bool(trace_guid_norm and disk_guid_norm and trace_guid_norm != disk_guid_norm)
+
+    if has_msfz_candidate and msfz_capable is False:
+        lines.append(
+            "- A matching PDB exists but is MSFZ-compressed, and the loaded "
+            f"dbghelp ({dbghelp_version or 'version unknown'} at "
+            f"{dbghelp_path or 'unknown path'}) predates MSFZ support. "
+            "Install Debugging Tools for Windows / WinDbg (dbghelp 10.0.29507+) "
+            "and either place it at `C:\\Debuggers\\dbghelp.dll` or set "
+            "`ETW_MCP_DBGHELP` to its path (and `ETW_MCP_SYMSRV` if symsrv.dll "
+            "is not beside it), then reload."
+        )
 
     if trace_pdb_found:
         if cross_machine:

@@ -4,6 +4,16 @@ All notable changes to etw-mcp are documented here. Format follows [Keep a Chang
 
 ## [Unreleased]
 
+### Fixed
+
+- **Bug F: MSFZ-compressed kernel PDBs now produce actionable dbghelp
+  diagnostics instead of misleading unreadable/export-only guesses.** The
+  native symbolizer honors `ETW_MCP_DBGHELP` / `ETW_MCP_SYMSRV`, records the
+  loaded dbghelp path and FileVersion, broadens WinDbg / Windows SDK discovery,
+  and reports when an MSFZ PDB is present but the loaded dbghelp predates MSFZ
+  support. No MSFZ decompression is attempted; operators should install a
+  current Debugging Tools for Windows / WinDbg dbghelp.
+
 ## [0.7.1] - 2026-06-16
 
 ### Fixed

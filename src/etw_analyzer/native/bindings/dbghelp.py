@@ -18,6 +18,9 @@ so any wrong-type call surfaces immediately as a ctypes error.
 from __future__ import annotations
 
 import ctypes
+import glob
+import os
+import re
 from ctypes import POINTER, wintypes
 
 from .types import SYMBOL_INFOW, IMAGEHLP_MODULEW64
@@ -71,6 +74,206 @@ SSRVOPT_DWORDPTR = 0x00000002
 MAX_SYM_NAME = 2000
 
 
+# Identity of the dbghelp/symsrv pair selected at import time. Diagnostics use
+# this to explain MSFZ PDB failures instead of leaving users to guess which
+# Windows debugger toolchain was loaded.
+LOADED_DBGHELP_PATH: str | None = None
+LOADED_DBGHELP_VERSION: str | None = None
+LOADED_SYMSRV_PATH: str | None = None
+
+
+class _VS_FIXEDFILEINFO(ctypes.Structure):
+    _fields_ = [
+        ("dwSignature", wintypes.DWORD),
+        ("dwStrucVersion", wintypes.DWORD),
+        ("dwFileVersionMS", wintypes.DWORD),
+        ("dwFileVersionLS", wintypes.DWORD),
+        ("dwProductVersionMS", wintypes.DWORD),
+        ("dwProductVersionLS", wintypes.DWORD),
+        ("dwFileFlagsMask", wintypes.DWORD),
+        ("dwFileFlags", wintypes.DWORD),
+        ("dwFileOS", wintypes.DWORD),
+        ("dwFileType", wintypes.DWORD),
+        ("dwFileSubtype", wintypes.DWORD),
+        ("dwFileDateMS", wintypes.DWORD),
+        ("dwFileDateLS", wintypes.DWORD),
+    ]
+
+
+def _read_file_version(path: str | None) -> str | None:
+    """Return a DLL FileVersion like ``10.0.29507.1001`` when available."""
+    if not path:
+        return None
+    try:
+        version = ctypes.WinDLL("version.dll", use_last_error=True)
+        get_size = version.GetFileVersionInfoSizeW
+        get_size.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(wintypes.DWORD)]
+        get_size.restype = wintypes.DWORD
+        get_info = version.GetFileVersionInfoW
+        get_info.argtypes = [
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            ctypes.c_void_p,
+        ]
+        get_info.restype = wintypes.BOOL
+        query = version.VerQueryValueW
+        query.argtypes = [
+            ctypes.c_void_p,
+            wintypes.LPCWSTR,
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.POINTER(wintypes.UINT),
+        ]
+        query.restype = wintypes.BOOL
+
+        handle = wintypes.DWORD()
+        size = get_size(path, ctypes.byref(handle))
+        if not size:
+            return None
+        buf = ctypes.create_string_buffer(size)
+        if not get_info(path, 0, size, buf):
+            return None
+        value_ptr = ctypes.c_void_p()
+        value_len = wintypes.UINT()
+        if not query(buf, "\\", ctypes.byref(value_ptr), ctypes.byref(value_len)):
+            return None
+        fixed = ctypes.cast(
+            value_ptr, ctypes.POINTER(_VS_FIXEDFILEINFO)
+        ).contents
+        if fixed.dwSignature != 0xFEEF04BD:
+            return None
+        major = fixed.dwFileVersionMS >> 16
+        minor = fixed.dwFileVersionMS & 0xFFFF
+        build = fixed.dwFileVersionLS >> 16
+        revision = fixed.dwFileVersionLS & 0xFFFF
+        return f"{major}.{minor}.{build}.{revision}"
+    except Exception:
+        return None
+
+
+def _module_path_from_handle(handle: int | None) -> str | None:
+    """Resolve a loaded module handle to its full path, best-effort."""
+    if not handle:
+        return None
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        get_module_file_name = kernel32.GetModuleFileNameW
+        get_module_file_name.argtypes = [
+            wintypes.HMODULE,
+            wintypes.LPWSTR,
+            wintypes.DWORD,
+        ]
+        get_module_file_name.restype = wintypes.DWORD
+        buf = ctypes.create_unicode_buffer(32768)
+        n = get_module_file_name(wintypes.HMODULE(handle), buf, len(buf))
+        if n:
+            return buf.value
+    except Exception:
+        pass
+    return None
+
+
+def _fallback_system_dbghelp_path() -> str:
+    system_root = os.environ.get("SystemRoot", r"C:\Windows")
+    return os.path.join(system_root, "System32", "dbghelp.dll")
+
+
+def _version_sort_key(path: str) -> tuple:
+    """Best-effort numeric sort key for WinDbg package/version directories."""
+    parts: list[tuple[int, int | str]] = []
+    for token in re.findall(r"\d+|[A-Za-z]+", path):
+        if token.isdigit():
+            parts.append((1, int(token)))
+        else:
+            parts.append((0, token.lower()))
+    return tuple(parts)
+
+
+def _candidate_dbghelp_paths() -> list[tuple[str, str | None]]:
+    """Return dbghelp candidates in priority order."""
+    candidates: list[tuple[str, str | None]] = []
+
+    env_dbghelp = os.environ.get("ETW_MCP_DBGHELP")
+    if env_dbghelp:
+        env_symsrv = os.environ.get("ETW_MCP_SYMSRV")
+        if not env_symsrv:
+            env_symsrv = os.path.join(os.path.dirname(env_dbghelp), "symsrv.dll")
+        candidates.append((env_dbghelp, env_symsrv))
+
+    candidates.append((r"C:\Debuggers\dbghelp.dll", r"C:\Debuggers\symsrv.dll"))
+
+    local_appdata = os.environ.get("LOCALAPPDATA")
+    if local_appdata:
+        local_windbg_hits = sorted(
+            glob.glob(
+                os.path.join(
+                    local_appdata,
+                    "Microsoft",
+                    "WinDbg",
+                    "*",
+                    "amd64",
+                    "dbghelp.dll",
+                )
+            ),
+            key=_version_sort_key,
+            reverse=True,
+        )
+        for path in local_windbg_hits:
+            candidates.append((path, os.path.join(os.path.dirname(path), "symsrv.dll")))
+
+    uwp_hits = sorted(
+        glob.glob(r"C:\Program Files\WindowsApps\Microsoft.WinDbg_*\x64\dbghelp.dll"),
+        key=_version_sort_key,
+        reverse=True,
+    )
+    for path in uwp_hits:
+        candidates.append((path, os.path.join(os.path.dirname(path), "symsrv.dll")))
+
+    candidates.extend([
+        (r"C:\Program Files\Windows Kits\10\Debuggers\x64\dbghelp.dll",
+         r"C:\Program Files\Windows Kits\10\Debuggers\x64\symsrv.dll"),
+        (r"C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\dbghelp.dll",
+         r"C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\symsrv.dll"),
+        ("dbghelp.dll", None),
+    ])
+
+    seen: set[str] = set()
+    out: list[tuple[str, str | None]] = []
+    for dbghelp_path, symsrv_path in candidates:
+        key = dbghelp_path.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append((dbghelp_path, symsrv_path))
+    return out
+
+
+def dbghelp_version_supports_msfz(version: str | None) -> bool | None:
+    """Heuristic: dbghelp 10.0 build >= 27000 is treated as MSFZ-capable.
+
+    Microsoft has not published the exact first supporting build. Known-bad
+    system builds are 10.0.26100.x; known-good WinDbg builds are 10.0.29507.x.
+    """
+    if not version:
+        return None
+    parts = version.split(".")
+    if len(parts) < 3:
+        return None
+    try:
+        major = int(parts[0])
+        build = int(parts[2])
+    except ValueError:
+        return None
+    if major != 10:
+        return None
+    return build >= 27000
+
+
+def dbghelp_supports_msfz() -> bool | None:
+    """Return whether the loaded dbghelp is expected to read MSFZ PDBs."""
+    return dbghelp_version_supports_msfz(LOADED_DBGHELP_VERSION)
+
+
 # Load dbghelp at import time. On non-Windows hosts this raises OSError;
 # the higher-level ``Symbolizer.is_available`` wrapper turns that into a
 # boolean so the rest of the codebase can probe safely.
@@ -82,44 +285,32 @@ MAX_SYM_NAME = 2000
 # symsrv.dll must be loaded from the SAME directory as dbghelp so it
 # satisfies dbghelp's import and handles the srv*cache*server path syntax.
 def _load_dbghelp() -> ctypes.WinDLL:
-    import os
+    global LOADED_DBGHELP_PATH, LOADED_DBGHELP_VERSION, LOADED_SYMSRV_PATH
 
-    candidates = [
-        # WinDbg external installation (common lab / dev setup).
-        (r"C:\Debuggers\dbghelp.dll",      r"C:\Debuggers\symsrv.dll"),
-        # WDK x64 Debuggers (usually older than the WinDbg build above).
-        (r"C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\dbghelp.dll",
-         r"C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\symsrv.dll"),
-        # System fallback — always present on Windows.
-        ("dbghelp.dll", None),
-    ]
-
-    # Insert any WinDbg UWP / Store installs discovered at runtime.
-    try:
-        import glob
-        uwp_hits = sorted(
-            glob.glob(
-                r"C:\Program Files\WindowsApps\Microsoft.WinDbg_*\x64\dbghelp.dll"
-            ),
-            reverse=True,  # highest version name first
-        )
-        for path in uwp_hits:
-            symsrv = os.path.join(os.path.dirname(path), "symsrv.dll")
-            candidates.insert(0, (path, symsrv))
-    except Exception:
-        pass
-
-    for dbghelp_path, symsrv_path in candidates:
+    for dbghelp_path, symsrv_path in _candidate_dbghelp_paths():
         if dbghelp_path != "dbghelp.dll" and not os.path.exists(dbghelp_path):
             continue
         # Load symsrv from the same directory first so dbghelp picks it up.
+        loaded_symsrv_path = None
         if symsrv_path and os.path.exists(symsrv_path):
             try:
                 ctypes.WinDLL(symsrv_path, use_last_error=True)
+                loaded_symsrv_path = symsrv_path
             except OSError:
                 pass
         try:
-            return ctypes.WinDLL(dbghelp_path, use_last_error=True)
+            dll = ctypes.WinDLL(dbghelp_path, use_last_error=True)
+            loaded_path = _module_path_from_handle(getattr(dll, "_handle", None))
+            if not loaded_path:
+                loaded_path = (
+                    os.path.abspath(dbghelp_path)
+                    if dbghelp_path != "dbghelp.dll"
+                    else _fallback_system_dbghelp_path()
+                )
+            LOADED_DBGHELP_PATH = loaded_path
+            LOADED_DBGHELP_VERSION = _read_file_version(loaded_path)
+            LOADED_SYMSRV_PATH = loaded_symsrv_path
+            return dll
         except OSError:
             continue
 
@@ -289,6 +480,11 @@ __all__ = [
     "SSRVOPT_GUIDPTR",
     "SSRVOPT_DWORDPTR",
     "MAX_SYM_NAME",
+    "LOADED_DBGHELP_PATH",
+    "LOADED_DBGHELP_VERSION",
+    "LOADED_SYMSRV_PATH",
+    "dbghelp_version_supports_msfz",
+    "dbghelp_supports_msfz",
     "SymInitializeW",
     "SymCleanup",
     "SymSetOptions",
