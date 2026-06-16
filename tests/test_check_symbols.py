@@ -221,3 +221,143 @@ def test_check_symbols_legacy_cache_emits_note_and_falls_back(tmp_path: Path):
     assert "% Resolved" in out
     assert "From PDB" not in out
     assert "From Export" not in out
+
+
+# ---------------------------------------------------------------------------
+# M4: kernel EXPORT_ONLY remediation hint
+# ---------------------------------------------------------------------------
+
+
+def _register_trace_with_image_and_cpu(
+    tmp_path: Path,
+    cpu_df: pd.DataFrame,
+    image_rows: list | None = None,
+    *,
+    trace_id: str = "trace_kernel_hint",
+) -> trace_mgmt.TraceData:
+    """Register a TraceData with both cpu_sampling and optional image DF."""
+    etl = tmp_path / f"{trace_id}.etl"
+    etl.write_bytes(b"synthetic")
+    t = trace_mgmt.TraceData(
+        trace_id=trace_id,
+        etl_path=etl,
+        export_dir=tmp_path / f".export-{trace_id}",
+        symbol_path="srv*C:\\symbols*https://msdl.microsoft.com/download/symbols",
+    )
+    t.raw_csv["cpu_sampling"] = cpu_df
+    if image_rows is not None:
+        t.raw_csv["image"] = pd.DataFrame(image_rows)
+    trace_mgmt.register_trace(t)
+    return t
+
+
+def test_check_symbols_kernel_export_only_shows_remediation_hint(tmp_path: Path):
+    """A kernel module stuck on EXPORT_ONLY gets a remediation hint with
+    the trace GUID and a pointer to symbol-path / dbghelp guidance."""
+    cpu_df = pd.DataFrame({
+        "Process Name": ["System"] * 5,
+        "PID": [4] * 5,
+        "Weight": [200] * 5,
+        "% Weight": [100.0] * 5,
+        "Module": ["ntoskrnl.exe"] * 5,
+        "Function": [f"export_guess_{i}" for i in range(5)],
+        "SymbolSource": ["export"] * 5,
+    })
+    image_rows = [
+        {
+            "FileName": r"\Windows\System32\ntoskrnl.exe",
+            "ImageBase": 0xFFFFF8057E600000,
+            "ImageSize": 0x900000,
+            "PdbGuid": "AFB1E3B1-3754-8BA7-3B92-C060D6D5605F",
+            "PdbAge": 1,
+            "PdbName": "ntkrnlmp.pdb",
+        }
+    ]
+    trace = _register_trace_with_image_and_cpu(tmp_path, cpu_df, image_rows)
+
+    out = trace_mgmt.check_symbols(trace.trace_id)
+
+    assert "ntoskrnl.exe" in out
+    assert "EXPORT_ONLY" in out
+    # Kernel-specific remediation line.
+    assert "Kernel module" in out
+    # Must name the GUID from the trace identity.
+    assert "AFB1E3B1" in out
+    # Must mention dbghelp or symbol path.
+    assert "dbghelp" in out.lower() or "_NT_SYMBOL_PATH" in out
+
+
+def test_check_symbols_sys_driver_export_only_shows_hint(tmp_path: Path):
+    """A .sys driver (not ntoskrnl.exe) also gets the kernel remediation hint."""
+    cpu_df = pd.DataFrame({
+        "Process Name": ["System"] * 5,
+        "PID": [4] * 5,
+        "Weight": [300] * 5,
+        "% Weight": [100.0] * 5,
+        "Module": ["tcpip.sys"] * 5,
+        "Function": [f"export_{i}" for i in range(5)],
+        "SymbolSource": ["export"] * 5,
+    })
+    image_rows = [
+        {
+            "FileName": r"\Windows\System32\drivers\tcpip.sys",
+            "ImageBase": 0xFFFFF80500000000,
+            "ImageSize": 0x400000,
+            "PdbGuid": "BBBB1234-0000-1111-CCCC-DDDDEEEE0001",
+            "PdbAge": 2,
+            "PdbName": "tcpip.pdb",
+        }
+    ]
+    trace = _register_trace_with_image_and_cpu(tmp_path, cpu_df, image_rows)
+
+    out = trace_mgmt.check_symbols(trace.trace_id)
+
+    assert "tcpip.sys" in out
+    assert "EXPORT_ONLY" in out
+    assert "Kernel module" in out
+    assert "BBBB1234" in out
+
+
+def test_check_symbols_usermode_export_only_no_kernel_hint(tmp_path: Path):
+    """A user-mode DLL stuck on EXPORT_ONLY must NOT get the kernel-specific
+    hint (the hint is only for kernel-mode modules)."""
+    cpu_df = pd.DataFrame({
+        "Process Name": ["app.exe"] * 5,
+        "PID": [1000] * 5,
+        "Weight": [100] * 5,
+        "% Weight": [100.0] * 5,
+        "Module": ["mswsock.dll"] * 5,
+        "Function": [f"export_{i}" for i in range(5)],
+        "SymbolSource": ["export"] * 5,
+    })
+    trace = _register_trace_with_image_and_cpu(tmp_path, cpu_df)
+
+    out = trace_mgmt.check_symbols(trace.trace_id)
+
+    assert "mswsock.dll" in out
+    assert "EXPORT_ONLY" in out
+    # Kernel-specific hint must NOT appear for a user-mode module.
+    assert "Kernel module resolved export-only" not in out
+
+
+def test_check_symbols_kernel_no_image_df_shows_generic_hint(tmp_path: Path):
+    """Kernel module EXPORT_ONLY without trace GUID (old cache) still gets
+    a generic remediation hint (without the GUID)."""
+    cpu_df = pd.DataFrame({
+        "Process Name": ["System"] * 5,
+        "PID": [4] * 5,
+        "Weight": [200] * 5,
+        "% Weight": [100.0] * 5,
+        "Module": ["ntoskrnl.exe"] * 5,
+        "Function": [f"export_{i}" for i in range(5)],
+        "SymbolSource": ["export"] * 5,
+    })
+    # No image DF -- trace GUID unavailable.
+    trace = _register_trace_with_image_and_cpu(tmp_path, cpu_df, image_rows=None)
+
+    out = trace_mgmt.check_symbols(trace.trace_id)
+
+    assert "ntoskrnl.exe" in out
+    assert "EXPORT_ONLY" in out
+    assert "Kernel module" in out
+    assert "dbghelp" in out.lower() or "_NT_SYMBOL_PATH" in out

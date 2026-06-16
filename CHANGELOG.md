@@ -4,6 +4,60 @@ All notable changes to etw-mcp are documented here. Format follows [Keep a Chang
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-06-15
+
+### Fixed
+
+- **Kernel-mode stack frames now resolve from PDBs** via captured DbgID_RSDS identity.
+  Previously all kernel-mode frames (ntoskrnl.exe, tcpip.sys, afd.sys, mlx5.sys, etc.)
+  were resolved using PE export-table fallback only -- ntoskrnl showed bogus symbols such
+  as MmCopyMemory, strncpy, and FsRtlAreNamesEqual; driver frames were blank.
+  Root cause: the symbolizer called `SymLoadModuleEx` with the analyst box's local kernel
+  image path, causing dbghelp to derive the wrong PDB GUID from the local image instead
+  of from the trace.
+  Fix (M1-M5): the .NET sidecar and native in-process consumer now capture each image's
+  DbgID_RSDS record (PdbGuid, PdbAge, PdbName) at trace-dump time. The symbolizer calls
+  `SymFindFileInPathW(SSRVOPT_GUIDPTR)` with the exact RSDS identity to locate and load
+  the correct PDB from the symbol server, completely bypassing the local image.
+
+- **CPU sampling aggregator now preserves kernel-space InstructionPointer values** when
+  building `cpu_sampling.parquet`. Kernel addresses (bit-63 set, e.g. 0xFFFFF8...) stored
+  as uint64 in the sampled_profile parquet were previously cast to int64, making them
+  negative Python ints; the ip_to_label dict lookup then failed to find them (signed
+  -N != unsigned 2^64-N as a dict key). Result: ntoskrnl and all other kernel modules
+  appeared as Module="unknown" in get_hot_functions even when the symbolizer correctly
+  resolved those addresses. Fix: use `int(x)` (Python's arbitrary-precision int) instead
+  of `.astype("int64")` -- `int()` preserves the full unsigned value for all dtype inputs.
+
+- **Native in-process mode now decodes ImageID/DbgID_RSDS events** (event-class GUID
+  `b3e675d7-...`) to populate PdbGuid/PdbAge/PdbName per image. Previously these events
+  were silently dropped by the in-process consumer; the Symbolizer could only use the
+  PE-export fallback path when running in native mode. (M5/M5b)
+
+- `diagnose_symbol_load` / `check_symbols`: follow `file.ptr` redirects in downstream
+  symbol stores before reporting a module as MISSING. (#20)
+
+- `export_analysis`: honor the `filter_query` argument instead of returning the
+  unfiltered full-trace template. (#21)
+
+### Changed (breaking)
+
+- **Cache schema `EVENT_SCHEMA_VERSION` bumped 1 -> 2.** The native image parquet schema
+  now carries `PdbGuid`, `PdbAge`, `PdbName`, and `TimeDateStamp` columns per image row.
+  All existing `.etw-export-*` cache directories from v0.6.x are invalidated; the next
+  `load_trace` call re-extracts from the ETL automatically. No back-compat by design.
+
+### Requirements (operational)
+
+- **MSFZ-format PDB stores require a recent `dbghelp.dll`** (v10.0.29507 or later).
+  Internal Microsoft and lab symbol servers distribute kernel/driver PDBs in MSFZ
+  (compressed) format; the system dbghelp.dll (v10.0.26100, shipped with Windows) cannot
+  load them and falls back to PE-export-table symbols. etw-mcp now prefers the WinDbg
+  "Debugging Tools for Windows" dbghelp at `C:\Debuggers\dbghelp.dll` over the system one
+  when it is present. Users with only the system dbghelp will see EXPORT_ONLY for
+  MSFZ-stored symbols; public Microsoft symbol server (msdl.microsoft.com) PDBs use
+  standard MSF7 format and are unaffected.
+
 ## [0.6.2] - 2026-06-15
 
 ### Fixed

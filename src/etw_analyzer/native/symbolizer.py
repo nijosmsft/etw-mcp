@@ -112,10 +112,11 @@ class Symbolizer:
 
     def __init__(self, symbol_path: Optional[str] = None) -> None:
         from .bindings import dbghelp  # local import so non-Windows fails late
-        from .bindings.types import SYMBOL_INFOW
+        from .bindings.types import SYMBOL_INFOW, IMAGEHLP_MODULEW64
 
         self._dbghelp = dbghelp
         self._SYMBOL_INFOW = SYMBOL_INFOW
+        self._IMAGEHLP_MODULEW64 = IMAGEHLP_MODULEW64
         self._symbol_path = resolve_symbol_path(symbol_path)
         self._handle = _next_synthetic_handle()
         self._initialized = False
@@ -286,23 +287,34 @@ class Symbolizer:
         image_base: int,
         image_size: int,
         file_path: str,
+        *,
+        pdb_guid: Optional[str] = None,
+        pdb_age: Optional[int] = None,
+        pdb_name: Optional[str] = None,
+        time_date_stamp: Optional[int] = None,
     ) -> None:
         """Register a loaded module from an ImageLoad event.
 
+        When ``pdb_guid`` and ``pdb_name`` are provided (M3 identity path),
+        the method calls ``SymFindFileInPathW(SSRVOPT_GUIDPTR)`` to resolve
+        the PDB by exact GUID+Age through every element of the symbol path
+        (flat dirs, two-tier ``file.ptr`` stores, ``srv*...*http(s)``
+        servers), then loads the returned PDB path via ``SymLoadModuleExW``.
+        This gives real function names for kernel modules captured from a
+        different build than the analyst box.
+
+        When ``pdb_guid`` is absent (or ``SymFindFileInPathW`` fails/misses),
+        the call falls back to the legacy local-image load — identical to
+        the pre-M3 behaviour.
+
         Idempotent: re-registering the same base updates the recorded
-        size / path but does not re-call ``SymLoadModuleExW`` (which
-        would simply return the same loaded address). ImageLoad events
-        emitted during a kernel rundown can show the same module at the
-        same base multiple times — we tolerate that without rework.
+        size / path but does not re-call ``SymLoadModuleExW``.  ImageLoad
+        events emitted during a kernel rundown can show the same module at
+        the same base multiple times — we tolerate that without rework.
         """
 
         if not image_base:
             return
-        # File names from ETW often have NT-form prefixes
-        # (``\SystemRoot\…`` / ``\Device\HarddiskVolume3\…``). dbghelp's
-        # SymLoadModuleExW needs a path it can stat or at least extract a
-        # name from; both forms produce a usable basename via
-        # ``Path(..).name``, so we don't need to rewrite paths upfront.
         path_for_dbghelp = _normalize_image_path(file_path)
 
         with self._lock:
@@ -314,13 +326,110 @@ class Symbolizer:
                 "ImageSize": image_size,
                 "FileName": file_path,
                 "DbgHelpPath": path_for_dbghelp,
+                "identity_source": "image",
             }
             self._rebuild_index()
 
             if existing is not None:
+                # Preserve the DbgHelpPath (and identity_source) from the
+                # first successful load so deferred-load retries keep using
+                # the correct PDB path instead of reverting to the legacy
+                # local-image path.
+                self._modules[image_base]["DbgHelpPath"] = existing.get(
+                    "DbgHelpPath", path_for_dbghelp
+                )
+                self._modules[image_base]["identity_source"] = existing.get(
+                    "identity_source", "image"
+                )
                 return
 
             d = self._dbghelp
+
+            # ------------------------------------------------------------------
+            # Option A (M3): RSDS exact-identity load via SymFindFileInPathW.
+            # Requires both pdb_guid and pdb_name.  Any failure degrades
+            # gracefully to the legacy local-image load below.
+            # ------------------------------------------------------------------
+            if pdb_guid and pdb_name:
+                try:
+                    from .bindings.types import guid_from_string
+                    guid = guid_from_string(pdb_guid)
+                    found_buf = ctypes.create_unicode_buffer(1024)
+                    ok = d.SymFindFileInPathW(
+                        self._handle,
+                        None,           # use search path from SymInitializeW
+                        pdb_name,
+                        ctypes.cast(ctypes.pointer(guid), ctypes.c_void_p),
+                        wintypes.DWORD(int(pdb_age or 0)),
+                        wintypes.DWORD(0),
+                        wintypes.DWORD(d.SSRVOPT_GUIDPTR),
+                        found_buf,
+                        None,
+                        None,
+                    )
+                    if ok and found_buf.value:
+                        found_pdb_path = found_buf.value
+                        logger.debug(
+                            "SymFindFileInPathW found %s -> %s",
+                            pdb_name, found_pdb_path,
+                        )
+                        loaded = d.SymLoadModuleExW(
+                            self._handle,
+                            None,
+                            found_pdb_path,
+                            None,
+                            ctypes.c_ulonglong(image_base),
+                            wintypes.DWORD(image_size & 0xFFFFFFFF),
+                            None,
+                            wintypes.DWORD(0),
+                        )
+                        if not loaded:
+                            err = ctypes.get_last_error()
+                            if err != 0:
+                                logger.debug(
+                                    "SymLoadModuleExW(rsds) failed for %s @ 0x%x: err=%d",
+                                    found_pdb_path, image_base, err,
+                                )
+                        # Update to the found PDB path for deferred-load retries.
+                        self._modules[image_base]["DbgHelpPath"] = found_pdb_path
+                        self._modules[image_base]["identity_source"] = "rsds"
+
+                        # Optional: verify the load actually yielded PDB symbols.
+                        mi = self._IMAGEHLP_MODULEW64()
+                        mi.SizeOfStruct = ctypes.sizeof(self._IMAGEHLP_MODULEW64)
+                        if d.SymGetModuleInfoW64(
+                            self._handle,
+                            ctypes.c_ulonglong(image_base),
+                            ctypes.byref(mi),
+                        ):
+                            if mi.SymType == d.SymExport:
+                                logger.warning(
+                                    "RSDS load did not yield PDB symbols for %s "
+                                    "@ 0x%x (SymType=SymExport after rsds load); "
+                                    "GUID=%s age=%s",
+                                    pdb_name, image_base, pdb_guid, pdb_age,
+                                )
+                        return
+                    else:
+                        err = ctypes.get_last_error()
+                        logger.debug(
+                            "SymFindFileInPathW miss for %s GUID=%s age=%s err=%d; "
+                            "falling back to local image",
+                            pdb_name, pdb_guid, pdb_age, err,
+                        )
+                except Exception as exc:
+                    logger.debug(
+                        "RSDS identity load error for GUID=%s pdb=%s: %s; "
+                        "falling back to local image",
+                        pdb_guid, pdb_name, exc,
+                    )
+
+            # ------------------------------------------------------------------
+            # Legacy path: load via the local image on disk.  This is what
+            # the pre-M3 code always did; it works for modules whose local
+            # image matches the trace (most user-mode DLLs), and serves as
+            # the fallback when RSDS lookup misses.
+            # ------------------------------------------------------------------
             loaded = d.SymLoadModuleExW(
                 self._handle,
                 None,                 # hFile — we never have one

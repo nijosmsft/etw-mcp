@@ -255,7 +255,15 @@ def _ensure_symbolizer_from_image_index(
             continue
         seen_bases.add(item.base)
         try:
-            symbolizer.add_module(item.base, item.end - item.base, item.file_name)
+            symbolizer.add_module(
+                item.base,
+                item.end - item.base,
+                item.file_name,
+                pdb_guid=item.pdb_guid,
+                pdb_age=item.pdb_age,
+                pdb_name=item.pdb_name,
+                time_date_stamp=item.time_date_stamp,
+            )
         except Exception:
             continue
     trace.symbolizer = symbolizer

@@ -751,21 +751,55 @@ def _safe_returncode(proc: subprocess.Popen) -> int | None:
         return getattr(proc, "returncode", None)
 
 
+_PROMOTE_RENAME_RETRIES = 4
+_PROMOTE_RENAME_BACKOFF_S = 0.25  # multiplied by (attempt + 1)
+_PROMOTE_RMTREE_RETRIES = 3
+_PROMOTE_RMTREE_BACKOFF_S = 0.1   # multiplied by (attempt + 1)
+
+
 def _promote_staging_cache(staging_dir: Path, export_dir: Path) -> None:
-    backup_dir: Path | None = None
+    """Rename staging_dir to export_dir, replacing any existing export_dir.
+
+    On Windows, Path.rename() (MoveFileExW) can fail with PermissionError /
+    WinError 5 when a file inside staging_dir is transiently held open by an
+    external process (Windows Defender, search indexer, or delayed release of
+    C++ extension objects in the aggregation worker).  We retry with linear
+    back-off so callers see a reliable promote rather than a spurious fallback
+    to the xperf pipeline.
+
+    If export_dir already exists (stale cache not yet deleted, or a prior
+    call was interrupted) it is removed with shutil.rmtree before the rename
+    so the target path is free.  The rmtree is also retried on PermissionError
+    for the same reason.
+    """
     if export_dir.exists():
-        backup_dir = export_dir.parent / (
-            f"{export_dir.name}.worker-backup-{uuid.uuid4().hex}"
-        )
-        export_dir.rename(backup_dir)
-    try:
-        staging_dir.rename(export_dir)
-    except Exception:
-        if backup_dir is not None and backup_dir.exists() and not export_dir.exists():
-            backup_dir.rename(export_dir)
-        raise
-    if backup_dir is not None:
-        _remove_dir(backup_dir)
+        _rmtree_with_retry(export_dir)
+
+    last_exc: Exception | None = None
+    for attempt in range(_PROMOTE_RENAME_RETRIES):
+        try:
+            staging_dir.rename(export_dir)
+            return
+        except PermissionError as exc:
+            last_exc = exc
+            time.sleep(_PROMOTE_RENAME_BACKOFF_S * (attempt + 1))
+    # Exhausted retries — propagate the last PermissionError.
+    assert last_exc is not None
+    raise last_exc
+
+
+def _rmtree_with_retry(path: Path) -> None:
+    """Remove a directory tree, retrying briefly on Windows PermissionError."""
+    last_exc: Exception | None = None
+    for attempt in range(_PROMOTE_RMTREE_RETRIES):
+        try:
+            shutil.rmtree(path)
+            return
+        except PermissionError as exc:
+            last_exc = exc
+            time.sleep(_PROMOTE_RMTREE_BACKOFF_S * (attempt + 1))
+    if last_exc is not None:
+        raise last_exc
 
 
 def _remove_dir(path: Path) -> None:

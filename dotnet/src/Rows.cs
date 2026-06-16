@@ -201,6 +201,10 @@ internal sealed class ImageRow
     public long ImageSize;
     public long TimeDateStamp;
     public string? FileName;
+    // PDB identity from DbgID/RSDS rundown (null when no RSDS record matched).
+    public string? PdbGuid;  // canonical uppercase hyphenated, e.g. AFB1E3B1-3754-8BA7-3B92-C060D6D5605F
+    public int? PdbAge;
+    public string? PdbName;  // basename only, e.g. ntkrnlmp.pdb
 }
 
 /// <summary>DiskIo row (read/write).</summary>

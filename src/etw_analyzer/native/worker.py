@@ -170,6 +170,7 @@ def build_native_cache(
     wanted_with_aux = set(requested)
     wanted_with_aux.update({
         "Image/Load", "Image/DCStart",
+        "ImageID/DbgID_RSDS",           # M5: PDB identity for kernel symbol resolution
         "PerfInfo/DPC", "PerfInfo/ThreadedDPC",
         "PerfInfo/TimerDPC", "PerfInfo/ISR",
         "Process/Start", "Process/End",

@@ -50,27 +50,64 @@ class _ImageInterval:
     end: int
     file_name: str
     module: str
+    # M2: PDB identity carried for M3's exact-GUID dbghelp load path.
+    # All four may be None for rows where the sidecar found no matching
+    # RSDS event (user-mode images, or native-mode captures before M5).
+    pdb_guid: str | None
+    pdb_age: int | None
+    pdb_name: str | None
+    time_date_stamp: int | None
 
 
 class _ImageIndex:
     def __init__(self) -> None:
         self._intervals: list[_ImageInterval] = []
         self._starts: list[int] = []
+        # M2: per-ImageBase PDB identity dict for M3 to consume at
+        # add_module call sites.  Key: ImageBase (int), value: dict with
+        # keys pdb_guid, pdb_age, pdb_name, time_date_stamp.
+        self.pdb_identity: dict[int, dict] = {}
 
-    def add(self, base: int, size: int, file_name: str) -> None:
+    def add(
+        self,
+        base: int,
+        size: int,
+        file_name: str,
+        *,
+        pdb_guid: str | None = None,
+        pdb_age: int | None = None,
+        pdb_name: str | None = None,
+        time_date_stamp: int | None = None,
+    ) -> None:
         if base <= 0 or size <= 0:
             return
         module = _module_basename(file_name)
         if not module:
             return
+        base_i = int(base)
         self._intervals.append(
             _ImageInterval(
-                base=int(base),
-                end=int(base) + int(size),
+                base=base_i,
+                end=base_i + int(size),
                 file_name=str(file_name or ""),
                 module=module,
+                pdb_guid=pdb_guid,
+                pdb_age=pdb_age,
+                pdb_name=pdb_name,
+                time_date_stamp=time_date_stamp,
             )
         )
+        # Stash identity for M3's add_module call site.  First-seen base wins
+        # (DCStart and Load for the same module share the same identity).
+        if base_i not in self.pdb_identity and any(
+            v is not None for v in (pdb_guid, pdb_age, pdb_name, time_date_stamp)
+        ):
+            self.pdb_identity[base_i] = {
+                "pdb_guid": pdb_guid,
+                "pdb_age": pdb_age,
+                "pdb_name": pdb_name,
+                "time_date_stamp": time_date_stamp,
+            }
 
     def finalize(self) -> None:
         self._intervals.sort(key=lambda item: item.base)
@@ -443,7 +480,14 @@ def _load_dimensions(store: "NativeEventStore", *, batch_size: int) -> _Dimensio
                 continue
             tid_to_pid.setdefault(tid, pid)
 
-    image_cols = ["ImageBase", "ImageSize", "FileName", "Type", "ProcessId"]
+    # M2: include the 4 identity columns so PDB GUID/Age/Name and
+    # TimeDateStamp survive from parquet to the _ImageIndex.  These are
+    # nullable (old caches / native-mode rows may lack them); iter_batches
+    # returns None for absent values.
+    image_cols = [
+        "ImageBase", "ImageSize", "FileName", "Type", "ProcessId",
+        "TimeDateStamp", "PdbGuid", "PdbAge", "PdbName",
+    ]
     for batch in store.iter_batches(
         "image",
         columns=image_cols,
@@ -452,6 +496,7 @@ def _load_dimensions(store: "NativeEventStore", *, batch_size: int) -> _Dimensio
     ):
         if batch.empty:
             continue
+        # zip over the core columns; pull identity columns per-row below.
         for base, size, file_name in zip(
             batch.get("ImageBase", pd.Series(dtype="object")),
             batch.get("ImageSize", pd.Series(dtype="object")),
@@ -462,6 +507,65 @@ def _load_dimensions(store: "NativeEventStore", *, batch_size: int) -> _Dimensio
             if base_i is None or size_i is None:
                 continue
             image_index.add(base_i, size_i, _clean_text(file_name))
+        # Second pass: populate pdb_identity for rows that have GUID data.
+        # Iterating over records is simpler than indexing four optional columns.
+        for row in batch.to_dict(orient="records"):
+            base_i = _safe_int(row.get("ImageBase"))
+            if base_i is None or base_i <= 0:
+                continue
+            if base_i in image_index.pdb_identity:
+                continue  # already recorded from a DCStart row
+            pdb_guid = row.get("PdbGuid") or None
+            pdb_age = _safe_int(row.get("PdbAge"))
+            pdb_name = row.get("PdbName") or None
+            tds = _safe_int(row.get("TimeDateStamp"))
+            if any(v is not None for v in (pdb_guid, pdb_age, pdb_name, tds)):
+                image_index.pdb_identity[base_i] = {
+                    "pdb_guid": str(pdb_guid) if pdb_guid else None,
+                    "pdb_age": pdb_age,
+                    "pdb_name": str(pdb_name) if pdb_name else None,
+                    "time_date_stamp": tds,
+                }
+
+    # M5: read ImageID/DbgID_RSDS records and merge PDB identity into
+    # image_index.pdb_identity for bases the image-row pass left blank.
+    # Graceful for old event stores that lack "imageid_rsds": iter_batches
+    # returns immediately with no data (returns [] or empty batches).
+    rsds_fallback: dict[int, dict] = {}
+    for batch in store.iter_batches(
+        "imageid_rsds",
+        columns=["ProcessId", "ImageBase", "PdbGuid", "PdbAge", "PdbName"],
+        include_time=False,
+        batch_size=batch_size,
+    ):
+        if batch.empty:
+            continue
+        for row in batch.to_dict(orient="records"):
+            base_i = _safe_int(row.get("ImageBase"))
+            if base_i is None or base_i == 0:
+                continue
+            if base_i not in rsds_fallback:
+                rsds_fallback[base_i] = row
+
+    if rsds_fallback:
+        for interval in image_index.intervals:
+            base_i = interval.base
+            if base_i in image_index.pdb_identity:
+                continue
+            rsds = rsds_fallback.get(base_i)
+            if rsds is None:
+                continue
+            pdb_guid = rsds.get("PdbGuid") or None
+            pdb_age = _safe_int(rsds.get("PdbAge"))
+            pdb_name = rsds.get("PdbName") or None
+            if pdb_guid or pdb_name:
+                image_index.pdb_identity[base_i] = {
+                    "pdb_guid": str(pdb_guid) if pdb_guid else None,
+                    "pdb_age": pdb_age,
+                    "pdb_name": str(pdb_name) if pdb_name else None,
+                    "time_date_stamp": None,
+                }
+
     image_index.finalize()
 
     process_table = _process_table_from_rows(process_rows)
@@ -810,13 +914,28 @@ def _build_symbolizer_from_images(trace: "TraceData", image_index: _ImageIndex) 
     except Exception:
         return
 
+    # M2: stash the per-base PDB identity dict on the trace so M3 can pass
+    # pdb_guid/pdb_age/pdb_name/time_date_stamp to the extended add_module.
+    # Seam: trace.pdb_identity[ImageBase] = {pdb_guid, pdb_age, pdb_name,
+    # time_date_stamp}.  M2 does NOT change the add_module call yet.
+    if image_index.pdb_identity:
+        trace.pdb_identity = dict(image_index.pdb_identity)
+
     seen_bases: set[int] = set()
     for item in image_index.intervals:
         if item.base in seen_bases:
             continue
         seen_bases.add(item.base)
         try:
-            symbolizer.add_module(item.base, item.end - item.base, item.file_name)
+            symbolizer.add_module(
+                item.base,
+                item.end - item.base,
+                item.file_name,
+                pdb_guid=item.pdb_guid,
+                pdb_age=item.pdb_age,
+                pdb_name=item.pdb_name,
+                time_date_stamp=item.time_date_stamp,
+            )
         except Exception:
             continue
     trace.symbolizer = symbolizer

@@ -502,6 +502,30 @@ Multiple paths can be combined with semicolons. Add local PDB directories for yo
 _NT_SYMBOL_PATH=srv*C:\symbols*https://msdl.microsoft.com/download/symbols;C:\myproject\build\bin
 ```
 
+### Kernel symbol resolution
+
+Starting in v0.7.0, etw-mcp resolves kernel-mode symbols (ntoskrnl.exe, tcpip.sys, afd.sys,
+driver stack frames, etc.) correctly from cross-machine traces. Previously, the symbolizer
+read the local analyst box's kernel image to derive the PDB GUID, which produced wrong
+symbols on any machine that didn't match the trace host (bogus ntoskrnl entries such as
+`MmCopyMemory`, `strncpy`, and `FsRtlAreNamesEqual`). Now the sidecar and native consumer
+capture the exact PDB identity (GUID, age, name) from each image's `DbgID_RSDS` rundown
+record embedded in the ETL, and the symbolizer loads PDBs by that exact identity via
+`SymFindFileInPathW`. The result is correct PDB-resolved function names for all kernel
+modules regardless of the analyst machine's installed OS version.
+
+**MSFZ PDB format requirement.** Internal and lab symbol servers (including Microsoft's
+internal `symweb`) distribute kernel/driver PDBs in MSFZ (compressed) format. The system
+`dbghelp.dll` (v10.0.26100, shipped with Windows) cannot load MSFZ PDBs and silently falls
+back to PE export-table symbols. etw-mcp automatically prefers the WinDbg "Debugging Tools
+for Windows" `dbghelp.dll` at `C:\Debuggers\dbghelp.dll` (v10.0.29507 or later) over the
+system one when it is present. Install WinDbg Preview from the Microsoft Store, or the
+standalone Debugging Tools for Windows from the Windows ADK, to enable MSFZ support.
+
+Public Microsoft symbol server (`msdl.microsoft.com`) PDBs use standard MSF7 format and
+work correctly with the system `dbghelp.dll`. Only internal/lab PDB stores require the
+upgraded dbghelp.
+
 ## Contributing
 
 Contributions welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for the project structure, how to run tests, and how maintainers publish releases. Please [open an issue](https://github.com/nijosmsft/etw-mcp/issues) first to discuss what you'd like to change.

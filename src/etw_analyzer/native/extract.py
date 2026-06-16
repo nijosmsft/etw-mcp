@@ -114,6 +114,7 @@ KERNEL_AUXILIARY_CLASSES: tuple[str, ...] = (
     "Image/DCEnd",
     "Image/KernelBase",
     "Image/HypercallPage",
+    "ImageID/DbgID_RSDS",       # M5: PDB identity records (provider b059b83f-...)
     "DiskIo/Read",
     "DiskIo/Write",
     "DiskIo/FlushBuffers",
@@ -316,6 +317,75 @@ def _enrich_native_sampled_profile(results: dict[str, pd.DataFrame]) -> None:
         results["SampledProfile"] = enriched
 
 
+# Image-load canonical class names that may receive RSDS identity data.
+_IMAGE_LOAD_CLASSES: tuple[str, ...] = (
+    "Image/Load",
+    "Image/Unload",
+    "Image/DCStart",
+    "Image/DCEnd",
+    "Image/KernelBase",
+    "Image/HypercallPage",
+)
+
+
+def _merge_rsds_into_image_rows(rows_by_class: dict[str, list[dict]]) -> None:
+    """Merge ``ImageID/DbgID_RSDS`` PDB identity into image-load row dicts.
+
+    Runs in-place on *rows_by_class* **before** DataFrames are constructed so
+    that the resulting ``Image/Load`` / ``Image/DCStart`` DataFrames carry
+    ``PdbGuid`` / ``PdbAge`` / ``PdbName`` columns for every image that has a
+    matching RSDS record.
+
+    Join strategy (mirrors the .NET sidecar M1 logic):
+
+    1. Primary key: ``(ProcessId, ImageBase)``  -- exact match.
+    2. Fallback key: ``ImageBase`` alone -- safe for kernel images (base
+       address is globally unique per boot session); acceptable for user-mode
+       because the PDB identity is a property of the file, not the process.
+
+    Rows that already have a non-empty ``PdbGuid`` are left untouched (they
+    were populated by the sidecar or an earlier pass).
+    """
+    rsds_rows: list[dict] = rows_by_class.get("ImageID/DbgID_RSDS", [])
+    if not rsds_rows:
+        return
+
+    # Build two lookup tables in a single pass.
+    primary: dict[tuple[int, int], dict] = {}
+    fallback: dict[int, dict] = {}
+    for r in rsds_rows:
+        base = int(r.get("ImageBase") or 0)
+        if base == 0:
+            continue
+        pid = int(r.get("ProcessId") or 0)
+        key = (pid, base)
+        if key not in primary:
+            primary[key] = r
+        if base not in fallback:
+            fallback[base] = r
+
+    if not primary and not fallback:
+        return
+
+    for class_name in _IMAGE_LOAD_CLASSES:
+        rows = rows_by_class.get(class_name)
+        if not rows:
+            continue
+        for row in rows:
+            if row.get("PdbGuid"):
+                continue
+            base = int(row.get("ImageBase") or 0)
+            if base == 0:
+                continue
+            pid = int(row.get("ProcessId") or 0)
+            rsds = primary.get((pid, base)) or fallback.get(base)
+            if rsds is None:
+                continue
+            row["PdbGuid"] = rsds["PdbGuid"]
+            row["PdbAge"] = rsds["PdbAge"]
+            row["PdbName"] = rsds["PdbName"]
+
+
 def extract_events(
     etl_paths: Path | str | Iterable[Path | str],
     *,
@@ -504,6 +574,13 @@ def extract_events(
     with EtwConsumer(paths_iter, on_event) as cons:
         stats = cons.run()
     elapsed = time.perf_counter() - start
+
+    # M5: merge RSDS PDB identity into image-load row dicts before DataFrames
+    # are materialized.  After this call, Image/Load and Image/DCStart rows
+    # that have a matching ImageID/DbgID_RSDS record carry PdbGuid/PdbAge/
+    # PdbName, which _build_symbolizer_from_images() uses to populate
+    # trace.pdb_identity so add_module() can locate PDBs on the symbol server.
+    _merge_rsds_into_image_rows(rows_by_class)
 
     # Build the result map. Every requested class is present (empty
     # DataFrame if nothing decoded). Auxiliary classes (StackWalk,

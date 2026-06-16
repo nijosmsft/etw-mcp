@@ -41,7 +41,7 @@ class _StubSymbolizer:
     def __init__(self, symbol_path=None):
         self._modules: dict[int, tuple[int, str]] = {}
 
-    def add_module(self, base: int, size: int, file_name: str) -> None:
+    def add_module(self, base: int, size: int, file_name: str, **kwargs) -> None:
         self._modules[base] = (size, file_name)
 
     def resolve(self, address: int) -> str:
@@ -76,6 +76,7 @@ class _FakeTrace:
         self.raw_csv = raw_csv
         self.symbolizer = None
         self.symbol_path = None
+        self.pdb_identity: dict = {}
 
 
 # ---------------------------------------------------------------------------

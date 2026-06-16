@@ -89,7 +89,13 @@ def aggregate_cpu_sampling(trace: "TraceData") -> Optional[pd.DataFrame]:
     # ``_synthesize_native_cpu_sampling`` behaviour and keeps the
     # downstream tools running (just without function attribution).
     if "InstructionPointer" in df.columns:
-        unique_ips = df["InstructionPointer"].dropna().astype("int64").unique().tolist()
+        # Use int() on each element to get positive Python ints for kernel-space
+        # addresses (uint64 > 2^63).  .astype("int64") would produce negative
+        # Python ints for those addresses, breaking the subsequent .map() lookup
+        # against the original uint64 column (unsigned 0xFFFFF...  !=  signed
+        # negative int as a dict key).  int(numpy.uint64(x)) always gives the
+        # unsigned numeric value regardless of the source dtype.
+        unique_ips = [int(x) for x in df["InstructionPointer"].dropna().unique()]
     else:
         unique_ips = []
 
