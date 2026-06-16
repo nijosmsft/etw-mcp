@@ -4,6 +4,8 @@ All notable changes to etw-mcp are documented here. Format follows [Keep a Chang
 
 ## [Unreleased]
 
+## [0.7.2] - 2026-06-16
+
 ### Fixed
 
 - **Bug F: MSFZ-compressed kernel PDBs now produce actionable dbghelp
