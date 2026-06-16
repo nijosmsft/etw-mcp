@@ -776,7 +776,17 @@ class _StackFormatter:
                     size_i = _safe_int(size)
                     if base_i is None or size_i is None:
                         continue
-                    symbolizer.add_module(base_i, size_i, str(file_name or ""))
+                    pdb_id = getattr(self.trace, "pdb_identity", {}).get(base_i)
+                    if pdb_id and pdb_id.get("pdb_guid"):
+                        symbolizer.add_module(
+                            base_i, size_i, str(file_name or ""),
+                            pdb_guid=pdb_id["pdb_guid"],
+                            pdb_age=pdb_id.get("pdb_age"),
+                            pdb_name=pdb_id.get("pdb_name"),
+                            time_date_stamp=pdb_id.get("time_date_stamp"),
+                        )
+                    else:
+                        symbolizer.add_module(base_i, size_i, str(file_name or ""))
             self.trace.symbolizer = symbolizer
             return symbolizer
         except Exception:

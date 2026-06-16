@@ -51,16 +51,82 @@ SYMOPT_DEBUG                = 0x80000000
 SYMFLAG_EXPORT              = 0x00000200
 
 
+# symsrv option flags for SymFindFileInPathW.
+#
+# SSRVOPT_GUIDPTR (0x00000008): the ``id`` argument points to a GUID struct;
+# symsrv locates the PDB by GUID+Age in flat dirs, two-tier ``file.ptr``
+# stores, and ``srv*...*http(s)`` servers.  Value confirmed as the canonical
+# documented constant in the Windows SDK ``dbghelp.h`` / ``symsrv.h``.
+#
+# SSRVOPT_DWORDPTR (0x00000002): the ``id`` argument points to a DWORD
+# (TimeDateStamp).  Retained here for completeness; the main M3 code path
+# uses GUIDPTR.
+SSRVOPT_GUIDPTR  = 0x00000008
+SSRVOPT_DWORDPTR = 0x00000002
+
+
 # Maximum symbol-name length we ever request from dbghelp. The SDK header
 # uses MAX_SYM_NAME = 2000 as the conventional ceiling; SYMBOL_INFOW is
 # typically allocated with this many WCHARs after the fixed prefix.
 MAX_SYM_NAME = 2000
 
 
-# Load dbghelp lazily at import time. On non-Windows hosts this raises
-# OSError; the higher-level ``Symbolizer.is_available`` wrapper turns
-# that into a boolean so the rest of the codebase can probe safely.
-_dbghelp = ctypes.WinDLL("dbghelp.dll", use_last_error=True)
+# Load dbghelp at import time. On non-Windows hosts this raises OSError;
+# the higher-level ``Symbolizer.is_available`` wrapper turns that into a
+# boolean so the rest of the codebase can probe safely.
+#
+# Prefer a newer dbghelp from a WinDbg/Debuggers installation when available,
+# because the system dbghelp.dll (<=10.0.26100) cannot load MSFZ-format
+# compressed PDBs (introduced in ~VS2024/Windows 11 build toolchain).
+# The WinDbg "Debuggers" toolchain at 10.0.29507+ supports MSFZ.
+# symsrv.dll must be loaded from the SAME directory as dbghelp so it
+# satisfies dbghelp's import and handles the srv*cache*server path syntax.
+def _load_dbghelp() -> ctypes.WinDLL:
+    import os
+
+    candidates = [
+        # WinDbg external installation (common lab / dev setup).
+        (r"C:\Debuggers\dbghelp.dll",      r"C:\Debuggers\symsrv.dll"),
+        # WDK x64 Debuggers (usually older than the WinDbg build above).
+        (r"C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\dbghelp.dll",
+         r"C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\symsrv.dll"),
+        # System fallback — always present on Windows.
+        ("dbghelp.dll", None),
+    ]
+
+    # Insert any WinDbg UWP / Store installs discovered at runtime.
+    try:
+        import glob
+        uwp_hits = sorted(
+            glob.glob(
+                r"C:\Program Files\WindowsApps\Microsoft.WinDbg_*\x64\dbghelp.dll"
+            ),
+            reverse=True,  # highest version name first
+        )
+        for path in uwp_hits:
+            symsrv = os.path.join(os.path.dirname(path), "symsrv.dll")
+            candidates.insert(0, (path, symsrv))
+    except Exception:
+        pass
+
+    for dbghelp_path, symsrv_path in candidates:
+        if dbghelp_path != "dbghelp.dll" and not os.path.exists(dbghelp_path):
+            continue
+        # Load symsrv from the same directory first so dbghelp picks it up.
+        if symsrv_path and os.path.exists(symsrv_path):
+            try:
+                ctypes.WinDLL(symsrv_path, use_last_error=True)
+            except OSError:
+                pass
+        try:
+            return ctypes.WinDLL(dbghelp_path, use_last_error=True)
+        except OSError:
+            continue
+
+    raise OSError("Failed to load dbghelp.dll from any candidate path")
+
+
+_dbghelp = _load_dbghelp()
 
 
 # ---------------------------------------------------------------------------
@@ -144,6 +210,37 @@ SymGetModuleInfoW64.argtypes = [
 SymGetModuleInfoW64.restype = wintypes.BOOL
 
 
+# ``SymFindFileInPathW(hProcess, SearchPath, FileName, id, two, three,
+#                      flags, FoundFile, callback, context)`` → BOOL
+#
+# When ``flags == SSRVOPT_GUIDPTR``, ``id`` is a pointer to a GUID struct,
+# ``two`` is the PDB Age (DWORD), and ``three`` is 0.  symsrv walks every
+# element of the symbol search path — flat dirs, two-tier ``file.ptr``
+# stores, and ``srv*...*https`` servers — and writes the resolved local PDB
+# path into ``FoundFile`` (a caller-allocated MAX_PATH+1 WCHAR buffer).
+# Returns TRUE on success.  On failure, GetLastError() typically returns
+# ``ERROR_FILE_NOT_FOUND`` (2) or a WinHTTP error.
+#
+# Callers must pass a ``WCHAR[MAX_PATH+1]`` buffer for ``FoundFile``; on
+# success it holds the full local path of the located PDB.  ``SearchPath``
+# may be NULL to re-use the path from ``SymInitializeW``.  ``callback``
+# and ``context`` may be NULL.
+SymFindFileInPathW = _dbghelp.SymFindFileInPathW
+SymFindFileInPathW.argtypes = [
+    wintypes.HANDLE,    # hProcess
+    wintypes.LPCWSTR,   # SearchPath (NULL -> symbol path from SymInitializeW)
+    wintypes.LPCWSTR,   # FileName (PDB basename, e.g. "ntkrnlmp.pdb")
+    ctypes.c_void_p,    # id (pointer to GUID when SSRVOPT_GUIDPTR)
+    wintypes.DWORD,     # two (PDB Age)
+    wintypes.DWORD,     # three (0)
+    wintypes.DWORD,     # flags (SSRVOPT_GUIDPTR)
+    wintypes.LPWSTR,    # FoundFile (caller-allocated output buffer, MAX_PATH+1)
+    ctypes.c_void_p,    # callback (NULL)
+    ctypes.c_void_p,    # context (NULL)
+]
+SymFindFileInPathW.restype = wintypes.BOOL
+
+
 # SYM_TYPE enum values for IMAGEHLP_MODULEW64.SymType. See DbgHelp.h.
 # ``SymExport`` is the smoking gun for "PDB missing - dbghelp fell back
 # to PE exports". ``SymDeferred`` means SYMOPT_DEFERRED_LOADS was set
@@ -189,6 +286,8 @@ __all__ = [
     "SYMOPT_AUTO_PUBLICS",
     "SYMOPT_DEBUG",
     "SYMFLAG_EXPORT",
+    "SSRVOPT_GUIDPTR",
+    "SSRVOPT_DWORDPTR",
     "MAX_SYM_NAME",
     "SymInitializeW",
     "SymCleanup",
@@ -198,6 +297,7 @@ __all__ = [
     "SymUnloadModule64",
     "SymFromAddrW",
     "SymGetModuleInfoW64",
+    "SymFindFileInPathW",
     "SymNone",
     "SymCoff",
     "SymCv",

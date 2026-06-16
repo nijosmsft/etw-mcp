@@ -1238,7 +1238,17 @@ def _build_symbolizer_from_images(
                 }
 
         try:
-            symbolizer.add_module(base, size, file_name)
+            identity = trace.pdb_identity.get(base)
+            if identity and identity.get("pdb_guid"):
+                symbolizer.add_module(
+                    base, size, file_name,
+                    pdb_guid=identity["pdb_guid"],
+                    pdb_age=identity.get("pdb_age"),
+                    pdb_name=identity.get("pdb_name"),
+                    time_date_stamp=identity.get("time_date_stamp"),
+                )
+            else:
+                symbolizer.add_module(base, size, file_name)
         except Exception:
             # Per-module failure is non-fatal; the address will still
             # resolve to ``unknown+0x…`` if dbghelp can't find a PDB.

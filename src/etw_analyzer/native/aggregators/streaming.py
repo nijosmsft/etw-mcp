@@ -887,11 +887,15 @@ def _build_symbolizer_from_images(trace: "TraceData", image_index: _ImageIndex) 
             continue
         seen_bases.add(item.base)
         try:
-            # M3 will extend this call to pass pdb_guid/pdb_age/pdb_name/
-            # time_date_stamp from trace.pdb_identity[item.base] (or
-            # directly from item.pdb_guid etc.) once add_module grows the
-            # keyword-only identity params.
-            symbolizer.add_module(item.base, item.end - item.base, item.file_name)
+            symbolizer.add_module(
+                item.base,
+                item.end - item.base,
+                item.file_name,
+                pdb_guid=item.pdb_guid,
+                pdb_age=item.pdb_age,
+                pdb_name=item.pdb_name,
+                time_date_stamp=item.time_date_stamp,
+            )
         except Exception:
             continue
     trace.symbolizer = symbolizer

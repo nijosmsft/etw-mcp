@@ -59,6 +59,24 @@ def guid_string(g: GUID) -> str:
     return str(g).lower()
 
 
+def guid_from_string(s: str) -> GUID:
+    """Parse a canonical hyphenated GUID string into a :class:`GUID` struct.
+
+    Accepts the standard ``'XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX'`` form
+    (case-insensitive, surrounding braces optional).  Raises ``ValueError``
+    when the input cannot be parsed.
+
+    This is a convenience wrapper around :meth:`GUID.from_string` provided
+    as a module-level function so callers can do a single-name import.
+
+    Example::
+
+        g = guid_from_string("AFB1E3B1-3754-8BA7-3B92-C060D6D5605F")
+        assert g.Data1 == 0xAFB1E3B1
+    """
+    return GUID.from_string(s)
+
+
 # ---------------------------------------------------------------------------
 # FILETIME / SYSTEMTIME / TIME_ZONE_INFORMATION
 # ---------------------------------------------------------------------------
@@ -532,6 +550,7 @@ class IMAGEHLP_MODULEW64(ctypes.Structure):
 __all__ = [
     "GUID",
     "guid_string",
+    "guid_from_string",
     "FILETIME",
     "SYSTEMTIME",
     "TIME_ZONE_INFORMATION",
