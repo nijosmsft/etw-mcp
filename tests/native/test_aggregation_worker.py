@@ -1,7 +1,7 @@
 """Tests for the post-sidecar aggregation worker.
 
 The aggregation worker is invoked AFTER the C# sidecar has written its
-layer-1/2 parquets and a v3 manifest into a staging directory. It runs
+layer-1/2 parquets and a non-final manifest into a staging directory. It runs
 the Python-side aggregators against those inputs and rewrites the manifest
 in place. These tests verify the orchestration mechanics with synthetic
 data; the real-fixture end-to-end test lives in tests/manual/.
@@ -26,7 +26,7 @@ def _make_etl(tmp_path: Path) -> Path:
 
 
 def _seed_sidecar_staging(staging_dir: Path, etl: Path) -> None:
-    """Write a minimal sidecar-style staging dir (parquets + v3 manifest)."""
+    """Write a minimal sidecar-style staging dir (parquets + non-final manifest)."""
 
     staging_dir.mkdir(parents=True, exist_ok=True)
 
@@ -83,7 +83,10 @@ def _seed_sidecar_staging(staging_dir: Path, etl: Path) -> None:
     manifest = native_cache.CacheManifest.materialized_small(
         etl,
         datasets,
+        complete=False,
+        finalized=False,
         producer="dotnet",
+        finalizer=None,
     )
     native_cache.write_manifest(staging_dir, manifest)
 
@@ -99,12 +102,13 @@ def test_run_aggregation_worker_against_dotnet_staging(tmp_path: Path):
         trace_id="trace_test_dotnet",
     )
     assert result.ok is True, f"failed: {result.message}; warnings={result.warnings}"
-    # Manifest must still be valid v3 with the dotnet producer stamp.
+    # Manifest must be the finalized v4 manifest with the dotnet producer stamp.
     loaded = native_cache.read_manifest(staging)
     assert loaded is not None
-    assert loaded.schema_version == 3
+    assert loaded.schema_version == native_cache.SCHEMA_VERSION
     assert loaded.producer == "dotnet"
     assert loaded.complete is True
+    assert loaded.finalized is True
     # The sidecar-original datasets must still be there.
     names = {d.name for d in loaded.datasets}
     assert "sampled_profile" in names
@@ -181,7 +185,8 @@ def test_run_aggregation_worker_preserves_dotnet_producer_in_rewrite(tmp_path: P
         (staging / native_cache.MANIFEST_FILENAME).read_text("utf-8")
     )
     assert raw["producer"] == "dotnet"
-    assert raw["schema_version"] == 3
+    assert raw["schema_version"] == native_cache.SCHEMA_VERSION
+    assert raw["finalized"] is True
 
 
 def test_run_aggregation_worker_handles_garbage_parquet_in_aux(tmp_path: Path):

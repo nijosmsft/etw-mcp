@@ -784,10 +784,12 @@ def _rewrite_manifest(
         mode="native",
         strategy=sidecar_manifest.strategy,
         complete=True,
+        finalized=True,
         etl=native_cache.EtlIdentity.from_path(etl_path),
         datasets=datasets,
         native_store=sidecar_manifest.native_store,
         producer=producer,
+        finalizer="python-aggregation-worker",
     )
     native_cache.write_manifest(staging_dir, manifest)
     return manifest

@@ -111,6 +111,7 @@ class TraceData:
     # (butterfly, hot_functions) call into ``symbolizer.bulk_resolve``
     # when resolving SampledProfile stacks.
     symbolizer: Any = field(default=None, repr=False)
+    _defer_symbolization: bool = field(default=False, repr=False)
 
     # M2: per-ImageBase PDB identity stashed by the three
     # _build_symbolizer_from_images helpers so M3 can pass exact

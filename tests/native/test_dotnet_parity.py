@@ -95,7 +95,7 @@ def _seed_dotnet_staging(
     cswitch_rows: int = 50,
     cpu_count: int = 4,
 ) -> None:
-    """Seed staging_dir with sidecar-shape parquets + v3 manifest."""
+    """Seed staging_dir with sidecar-shape parquets + non-final manifest."""
     staging_dir.mkdir(parents=True, exist_ok=True)
 
     sampled = _make_sampled_profile(sampled_rows, cpu_count)
@@ -144,7 +144,12 @@ def _seed_dotnet_staging(
         ),
     ]
     manifest = native_cache.CacheManifest.materialized_small(
-        etl, datasets, producer="dotnet",
+        etl,
+        datasets,
+        complete=False,
+        finalized=False,
+        producer="dotnet",
+        finalizer=None,
     )
     native_cache.write_manifest(staging_dir, manifest)
 
@@ -272,8 +277,8 @@ class TestBuildTraceMetadataDataframe:
             cpu_count=8, duration_seconds=1.5, timestamp_frequency=10_000_000.0,
         )
         manifest = native_cache.CacheManifest(
-            schema_version=3, mode="native", strategy="materialized-small",
-            complete=True,
+            schema_version=native_cache.SCHEMA_VERSION, mode="native", strategy="materialized-small",
+            complete=True, finalized=True,
             etl=native_cache.EtlIdentity(
                 path="x", name="x", size=1, mtime_ns=0,
             ),

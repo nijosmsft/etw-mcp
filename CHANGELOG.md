@@ -4,6 +4,37 @@ All notable changes to etw-mcp are documented here. Format follows [Keep a Chang
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-06-17
+
+### Added
+
+- `load_trace` now supports non-blocking async extraction with an inline wait
+  budget (`wait_seconds`, defaulting from `ETW_MCP_LOAD_WAIT` or 20s). Small
+  traces and cache hits keep the historical ready summary shape; slow traces
+  return JSON status with `status: "extracting"`, progress percent, current
+  phase/dataset, and an ETA.
+- New `get_load_status` tool reports `extracting`, `ready`, `failed`, or
+  `not_found` for an ETL path, trace ID, or job ID. `list_loaded_traces` now
+  includes in-progress/failed load jobs alongside loaded traces.
+- Async loads write `extracting.json` status markers with pid/host heartbeat,
+  percent, current dataset/phase, ETA, and trace identity. Fresh markers are
+  reused by repeat/concurrent `load_trace` calls; stale markers are reclaimed.
+  Failures leave `failed.json` with the error for later status queries.
+- ETA is based on ETL size and an extraction-throughput constant (22 MB/s by
+  default, override with `ETW_MCP_EXTRACT_MBPS`) and is refined as progress
+  events arrive from the sidecar/worker.
+
+### Fixed
+
+- Symbol resolution is now lazy/deferred per module: trace load no longer
+  blocks downloading every module's PDB from remote symbol servers (a
+  many-module server trace previously hung at the "aggregating" phase).
+  Kernel symbols still resolve by exact GUID on first query.
+- `load_trace` cache readiness now depends on an atomic finalized manifest:
+  Python writes `wpr-mcp-cache-manifest.json` last via temp-file +
+  `os.replace`, incomplete or partial caches are never rehydrated, and the
+  native event schema is bumped to invalidate older manifests.
+
 ## [0.7.2] - 2026-06-16
 
 ### Fixed

@@ -148,6 +148,7 @@ class _AddressResolver:
         max_symbol_addresses: int = _MAX_SYMBOL_ADDRESSES,
     ) -> None:
         self.symbolizer = getattr(trace, "symbolizer", None)
+        self.trace = trace
         self.image_index = image_index
         self.warnings = warnings
         self.max_symbol_addresses = max_symbol_addresses
@@ -170,7 +171,7 @@ class _AddressResolver:
 
         labels: dict[int, str] = {}
         sources: dict[int, str] = {}
-        if self.symbolizer is not None:
+        if self.symbolizer is not None and not bool(getattr(self.trace, "_defer_symbolization", False)):
             if len(self._pairs) + len(missing) <= self.max_symbol_addresses:
                 try:
                     # Prefer the v0.6 source-aware API; older Symbolizer

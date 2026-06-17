@@ -64,6 +64,75 @@ def _find_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
     return None
 
 
+_RESOLVED_RE = re.compile(r"^(?P<module>[^!]+)!(?P<function>[^+]+)(?:\+0x[0-9a-fA-F]+)?$")
+
+
+def _split_resolved_label(label: str) -> tuple[str, str]:
+    if not label:
+        return "", ""
+    match = _RESOLVED_RE.match(str(label))
+    if match:
+        return match.group("module"), match.group("function")
+    return "", ""
+
+
+def _resolve_deferred_instruction_pointers(
+    trace: TraceData,
+    df: pd.DataFrame,
+    *,
+    module_col: str,
+    function_col: str,
+) -> pd.DataFrame:
+    """Resolve function names for already-filtered lazy load-time rows."""
+
+    if "InstructionPointer" not in df.columns:
+        return df
+    symbolizer = getattr(trace, "symbolizer", None)
+    if symbolizer is None:
+        return df
+    try:
+        unique_ips = [int(x) for x in df["InstructionPointer"].dropna().unique() if int(x)]
+    except Exception:
+        return df
+    if not unique_ips:
+        return df
+
+    try:
+        if hasattr(symbolizer, "bulk_resolve_with_source"):
+            resolved = symbolizer.bulk_resolve_with_source(unique_ips)
+            labels = {addr: pair[0] for addr, pair in resolved.items()}
+            sources = {addr: pair[1] for addr, pair in resolved.items()}
+        else:
+            labels = symbolizer.bulk_resolve(unique_ips)
+            sources = {}
+    except Exception:
+        return df
+
+    out = df.copy()
+    ip_values = out["InstructionPointer"].map(
+        lambda value: int(value) if pd.notna(value) else 0
+    )
+    module_map: dict[int, str] = {}
+    function_map: dict[int, str] = {}
+    for addr, label in labels.items():
+        module, function = _split_resolved_label(label)
+        if module:
+            module_map[addr] = module
+        if function:
+            function_map[addr] = function
+
+    if module_map and module_col in out.columns:
+        resolved_modules = ip_values.map(module_map)
+        out[module_col] = resolved_modules.fillna(out[module_col]).astype(str)
+    if function_map:
+        out[function_col] = ip_values.map(function_map).fillna("").astype(str)
+    elif function_col not in out.columns:
+        out[function_col] = ""
+    if sources:
+        out["SymbolSource"] = ip_values.map(sources).fillna("unknown").astype(str)
+    return out
+
+
 def _cpu_denominator_info(
     trace: TraceData,
     cpu_filter: str | None,
@@ -251,6 +320,14 @@ def get_cpu_samples(
         cpu_col = _find_col(df, ["CPU", "Cpu", "Processor"]) or "CPU"
         time_col = _find_col(df, ["TimeStamp", "Time", "Timestamp (s)"]) or "TimeStamp"
 
+        if function_filter or group_by == "function":
+            df = _resolve_deferred_instruction_pointers(
+                trace,
+                df,
+                module_col=module_col,
+                function_col=function_col,
+            )
+
         # Apply filters
         df = apply_filters(
             df,
@@ -385,6 +462,13 @@ def get_hot_functions(
     if df_filtered.empty:
         mod_desc = ", ".join(target_modules) if target_modules else "all"
         return f"*No samples from [{mod_desc}] in the specified range.*"
+
+    df_filtered = _resolve_deferred_instruction_pointers(
+        trace,
+        df_filtered,
+        module_col=module_col,
+        function_col=function_col,
+    )
 
     # Aggregate by module + function
     group_cols = [c for c in [module_col, function_col] if c in df_filtered.columns]

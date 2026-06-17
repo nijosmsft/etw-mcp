@@ -198,14 +198,15 @@ function Compare-Materialized {
         }
     }
 
-    # Manifest must exist with schema_version=3 and producer=dotnet.
+    # Sidecar manifest must exist, but Python aggregation owns finalization.
     $manifestPath = Join-Path $Staging "wpr-mcp-cache-manifest.json"
     if (-not (Test-Path $manifestPath)) { Fail "manifest missing in materialized output" }
     $m = Get-Content $manifestPath -Raw | ConvertFrom-Json
-    if ($m.schema_version -ne 3) { Fail "expected schema_version=3, got $($m.schema_version)" }
+    if ($m.schema_version -ne 4) { Fail "expected schema_version=4, got $($m.schema_version)" }
     if ($m.producer -ne "dotnet") { Fail "expected producer=dotnet, got $($m.producer)" }
     if ($m.strategy -ne "materialized-small") { Fail "expected strategy=materialized-small, got $($m.strategy)" }
-    Write-Host "  [OK]   manifest schema_version=3 producer=dotnet strategy=$($m.strategy)"
+    if ($m.complete -ne $false) { Fail "expected sidecar manifest complete=false, got $($m.complete)" }
+    Write-Host "  [OK]   sidecar manifest schema_version=4 producer=dotnet strategy=$($m.strategy) complete=false"
 
     return $divergences
 }
@@ -219,7 +220,8 @@ function Compare-Streaming {
     if (-not (Test-Path $manifestPath)) { Fail "manifest missing in streaming output" }
     $m = Get-Content $manifestPath -Raw | ConvertFrom-Json
     if ($m.strategy -ne "event-store-streaming") { Fail "expected strategy=event-store-streaming, got $($m.strategy)" }
-    if ($m.schema_version -ne 3) { Fail "expected schema_version=3, got $($m.schema_version)" }
+    if ($m.schema_version -ne 4) { Fail "expected schema_version=4, got $($m.schema_version)" }
+    if ($m.complete -ne $false) { Fail "expected sidecar manifest complete=false, got $($m.complete)" }
     $eventStoreDs = $m.datasets | Where-Object { $_.kind -eq "native-event-store" }
     if (-not $eventStoreDs) { Fail "no native-event-store dataset in manifest" }
     Write-Host "  [OK]   top manifest: strategy=event-store-streaming, dataset=$($eventStoreDs.name) row_count=$($eventStoreDs.row_count)"

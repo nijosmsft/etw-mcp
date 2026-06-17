@@ -200,7 +200,9 @@ You don't need to know tool names. Just describe what you want:
 
 ```
 load_trace(path)          → Parse ETL via dotnet sidecar, native ETW, or xperf;
-                            cache as parquet; return trace_id
+                            cache as parquet; return trace_id, or return
+                            status="extracting" for long async loads
+get_load_status(path)     → Poll background extraction progress / failures
 analyze(trace_id)         → One-call comprehensive report
 detailed tools(trace_id)  → Drill into specific areas
 export_analysis(trace_id) → Save to .md for sharing
@@ -276,8 +278,9 @@ Run the LabLink agent elevated, or under an account with permission to start ETW
 | Tool | Purpose |
 |------|---------|
 | `list_traces` | Find `.etl` files in a directory |
-| `load_trace` | Load an ETL file. Decodes events via the .NET sidecar (when configured), the in-process native consumer, or xperf — see [Trace Loading Modes](#trace-loading-modes). Caches as parquet. Set `force=True` to re-export. |
-| `list_loaded_traces` | Show trace IDs currently loaded in memory |
+| `load_trace` | Load an ETL file. Decodes events via the .NET sidecar (when configured), the in-process native consumer, or xperf — see [Trace Loading Modes](#trace-loading-modes). Caches as parquet. Set `force=True` to re-export. Long extracts run in the background by default; tune the inline wait with `wait_seconds`. |
+| `get_load_status` | Return JSON status for a background load by `etl_path`, `trace_id`, or `job_id` (`extracting`, `ready`, `failed`, `not_found`) |
+| `list_loaded_traces` | Show trace IDs currently loaded in memory and active load jobs |
 | `unload_trace` | Remove a loaded trace from memory |
 | `trace_info` | Show loaded trace metadata by `trace_id` |
 | `check_symbols` | Check symbol resolution by `trace_id` with honest 3-category classification (OK / EXPORT_ONLY / MISSING). Accepts `extra_symbol_paths` to append local PDB dirs. |

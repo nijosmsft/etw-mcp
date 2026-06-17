@@ -133,9 +133,7 @@ def test_image_schema_null_identity_round_trip(tmp_path: Path):
 
 
 def test_image_schema_version_in_parquet_metadata():
-    """The image parquet schema must embed EVENT_SCHEMA_VERSION == 2 in its
-    metadata so stale caches written at version 1 are detectable.
-    """
+    """The image parquet schema must embed the current EVENT_SCHEMA_VERSION."""
     schema = EVENT_SCHEMAS["image"].schema
     raw_version = schema.metadata.get(b"wpr_mcp_schema_version")
     assert raw_version is not None, "wpr_mcp_schema_version metadata key must be present"
@@ -144,8 +142,8 @@ def test_image_schema_version_in_parquet_metadata():
         f"image schema metadata version must equal EVENT_SCHEMA_VERSION={EVENT_SCHEMA_VERSION}, "
         f"got {stored_version}"
     )
-    assert EVENT_SCHEMA_VERSION == 2, (
-        f"M2 bumped EVENT_SCHEMA_VERSION to 2; found {EVENT_SCHEMA_VERSION}"
+    assert EVENT_SCHEMA_VERSION == 3, (
+        f"Async-load Phase A bumped EVENT_SCHEMA_VERSION to 3; found {EVENT_SCHEMA_VERSION}"
     )
 
 

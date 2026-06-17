@@ -68,7 +68,10 @@ def _seed_sidecar_outputs(staging_dir: Path, etl: Path) -> None:
                 materialize_on_load=True,
             ),
         ],
+        complete=False,
+        finalized=False,
         producer="dotnet",
+        finalizer=None,
     )
     native_cache.write_manifest(staging_dir, manifest)
 
@@ -163,6 +166,9 @@ def test_run_dotnet_worker_success_promotes_to_export_dir(
     loaded = native_cache.read_manifest(export_dir)
     assert loaded is not None
     assert loaded.producer == "dotnet"
+    assert loaded.complete is True
+    assert loaded.finalized is True
+    assert loaded.finalizer == "python-aggregation-worker"
 
 
 def test_run_dotnet_worker_sidecar_failure_leaves_staging_for_debug(

@@ -80,6 +80,8 @@ def test_native_v2_manifest_cache_reloads_materialized_small(tmp_path: Path):
     assert manifest["mode"] == "native"
     assert manifest["strategy"] == native_cache.MATERIALIZED_SMALL_STRATEGY
     assert manifest["complete"] is True
+    assert manifest["finalized"] is True
+    assert manifest["event_schema_version"] == EVENT_SCHEMA_VERSION
     assert manifest["etl"]["name"] == etl.name
     assert manifest["etl"]["size"] == etl.stat().st_size
     assert manifest["etl"]["mtime_ns"] == etl.stat().st_mtime_ns
@@ -125,6 +127,7 @@ def test_native_v2_incomplete_manifest_rejected(tmp_path: Path):
 def test_native_v2_mode_mismatch_rejected(tmp_path: Path):
     etl = _make_etl(tmp_path)
     cache = _cache_dir(etl)
+    (cache / "cpu_sampling.parquet").write_bytes(b"parquet")
     manifest = native_cache.CacheManifest.materialized_small(
         etl,
         [
@@ -146,6 +149,7 @@ def test_native_v2_mode_mismatch_rejected(tmp_path: Path):
 def test_native_v2_stale_etl_identity_rejected(tmp_path: Path):
     etl = _make_etl(tmp_path)
     cache = _cache_dir(etl)
+    (cache / "cpu_sampling.parquet").write_bytes(b"parquet")
     manifest = native_cache.CacheManifest.materialized_small(
         etl,
         [
@@ -471,3 +475,149 @@ def test_native_v2_manifest_with_correct_event_schema_version_loads(tmp_path: Pa
 
     assert cached is not None, "valid manifest with correct event_schema_version must load"
     assert cached["cpu_sampling"]["Weight"].tolist() == [77]
+
+
+def test_finalized_manifest_fast_path_loads(tmp_path: Path):
+    etl = _make_etl(tmp_path)
+    cache = _cache_dir(etl)
+    df = _cpu_sampling(cache, weight=88)
+    _write_native_dumper_cache(cache)
+    trace_mgmt._write_cache_manifest(cache, etl, "native", {"cpu_sampling": df})
+
+    cached = trace_mgmt._load_from_cache(cache, etl, mode="native")
+
+    assert cached is not None
+    assert cached["cpu_sampling"]["Weight"].tolist() == [88]
+
+
+def test_non_finalized_manifest_triggers_rebuild(tmp_path: Path):
+    etl = _make_etl(tmp_path)
+    cache = _cache_dir(etl)
+    _cpu_sampling(cache, weight=23)
+    _write_native_dumper_cache(cache)
+    datasets = [
+        native_cache.CacheDataset(
+            name="cpu_sampling",
+            kind="parquet",
+            path="cpu_sampling.parquet",
+            row_count=1,
+            materialize_on_load=True,
+        )
+    ]
+    for _, stem in trace_mgmt._DUMPER_EVENT_CLASSES.values():
+        datasets.append(native_cache.CacheDataset(
+            name=stem,
+            kind="dumper-parquet",
+            path=f"{stem}.parquet",
+            row_count=0,
+            materialize_on_load=False,
+        ))
+    manifest = native_cache.CacheManifest.materialized_small(
+        etl,
+        datasets,
+        complete=False,
+        finalized=False,
+    )
+    native_cache.write_manifest(cache, manifest)
+
+    assert trace_mgmt._load_from_cache(cache, etl, mode="native") is None
+
+
+def test_schema_mismatch_manifest_triggers_rebuild(tmp_path: Path):
+    etl = _make_etl(tmp_path)
+    cache = _cache_dir(etl)
+    _cpu_sampling(cache, weight=24)
+    _write_native_dumper_cache(cache)
+    datasets = [
+        {
+            "name": "cpu_sampling",
+            "kind": "parquet",
+            "path": "cpu_sampling.parquet",
+            "schema_version": 1,
+            "row_count": 1,
+            "materialize_on_load": True,
+        }
+    ]
+    for _, stem in trace_mgmt._DUMPER_EVENT_CLASSES.values():
+        datasets.append({
+            "name": stem,
+            "kind": "dumper-parquet",
+            "path": f"{stem}.parquet",
+            "schema_version": 1,
+            "row_count": 0,
+            "materialize_on_load": False,
+        })
+    manifest = {
+        "schema_version": native_cache.SCHEMA_VERSION - 1,
+        "mode": "native",
+        "producer": "native",
+        "strategy": native_cache.MATERIALIZED_SMALL_STRATEGY,
+        "complete": True,
+        "finalized": True,
+        "event_schema_version": EVENT_SCHEMA_VERSION,
+        "etl": {
+            "path": str(etl.resolve()),
+            "name": etl.name,
+            "size": etl.stat().st_size,
+            "mtime_ns": etl.stat().st_mtime_ns,
+        },
+        "datasets": datasets,
+        "native_store": {"generation_id": "flat", "path": "."},
+    }
+    (cache / native_cache.MANIFEST_FILENAME).write_text(
+        json.dumps(manifest), encoding="utf-8"
+    )
+
+    assert trace_mgmt._load_from_cache(cache, etl, mode="native") is None
+
+
+def test_complete_manifest_with_missing_listed_dataset_triggers_rebuild(
+    tmp_path: Path,
+):
+    """Regression for observed bug: complete manifest before later parquets."""
+
+    etl = _make_etl(tmp_path)
+    cache = _cache_dir(etl)
+    # Deliberately do NOT write cpu_sampling.parquet.
+    _write_native_dumper_cache(cache)
+    datasets = [
+        {
+            "name": "cpu_sampling",
+            "kind": "parquet",
+            "path": "cpu_sampling.parquet",
+            "schema_version": 1,
+            "row_count": 1,
+            "materialize_on_load": True,
+        }
+    ]
+    for _, stem in trace_mgmt._DUMPER_EVENT_CLASSES.values():
+        datasets.append({
+            "name": stem,
+            "kind": "dumper-parquet",
+            "path": f"{stem}.parquet",
+            "schema_version": 1,
+            "row_count": 0,
+            "materialize_on_load": False,
+        })
+    manifest = {
+        "schema_version": native_cache.SCHEMA_VERSION,
+        "mode": "native",
+        "producer": "native",
+        "strategy": native_cache.MATERIALIZED_SMALL_STRATEGY,
+        "complete": True,
+        "finalized": True,
+        "event_schema_version": EVENT_SCHEMA_VERSION,
+        "etl": {
+            "path": str(etl.resolve()),
+            "name": etl.name,
+            "size": etl.stat().st_size,
+            "mtime_ns": etl.stat().st_mtime_ns,
+        },
+        "datasets": datasets,
+        "native_store": {"generation_id": "flat", "path": "."},
+    }
+    (cache / native_cache.MANIFEST_FILENAME).write_text(
+        json.dumps(manifest), encoding="utf-8"
+    )
+
+    assert trace_mgmt._load_from_cache(cache, etl, mode="native") is None

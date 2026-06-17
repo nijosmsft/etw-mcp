@@ -15,6 +15,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable
+import inspect
 
 from . import cache as native_cache
 from . import telemetry as _telemetry
@@ -216,6 +217,7 @@ def run_native_worker_extraction(
     timeout_seconds: float | None = None,
     stale_heartbeat_seconds: float | None = None,
     process_runner: Callable[..., NativeWorkerResult] | None = None,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> NativeWorkerResult:
     """Run the native worker into staging, validate, then promote to final cache."""
 
@@ -249,6 +251,7 @@ def run_native_worker_extraction(
             symbol_path=symbol_path,
             timeout_seconds=timeout_seconds,
             stale_heartbeat_seconds=stale_heartbeat_seconds,
+            **_progress_callback_kwarg(runner, progress_callback),
         )
         result.request_path = request_path
         result.staging_dir = staging_dir
@@ -260,7 +263,7 @@ def run_native_worker_extraction(
             manifest = native_cache.read_manifest(staging_dir)
             if manifest is None:
                 raise native_cache.NativeCacheError(
-                    "native worker did not write a v2 cache manifest"
+                    "native worker did not write a finalized cache manifest"
                 )
             native_cache.validate_manifest(
                 manifest,
@@ -292,6 +295,13 @@ def run_native_worker_extraction(
             )
 
         try:
+            if progress_callback is not None:
+                progress_callback({
+                    "type": "progress",
+                    "phase": "finalizing",
+                    "pct": 95.0,
+                    "staging_dir": str(staging_dir),
+                })
             _promote_staging_cache(staging_dir, export_dir)
         except Exception as exc:
             _remove_dir(staging_dir)
@@ -332,6 +342,7 @@ def run_worker_process(
     stale_heartbeat_seconds: float | None = None,
     popen_factory: Callable[..., subprocess.Popen] = subprocess.Popen,
     enforce_job: bool = True,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> NativeWorkerResult:
     """Launch and supervise the native worker subprocess."""
 
@@ -425,6 +436,7 @@ def run_worker_process(
                         stdout_tail,
                         invalid_tail,
                         progress,
+                        progress_callback=progress_callback,
                     )
                     if parsed is not None and parsed.get("type") == "result":
                         result_payload = parsed
@@ -466,6 +478,7 @@ def run_worker_process(
                     stdout_tail,
                     invalid_tail,
                     progress,
+                    progress_callback=progress_callback,
                 )
                 if parsed is not None and parsed.get("type") == "result":
                     result_payload = parsed
@@ -539,6 +552,8 @@ def _handle_stdout_line(
     stdout_tail: _BoundedTextTail,
     invalid_tail: _BoundedTextTail,
     progress: deque[dict[str, Any]],
+    *,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> tuple[dict[str, Any] | None, bool]:
     stdout_tail.append(line)
     stripped = line.strip()
@@ -553,7 +568,27 @@ def _handle_stdout_line(
         invalid_tail.append(line)
         return None, False
     progress.append(parsed)
+    if progress_callback is not None:
+        try:
+            progress_callback(parsed)
+        except Exception:
+            pass
     return parsed, parsed.get("type") in {"heartbeat", "progress", "result"}
+
+
+def _progress_callback_kwarg(
+    func: Callable[..., Any],
+    progress_callback: Callable[[dict[str, Any]], None] | None,
+) -> dict[str, Any]:
+    if progress_callback is None:
+        return {}
+    try:
+        params = inspect.signature(func).parameters
+    except (TypeError, ValueError):
+        return {}
+    if "progress_callback" in params:
+        return {"progress_callback": progress_callback}
+    return {}
 
 
 def _float_env(name: str, value: float | None, default: float) -> float:
@@ -893,6 +928,7 @@ def run_dotnet_worker_extraction(
     stale_heartbeat_seconds: float | None = None,
     process_runner: Callable[..., NativeWorkerResult] | None = None,
     aggregation_runner: Callable[..., Any] | None = None,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> NativeWorkerResult:
     """Run the .NET sidecar into staging, run aggregators, then promote.
 
@@ -977,6 +1013,7 @@ def run_dotnet_worker_extraction(
             request_path,
             timeout_seconds=timeout_seconds,
             stale_heartbeat_seconds=stale_heartbeat_seconds,
+            **_progress_callback_kwarg(runner, progress_callback),
         )
         sidecar_result.request_path = request_path
         sidecar_result.staging_dir = staging_dir
@@ -1008,7 +1045,9 @@ def run_dotnet_worker_extraction(
             # rust-hybrid-migration-plan v3 §11 phase 0.
             return sidecar_result
 
-        # Validate the sidecar manifest before running aggregators.
+        # Validate the sidecar's non-final manifest before running aggregators.
+        # The Python aggregation worker owns the final, complete=true manifest
+        # and writes it last after all derived datasets are durable.
         try:
             manifest = native_cache.read_manifest(staging_dir)
             if manifest is None:
@@ -1020,6 +1059,7 @@ def run_dotnet_worker_extraction(
                 staging_dir,
                 etl_path,
                 mode="native",
+                require_complete=False,
             )
         except Exception as exc:
             _telemetry.emit_with(
@@ -1059,6 +1099,13 @@ def run_dotnet_worker_extraction(
             trace_id=trace_id,
             staging_dir=staging_dir,
         )
+        if progress_callback is not None:
+            progress_callback({
+                "type": "progress",
+                "phase": "aggregating",
+                "pct": 85.0,
+                "staging_dir": str(staging_dir),
+            })
         _agg_start_monotonic = time.monotonic()
         try:
             agg_result = agg_run(staging_dir, etl_path, trace_id)
@@ -1115,6 +1162,13 @@ def run_dotnet_worker_extraction(
         )
 
         try:
+            if progress_callback is not None:
+                progress_callback({
+                    "type": "progress",
+                    "phase": "finalizing",
+                    "pct": 95.0,
+                    "staging_dir": str(staging_dir),
+                })
             _promote_staging_cache(staging_dir, export_dir)
         except Exception as exc:
             _telemetry.emit_with(
@@ -1191,6 +1245,7 @@ def run_dotnet_process(
     timeout_seconds: float | None = None,
     stale_heartbeat_seconds: float | None = None,
     popen_factory: Callable[..., subprocess.Popen] = subprocess.Popen,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> NativeWorkerResult:
     """Launch and supervise the .NET sidecar subprocess.
 
@@ -1275,6 +1330,7 @@ def run_dotnet_process(
                         stdout_tail,
                         invalid_tail,
                         progress,
+                        progress_callback=progress_callback,
                     )
                     if parsed is not None and parsed.get("type") == "result":
                         result_payload = parsed
@@ -1319,6 +1375,7 @@ def run_dotnet_process(
                 stdout_tail,
                 invalid_tail,
                 progress,
+                progress_callback=progress_callback,
             )
             if parsed is not None and parsed.get("type") == "result":
                 result_payload = parsed

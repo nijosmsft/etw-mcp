@@ -18,6 +18,7 @@ def test_native_v2_manifest_round_trips_materialized_small_generation(tmp_path: 
     export_dir = tmp_path / ".etw-export-sample"
     generation_dir = export_dir / "generation-001"
     generation_dir.mkdir(parents=True)
+    (generation_dir / "cpu_sampling.parquet").write_bytes(b"parquet")
 
     manifest = native_cache.CacheManifest.materialized_small(
         etl,
@@ -44,6 +45,8 @@ def test_native_v2_manifest_round_trips_materialized_small_generation(tmp_path: 
     assert loaded.mode == "native"
     assert loaded.strategy == native_cache.MATERIALIZED_SMALL_STRATEGY
     assert loaded.complete is True
+    assert loaded.finalized is True
+    assert loaded.event_schema_version == native_cache.EVENT_SCHEMA_VERSION
     assert loaded.etl.name == etl.name
     assert loaded.etl.size == etl.stat().st_size
     assert loaded.etl.mtime_ns == etl.stat().st_mtime_ns
@@ -84,9 +87,11 @@ def test_native_v2_manifest_rejects_dataset_path_escape_generation(tmp_path: Pat
         native_cache.validate_manifest_shape(manifest, export_dir)
 
 
-def test_manifest_writer_defaults_to_schema_v3(tmp_path: Path):
+def test_manifest_writer_defaults_to_schema_v4(tmp_path: Path):
     etl = _make_etl(tmp_path)
     export_dir = tmp_path / ".etw-export-sample"
+    export_dir.mkdir()
+    (export_dir / "cpu_sampling.parquet").write_bytes(b"parquet")
     manifest = native_cache.CacheManifest.materialized_small(
         etl,
         [
@@ -99,14 +104,17 @@ def test_manifest_writer_defaults_to_schema_v3(tmp_path: Path):
             )
         ],
     )
-    assert manifest.schema_version == 3
+    assert manifest.schema_version == 4
     native_cache.write_manifest(export_dir, manifest)
 
     import json
 
     raw = json.loads((export_dir / native_cache.MANIFEST_FILENAME).read_text("utf-8"))
-    assert raw["schema_version"] == 3
+    assert raw["schema_version"] == 4
     assert raw["producer"] == "native"
+    assert raw["complete"] is True
+    assert raw["finalized"] is True
+    assert raw["event_schema_version"] == native_cache.EVENT_SCHEMA_VERSION
     # producer must be the second-most-significant field after schema_version.
     assert "producer" in raw
 
@@ -114,6 +122,8 @@ def test_manifest_writer_defaults_to_schema_v3(tmp_path: Path):
 def test_manifest_writer_accepts_dotnet_producer(tmp_path: Path):
     etl = _make_etl(tmp_path)
     export_dir = tmp_path / ".etw-export-sample"
+    export_dir.mkdir()
+    (export_dir / "cpu_sampling.parquet").write_bytes(b"parquet")
     manifest = native_cache.CacheManifest.materialized_small(
         etl,
         [
@@ -131,14 +141,11 @@ def test_manifest_writer_accepts_dotnet_producer(tmp_path: Path):
     loaded = native_cache.read_manifest(export_dir)
     assert loaded is not None
     assert loaded.producer == "dotnet"
-    assert loaded.schema_version == 3
+    assert loaded.schema_version == 4
 
 
-def test_manifest_reader_accepts_legacy_v2_and_backfills_producer(
-    tmp_path: Path,
-    caplog,
-):
-    """v2 manifests written before the producer field must still load."""
+def test_manifest_reader_rejects_legacy_v2_as_not_finalized(tmp_path: Path):
+    """Phase A invalidates old v2/v3 manifests so partial caches rebuild."""
 
     etl = _make_etl(tmp_path)
     export_dir = tmp_path / ".etw-export-sample"
@@ -173,17 +180,7 @@ def test_manifest_reader_accepts_legacy_v2_and_backfills_producer(
         json.dumps(legacy, indent=2), encoding="utf-8"
     )
 
-    with caplog.at_level("WARNING", logger="etw_analyzer.native.cache"):
-        loaded = native_cache.read_manifest(export_dir)
-    assert loaded is not None
-    assert loaded.schema_version == 2
-    assert loaded.is_legacy_v2
-    # back-filled to "native" because no producer field existed.
-    assert loaded.producer == "native"
-    # validate_manifest still accepts the legacy version.
-    native_cache.validate_manifest(loaded, export_dir, etl, mode="native")
-    # User-visible warning fired.
-    assert any("schema_version=2" in rec.getMessage() for rec in caplog.records)
+    assert native_cache.read_manifest(export_dir) is None
 
 
 def test_manifest_reader_rejects_unknown_schema_version(tmp_path: Path):
@@ -201,7 +198,7 @@ def test_manifest_reader_rejects_unknown_schema_version(tmp_path: Path):
 
 
 def test_manifest_reader_rejects_unknown_producer(tmp_path: Path):
-    """A v3 manifest with an unrecognized producer value is malformed."""
+    """A v4 manifest with an unrecognized producer value is malformed."""
 
     export_dir = tmp_path / ".etw-export-sample"
     export_dir.mkdir()
@@ -209,7 +206,7 @@ def test_manifest_reader_rejects_unknown_producer(tmp_path: Path):
     import json
 
     bad = {
-        "schema_version": 3,
+        "schema_version": 4,
         "mode": "native",
         "producer": "rust-fork",
         "strategy": native_cache.MATERIALIZED_SMALL_STRATEGY,
@@ -227,3 +224,64 @@ def test_manifest_reader_rejects_unknown_producer(tmp_path: Path):
     )
     with pytest.raises(native_cache.NativeCacheError, match="producer"):
         native_cache.read_manifest(export_dir)
+
+
+def test_manifest_writer_uses_atomic_replace_after_dataset_writes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    etl = _make_etl(tmp_path)
+    export_dir = tmp_path / ".etw-export-sample"
+    export_dir.mkdir()
+    dataset = export_dir / "cpu_sampling.parquet"
+    dataset.write_bytes(b"parquet")
+    manifest = native_cache.CacheManifest.materialized_small(
+        etl,
+        [
+            native_cache.CacheDataset(
+                name="cpu_sampling",
+                kind="parquet",
+                path="cpu_sampling.parquet",
+                row_count=1,
+                materialize_on_load=True,
+            )
+        ],
+    )
+    calls: list[tuple[Path, Path, bool]] = []
+    real_replace = native_cache.os.replace
+
+    def recording_replace(src, dst):
+        calls.append((Path(src), Path(dst), dataset.exists()))
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(native_cache.os, "replace", recording_replace)
+
+    native_cache.write_manifest(export_dir, manifest)
+
+    assert calls
+    src, dst, dataset_existed = calls[-1]
+    assert src.name.startswith(f"{native_cache.MANIFEST_FILENAME}.tmp.")
+    assert dst == export_dir / native_cache.MANIFEST_FILENAME
+    assert dataset_existed is True
+    assert dst.stat().st_mtime_ns >= dataset.stat().st_mtime_ns
+
+
+def test_finalized_manifest_requires_listed_dataset_files(tmp_path: Path):
+    etl = _make_etl(tmp_path)
+    export_dir = tmp_path / ".etw-export-sample"
+    export_dir.mkdir()
+    manifest = native_cache.CacheManifest.materialized_small(
+        etl,
+        [
+            native_cache.CacheDataset(
+                name="cpu_sampling",
+                kind="parquet",
+                path="cpu_sampling.parquet",
+                row_count=1,
+                materialize_on_load=True,
+            )
+        ],
+    )
+
+    with pytest.raises(native_cache.NativeCacheError, match="listed but missing"):
+        native_cache.write_manifest(export_dir, manifest)
