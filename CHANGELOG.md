@@ -4,6 +4,13 @@ All notable changes to etw-mcp are documented here. Format follows [Keep a Chang
 
 ## [Unreleased]
 
+### Fixed
+
+- `load_trace` cache readiness now depends on an atomic finalized manifest:
+  Python writes `wpr-mcp-cache-manifest.json` last via temp-file +
+  `os.replace`, incomplete or partial caches are never rehydrated, and the
+  native event schema is bumped to invalidate older manifests.
+
 ## [0.7.2] - 2026-06-16
 
 ### Fixed

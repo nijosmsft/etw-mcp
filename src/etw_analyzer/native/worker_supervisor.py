@@ -260,7 +260,7 @@ def run_native_worker_extraction(
             manifest = native_cache.read_manifest(staging_dir)
             if manifest is None:
                 raise native_cache.NativeCacheError(
-                    "native worker did not write a v2 cache manifest"
+                    "native worker did not write a finalized cache manifest"
                 )
             native_cache.validate_manifest(
                 manifest,
@@ -1008,7 +1008,9 @@ def run_dotnet_worker_extraction(
             # rust-hybrid-migration-plan v3 §11 phase 0.
             return sidecar_result
 
-        # Validate the sidecar manifest before running aggregators.
+        # Validate the sidecar's non-final manifest before running aggregators.
+        # The Python aggregation worker owns the final, complete=true manifest
+        # and writes it last after all derived datasets are durable.
         try:
             manifest = native_cache.read_manifest(staging_dir)
             if manifest is None:
@@ -1020,6 +1022,7 @@ def run_dotnet_worker_extraction(
                 staging_dir,
                 etl_path,
                 mode="native",
+                require_complete=False,
             )
         except Exception as exc:
             _telemetry.emit_with(

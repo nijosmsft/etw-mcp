@@ -360,8 +360,10 @@ try
     if (req.PanicProbe == "manifest_write_panic")
         throw new InvalidOperationException("panic_probe=manifest_write_panic triggered");
 
+    // This is intentionally non-final. Python aggregation adds derived
+    // datasets and writes the sole complete=true manifest last.
     manifestBytes = ManifestEmitter.WriteCacheManifest(req.StagingDir, req.EtlPath, req.Strategy, datasets,
-        complete: true, runId: streamingRunId, qpcOrigin: runner.QpcOrigin, perfFreq: runner.PerfFreq);
+        complete: false, runId: streamingRunId, qpcOrigin: runner.QpcOrigin, perfFreq: runner.PerfFreq);
 }
 catch (Exception ex)
 {

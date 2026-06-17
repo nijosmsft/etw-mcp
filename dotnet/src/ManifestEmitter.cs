@@ -13,8 +13,8 @@ internal static class ManifestEmitter
     private static readonly DateTime UnixEpochUtc = new(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc);
 
     /// <summary>
-    /// Write the top-level cache manifest at <paramref name="stagingDir"/>/wpr-mcp-cache-manifest.json.
-    /// Schema version 3 — adds the <c>producer</c> field per spike-contract §7.
+    /// Write the sidecar's non-final manifest at <paramref name="stagingDir"/>/wpr-mcp-cache-manifest.json.
+    /// Python aggregation owns the final complete manifest and writes it last.
     /// </summary>
     /// <param name="stagingDir">Absolute staging directory.</param>
     /// <param name="etlPath">Absolute path to the source ETL.</param>
@@ -41,11 +41,14 @@ internal static class ManifestEmitter
 
         var manifest = new
         {
-            schema_version = 3,
+            schema_version = 4,
             mode = "native",
             producer = "dotnet",
             strategy,
             complete,
+            finalized = complete,
+            event_schema_version = 3,
+            finalizer = complete ? "dotnet-sidecar" : (string?)null,
             etl = new
             {
                 path = Path.GetFullPath(etlPath),
@@ -92,7 +95,31 @@ internal static class ManifestEmitter
             WriteIndented = true,
             DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.Never,
         });
-        File.WriteAllText(path, json, new UTF8Encoding(false));
+        var tmpPath = Path.Combine(
+            stagingDir,
+            $"wpr-mcp-cache-manifest.json.tmp.{Environment.ProcessId}.{Guid.NewGuid():N}");
+        try
+        {
+            using (var stream = new FileStream(
+                tmpPath, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+            using (var writer = new StreamWriter(stream, new UTF8Encoding(false)))
+            {
+                writer.Write(json);
+                writer.WriteLine();
+                writer.Flush();
+                stream.Flush(flushToDisk: true);
+            }
+            File.Move(tmpPath, path, overwrite: true);
+        }
+        finally
+        {
+            try
+            {
+                if (File.Exists(tmpPath))
+                    File.Delete(tmpPath);
+            }
+            catch { /* best effort cleanup */ }
+        }
         return new FileInfo(path).Length;
     }
 }

@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import json
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -1741,8 +1742,8 @@ _PARQUET_EXCLUDED = frozenset({
 })
 
 # Cache manifest written after successful exports. Xperf continues to use the
-# v1 flat manifest. Native writes a v2 manifest via etw_analyzer.native.cache,
-# but v1 native manifests remain readable for compatibility.
+# v1 flat manifest. Native/dotnet use etw_analyzer.native.cache's finalized
+# manifest schema; pre-finalized native manifests are treated as incomplete.
 #
 # NOTE: The "wpr-mcp-" prefix is intentionally retained after the v0.4
 # etw-mcp rename — see src/etw_analyzer/native/cache.py:MANIFEST_FILENAME
@@ -1754,7 +1755,7 @@ _CACHE_SCHEMA_VERSION = 1
 # considered usable. Xperf needs cpu_sampling as the historical floor. Native
 # and dotnet can have traces with no sampled-profile rows, so completeness is
 # tracked by the per-event parquet set in the manifest instead. dotnet shares
-# the native cache shape (the producer field on the v3 manifest carries the
+# the native cache shape (the producer field on the manifest carries the
 # distinction).
 _CACHE_REQUIRED_DATASETS_BY_MODE = {
     "xperf": frozenset({"cpu_sampling"}),
@@ -1813,9 +1814,8 @@ def _remove_cache_manifest(export_dir: Path) -> None:
 def _is_native_v2_manifest(manifest: dict) -> bool:
     """Return True for native cache manifests we know how to read.
 
-    The name predates schema v3 — it now matches any schema version listed
-    in :data:`etw_analyzer.native.cache.SUPPORTED_SCHEMA_VERSIONS`. Both
-    v2 (legacy) and v3 (dotnet/native producer split) caches qualify; the
+    The name predates schema v4 — it now matches any schema version listed
+    in :data:`etw_analyzer.native.cache.SUPPORTED_SCHEMA_VERSIONS`. The
     cache loader does the producer-specific translation downstream.
     """
 
@@ -1873,11 +1873,12 @@ def _cached_dumper_paths_for_trace(trace: TraceData) -> dict[str, Path] | None:
             from etw_analyzer.native import cache as native_cache
 
             parsed = native_cache.CacheManifest.from_dict(manifest)
+            manifest_mode = "native" if trace.mode == "dotnet" else trace.mode
             native_cache.validate_manifest(
                 parsed,
                 trace.export_dir,
                 trace.etl_path,
-                mode=trace.mode,
+                mode=manifest_mode,
             )
             paths = {
                 dataset.name: native_cache.resolve_dataset_path(
@@ -1906,6 +1907,8 @@ def _cached_dumper_paths_for_trace(trace: TraceData) -> dict[str, Path] | None:
     if manifest.get("mode") != trace.mode:
         return {}
     if manifest.get("complete") is not True:
+        return {}
+    if manifest.get("finalized") is not True:
         return {}
     if not _manifest_matches_etl(manifest, trace.etl_path):
         return {}
@@ -1984,6 +1987,7 @@ def _write_cache_manifest(
         "event_schema_version": _EVENT_SCHEMA_VERSION,
         "mode": mode,
         "complete": True,
+        "finalized": True,
         **identity,
         "datasets": sorted(set(persisted_datasets)),
         "dumper_datasets": persisted_dumper_stems,
@@ -1993,12 +1997,23 @@ def _write_cache_manifest(
 
     try:
         export_dir.mkdir(parents=True, exist_ok=True)
-        _cache_manifest_path(export_dir).write_text(
-            json.dumps(manifest, indent=2, sort_keys=True),
-            encoding="utf-8",
-        )
+        _write_json_atomic(_cache_manifest_path(export_dir), manifest)
     except Exception:
         pass
+
+
+def _write_json_atomic(path: Path, data: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.parent / f"{path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}"
+    try:
+        with temp_path.open("w", encoding="utf-8") as handle:
+            handle.write(json.dumps(data, indent=2, sort_keys=True))
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+    finally:
+        temp_path.unlink(missing_ok=True)
 
 
 def _write_native_v2_cache_manifest(
@@ -2235,6 +2250,8 @@ def _load_from_cache(
             return None
         if manifest.get("complete") is not True:
             return None
+        if manifest.get("finalized") is not True:
+            return None
         if not _manifest_matches_etl(manifest, etl_path):
             return None
         manifest_datasets = {
@@ -2255,6 +2272,14 @@ def _load_from_cache(
             for stem in required_stems:
                 if not (export_dir / f"{stem}.parquet").exists():
                     return None
+        for name in manifest_datasets:
+            if name in _PARQUET_EXCLUDED:
+                continue
+            if name in _TEXT_DATASETS:
+                if not (export_dir / _TEXT_DATASETS[name]).exists():
+                    return None
+            elif not (export_dir / f"{name}.parquet").exists():
+                return None
 
     results: dict[str, pd.DataFrame] = {}
 

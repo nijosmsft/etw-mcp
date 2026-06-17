@@ -8,7 +8,7 @@ from typing import Any, Iterable
 import pyarrow as pa
 
 
-EVENT_SCHEMA_VERSION = 2  # bumped in M2: image schema gains PdbGuid/PdbAge/PdbName/TimeDateStamp
+EVENT_SCHEMA_VERSION = 3  # async-load Phase A: finalized-manifest cache gate
 
 
 @dataclass(frozen=True)

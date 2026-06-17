@@ -1,6 +1,6 @@
 """Cross-producer cache compatibility tests.
 
-The cache manifest schema v3 introduced a ``producer`` field that names
+The cache manifest schema includes a ``producer`` field that names
 the extractor that wrote the cache (``dotnet``, ``native``, or ``xperf``).
 A core invariant of the migration plan is that the parquet schema is
 identical across producers, so a cache written by one producer must be
@@ -32,7 +32,7 @@ def _write_minimal_native_cache(
     cache_dir: Path,
     etl: Path,
     producer: str,
-    schema_version: int = 3,
+    schema_version: int = native_cache.SCHEMA_VERSION,
 ) -> None:
     """Write a minimal but well-formed native cache + manifest."""
 
@@ -80,6 +80,7 @@ def _write_minimal_native_cache(
         "mode": "native",
         "strategy": native_cache.MATERIALIZED_SMALL_STRATEGY,
         "complete": True,
+        "finalized": True,
         "etl": {
             "path": str(etl.resolve()),
             "name": etl.name,
@@ -103,30 +104,28 @@ def _write_minimal_native_cache(
 
 
 def test_v2_manifest_loads_with_default_native_producer(tmp_path: Path):
-    """Synthetic legacy v2 manifest → reader treats it as producer='native'."""
+    """Synthetic legacy v2 manifest is rejected and rebuilt in Phase A."""
 
     etl = _make_etl(tmp_path)
     cache_dir = tmp_path / ".etw-export-sample"
     _write_minimal_native_cache(cache_dir, etl, producer="ignored", schema_version=2)
 
     loaded = native_cache.read_manifest(cache_dir)
-    assert loaded is not None
-    assert loaded.schema_version == 2
-    assert loaded.is_legacy_v2 is True
-    assert loaded.producer == "native"
+    assert loaded is None
 
 
-def test_v3_dotnet_manifest_loads_and_downstream_tools_work(tmp_path: Path):
+def test_v4_dotnet_manifest_loads_and_downstream_tools_work(tmp_path: Path):
     """A producer='dotnet' cache must hydrate via the standard loader path."""
 
     etl = _make_etl(tmp_path)
     cache_dir = tmp_path / ".etw-export-sample"
-    _write_minimal_native_cache(cache_dir, etl, producer="dotnet", schema_version=3)
+    _write_minimal_native_cache(cache_dir, etl, producer="dotnet")
 
     loaded = native_cache.read_manifest(cache_dir)
     assert loaded is not None
     assert loaded.producer == "dotnet"
-    assert loaded.schema_version == 3
+    assert loaded.schema_version == native_cache.SCHEMA_VERSION
+    assert loaded.finalized is True
 
     # Validate the cache is well-formed (raises on path escape, missing
     # fields, mode mismatch, stale ETL).
@@ -141,7 +140,7 @@ def test_v3_dotnet_manifest_loads_and_downstream_tools_work(tmp_path: Path):
     assert cached["cpu_sampling"]["Weight"].tolist() == [100]
 
 
-def test_v3_native_manifest_loads_identically_to_dotnet(tmp_path: Path):
+def test_v4_native_manifest_loads_identically_to_dotnet(tmp_path: Path):
     """Producer is metadata; the parquet shape is identical, the loader agnostic."""
 
     etl = _make_etl(tmp_path)
@@ -162,7 +161,7 @@ def test_v3_native_manifest_loads_identically_to_dotnet(tmp_path: Path):
     )
 
 
-def test_v3_dotnet_cache_readable_under_xperf_mode_reload(tmp_path: Path):
+def test_v4_dotnet_cache_readable_under_xperf_mode_reload(tmp_path: Path):
     """Spec D4: a trace extracted by dotnet can be hydrated by mode='xperf'.
 
     Mode here is the *requested* mode at load time, not the producer that
@@ -182,7 +181,7 @@ def test_v3_dotnet_cache_readable_under_xperf_mode_reload(tmp_path: Path):
     cache_dir = tmp_path / ".etw-export-sample"
     _write_minimal_native_cache(cache_dir, etl, producer="dotnet")
 
-    # When the trace is loaded under mode='xperf', the native v3 manifest
+    # When the trace is loaded under mode='xperf', the native manifest
     # is intentionally bypassed because xperf and native carry different
     # auxiliary text (.txt) datasets and dumper stem expectations.
     cached_xperf = trace_mgmt._load_from_cache(cache_dir, etl, mode="xperf")
@@ -196,7 +195,7 @@ def test_v3_dotnet_cache_readable_under_xperf_mode_reload(tmp_path: Path):
     assert cached_native is not None
 
 
-def test_v3_dotnet_manifest_with_unix_epoch_mtime_validates_strict(tmp_path: Path):
+def test_v4_dotnet_manifest_with_unix_epoch_mtime_validates_strict(tmp_path: Path):
     """Regression for D1: dotnet manifests with Unix-epoch mtime_ns must
     pass the strict three-field identity check, not the deprecated loose
     fall-back.
@@ -210,7 +209,7 @@ def test_v3_dotnet_manifest_with_unix_epoch_mtime_validates_strict(tmp_path: Pat
 
     etl = _make_etl(tmp_path)
     cache_dir = tmp_path / ".etw-export-sample"
-    _write_minimal_native_cache(cache_dir, etl, producer="dotnet", schema_version=3)
+    _write_minimal_native_cache(cache_dir, etl, producer="dotnet")
 
     loaded = native_cache.read_manifest(cache_dir)
     assert loaded is not None
@@ -225,14 +224,14 @@ def test_v3_dotnet_manifest_with_unix_epoch_mtime_validates_strict(tmp_path: Pat
     assert not hasattr(native_cache.EtlIdentity, "matches_loose")
 
 
-def test_v3_dotnet_manifest_with_stale_mtime_is_rejected(tmp_path: Path):
+def test_v4_dotnet_manifest_with_stale_mtime_is_rejected(tmp_path: Path):
     """A dotnet-produced cache whose mtime_ns no longer matches the
     on-disk ETL must be rejected — the loose-match workaround is gone
     so this case is now an error, not a silent cache hit."""
 
     etl = _make_etl(tmp_path)
     cache_dir = tmp_path / ".etw-export-stale"
-    _write_minimal_native_cache(cache_dir, etl, producer="dotnet", schema_version=3)
+    _write_minimal_native_cache(cache_dir, etl, producer="dotnet")
 
     # Bump mtime by re-touching the ETL — bytes unchanged, identity changed.
     import os
@@ -313,7 +312,7 @@ def test_dotnet_e2e_against_real_fixture_rehydrates_from_cache(tmp_path: Path):
     manifest = native_cache.read_manifest(export_dir)
     assert manifest is not None
     assert manifest.producer == "dotnet"
-    assert manifest.schema_version == 3
+    assert manifest.schema_version == native_cache.SCHEMA_VERSION
 
     # Hydrate from cache and verify cpu_sampling is non-empty.
     cached = trace_mgmt._load_from_cache(export_dir, fixture, mode="native")
