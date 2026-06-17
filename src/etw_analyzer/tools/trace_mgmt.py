@@ -8,8 +8,10 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Callable
 
 from etw_analyzer.app import mcp
+from etw_analyzer import load_jobs
 from etw_analyzer.native import telemetry as _telemetry
 from etw_analyzer.trace_state import (
     TraceData,
@@ -190,14 +192,16 @@ def list_traces(directory: str = r"C:\traces", pattern: str = "*.etl") -> str:
     return f"**ETL Traces in {directory}** ({len(files)} files)\n\n{format_table(df)}"
 
 
-@mcp.tool()
-def load_trace(
+def _load_trace_blocking(
     etl_path: str,
     symbol_path: str | None = None,
     timeout_seconds: int = 300,
     force: bool = False,
     mode: str = "auto",
     extra_symbol_paths: list[str] | None = None,
+    progress_callback: Callable[[dict], None] | None = None,
+    emit_start: bool = True,
+    skip_initial_cache: bool = False,
 ) -> str:
     """Load an ETL trace file for analysis.
 
@@ -263,14 +267,15 @@ def load_trace(
         etl_size_mb = path.stat().st_size / (1024 * 1024)
     except OSError:
         etl_size_mb = None
-    _telemetry.emit_with(
-        _telemetry.EVENT_LOAD_START,
-        mode=mode,
-        trace_id=make_trace_id(path),
-        etl_path=path,
-        etl_size_mb=etl_size_mb,
-        force=force,
-    )
+    if emit_start:
+        _telemetry.emit_with(
+            _telemetry.EVENT_LOAD_START,
+            mode=mode,
+            trace_id=make_trace_id(path),
+            etl_path=path,
+            etl_size_mb=etl_size_mb,
+            force=force,
+        )
 
     # Resolve the load pipeline. Environment variable overrides the arg
     # when the arg is left at its default. An explicit ``mode="native"``
@@ -342,7 +347,7 @@ def load_trace(
         )
 
     # Check if we can skip re-export (cached parquet/csv files exist and are newer than ETL)
-    cached = _load_from_cache(export_dir, path, mode=resolved_mode)
+    cached = None if skip_initial_cache else _load_from_cache(export_dir, path, mode=resolved_mode)
     if cached is not None:
         trace_id = make_trace_id(path)
         _telemetry.emit_with(
@@ -388,6 +393,7 @@ def load_trace(
             path,
             export_dir,
             sym_path,
+            progress_callback=progress_callback,
         )
         if worker_result.ok:
             cached = _load_from_cache(export_dir, path, mode="dotnet")
@@ -474,6 +480,7 @@ def load_trace(
             path,
             export_dir,
             sym_path,
+            progress_callback=progress_callback,
         )
         if worker_result.ok:
             cached = _load_from_cache(export_dir, path, mode="native")
@@ -535,6 +542,8 @@ def load_trace(
     # on for the no-cpu-filter path, and we materialise it on first use
     # via ``_synthesize_native_cpu_sampling`` rather than running xperf.
     if resolved_mode == "native":
+        if progress_callback is not None:
+            progress_callback({"type": "progress", "phase": "extracting", "pct": 5.0})
         export_dir.mkdir(parents=True, exist_ok=True)
         results: dict[str, pd.DataFrame] = {}
         errors: list[str] = list(load_notices)
@@ -560,12 +569,16 @@ def load_trace(
         # somehow didn't, fall back to the Phase N1 stub for
         # ``cpu_sampling`` so ``get_cpu_samples`` still has a row set.
         trace.wait_for_dumper()
+        if progress_callback is not None:
+            progress_callback({"type": "progress", "phase": "aggregating", "pct": 85.0})
         if trace._dumper_error:
             return _native_load_failed(trace, trace._dumper_error)
         if "cpu_sampling" not in trace.raw_csv:
             _synthesize_native_cpu_sampling(trace)
         _populate_metadata(trace)
         _write_cache_manifest(trace.export_dir, trace.etl_path, trace.mode, trace.raw_csv)
+        if progress_callback is not None:
+            progress_callback({"type": "progress", "phase": "finalizing", "pct": 95.0})
 
         _telemetry.emit_with(
             _telemetry.EVENT_LOAD_COMPLETE,
@@ -578,6 +591,8 @@ def load_trace(
 
     # Build symcache — idempotent, fast when symbols already cached
     from etw_analyzer.parsing.wpa_exporter import _run_xperf
+    if progress_callback is not None:
+        progress_callback({"type": "progress", "phase": "symcache", "pct": 5.0})
     try:
         _run_xperf(
             path, "symcache", ["-build"],
@@ -593,6 +608,8 @@ def load_trace(
     errors: list[str] = list(load_notices)
 
     try:
+        if progress_callback is not None:
+            progress_callback({"type": "progress", "phase": "exporting", "pct": 15.0})
         file_paths = export_all_profiles(
             path, export_dir,
             symbol_path=sym_path,
@@ -602,6 +619,12 @@ def load_trace(
         return f"Export failed: {e}"
 
     for profile_name, file_path in file_paths.items():
+        if progress_callback is not None:
+            progress_callback({
+                "type": "progress",
+                "phase": "loading",
+                "current_dataset": profile_name,
+            })
         try:
             results[profile_name] = _load_file(file_path)
         except Exception as e:
@@ -628,6 +651,8 @@ def load_trace(
         trace.raw_csv,
         dumper_stems=frozenset(),
     )
+    if progress_callback is not None:
+        progress_callback({"type": "progress", "phase": "finalizing", "pct": 95.0})
     _start_background_dumper(trace)
 
     _telemetry.emit_with(
@@ -638,6 +663,223 @@ def load_trace(
         from_cache=False,
     )
     return _format_load_summary(trace)
+
+
+def _resolve_mode_for_load(mode: str, path: Path) -> tuple[str, str | None]:
+    from etw_analyzer.native.config import (
+        apply_native_size_guardrail,
+        resolve_mode,
+    )
+
+    resolved_mode = resolve_mode(mode, etl_path=path)
+    return apply_native_size_guardrail(mode, resolved_mode, path)
+
+
+def _format_json_status(status: dict) -> str:
+    return json.dumps(status, indent=2, sort_keys=True)
+
+
+def _format_extracting_response(
+    status: dict,
+    *,
+    etl_path: Path,
+    reused: bool,
+) -> str:
+    size_bytes = int(status.get("size_bytes") or 0)
+    size_mb = size_bytes / (1024 * 1024) if size_bytes else 0.0
+    eta = status.get("eta_seconds")
+    status = dict(status)
+    status["message"] = (
+        f"{etl_path.name} ({size_mb:,.1f} MB) is extracting in background; "
+        f"ETA ~{eta}s. Call get_load_status(etl_path=...) or "
+        "list_loaded_traces() for progress."
+    )
+    if reused:
+        status["message"] = "Existing extraction reused; no new extractor was started. " + status["message"]
+    return _format_json_status(status)
+
+
+def _try_register_cache_hit(
+    path: Path,
+    export_dir: Path,
+    sym_path: str | None,
+    resolved_mode: str,
+    load_notices: list[str],
+) -> str | None:
+    cached = _load_from_cache(export_dir, path, mode=resolved_mode)
+    if cached is None:
+        return None
+    trace_id = make_trace_id(path)
+    _telemetry.emit_with(
+        _telemetry.EVENT_LOAD_CACHE_HIT,
+        mode=resolved_mode,
+        trace_id=trace_id,
+        export_dir=export_dir,
+        datasets=len(cached),
+    )
+    try:
+        load_jobs.marker_path(export_dir).unlink(missing_ok=True)
+        load_jobs.failed_marker_path(export_dir).unlink(missing_ok=True)
+    except Exception:
+        pass
+    return _register_cached_trace(
+        path,
+        export_dir,
+        sym_path,
+        resolved_mode,
+        cached,
+        load_notices,
+        from_cache=True,
+    )
+
+
+@mcp.tool()
+def load_trace(
+    etl_path: str,
+    symbol_path: str | None = None,
+    timeout_seconds: int = 300,
+    force: bool = False,
+    mode: str = "auto",
+    extra_symbol_paths: list[str] | None = None,
+    wait_seconds: float | None = None,
+    async_load: bool = True,
+) -> str:
+    """Load an ETL trace file for analysis.
+
+    Args:
+        etl_path: Full path to the .etl file.
+        symbol_path: NT symbol path. When set, replaces ``_NT_SYMBOL_PATH``.
+        timeout_seconds: Max seconds per xperf invocation. Default: 300.
+        force: Delete cached exports and re-run extraction. Does not start a
+            second extractor when a fresh extraction marker already exists.
+        mode: ``"auto"`` (default), ``"dotnet"``, ``"native"``, or ``"xperf"``.
+        extra_symbol_paths: Symbol path entries appended to the selected base.
+        wait_seconds: Inline wait budget for async loads. Defaults to
+            ``ETW_MCP_LOAD_WAIT`` or 20 seconds.
+        async_load: When true, extraction runs in a background thread and this
+            call waits only up to ``wait_seconds``. Ready/cache-hit responses
+            keep the historical load summary shape; slow loads return a JSON
+            status with ``status: "extracting"``.
+    """
+    if not async_load:
+        return _load_trace_blocking(
+            etl_path,
+            symbol_path=symbol_path,
+            timeout_seconds=timeout_seconds,
+            force=force,
+            mode=mode,
+            extra_symbol_paths=extra_symbol_paths,
+        )
+
+    path = Path(etl_path)
+    if not path.exists():
+        return (
+            f"File not found: {etl_path}\n\n"
+            "Use list_traces(directory=...) to enumerate .etl files in a "
+            "directory, or check the path for typos / drive-letter case. "
+            "load_trace needs an absolute path to an existing .etl file."
+        )
+    if not path.suffix.lower() == ".etl":
+        return (
+            f"Expected .etl file, got: {path.suffix or '(no suffix)'}\n\n"
+            f"Path: {etl_path}\n\n"
+            "load_trace only accepts ETW trace files with a .etl extension. "
+            "Use list_traces(directory=...) to find .etl files in a "
+            "directory, or rename the file if you know it is a valid ETW "
+            "trace under a different extension."
+        )
+
+    try:
+        etl_size_mb = path.stat().st_size / (1024 * 1024)
+    except OSError:
+        etl_size_mb = None
+    _telemetry.emit_with(
+        _telemetry.EVENT_LOAD_START,
+        mode=mode,
+        trace_id=make_trace_id(path),
+        etl_path=path,
+        etl_size_mb=etl_size_mb,
+        force=force,
+    )
+
+    try:
+        resolved_mode, guardrail_notice = _resolve_mode_for_load(mode, path)
+    except ValueError as e:
+        return str(e)
+    except RuntimeError as e:
+        return str(e)
+
+    if resolved_mode == "native" and timeout_seconds != 300:
+        return (
+            "timeout_seconds is only supported for mode='xperf'. The native "
+            "ETW pipeline currently runs to completion because safe "
+            "cancellation is not implemented. Use mode='xperf' for timeout "
+            "enforcement, or leave timeout_seconds at its default for native."
+        )
+
+    xperf = find_xperf()
+    if xperf is None and resolved_mode not in ("native", "dotnet"):
+        prefix = f"{guardrail_notice}\n\n" if guardrail_notice else ""
+        return prefix + (
+            "xperf.exe not found. Install Windows Performance Toolkit "
+            "(part of Windows SDK/ADK) or add it to PATH.\n\n"
+            "Expected at: C:\\Program Files (x86)\\Windows Kits\\10\\Windows Performance Toolkit\\xperf.exe\n\n"
+            "Alternatives that do not need xperf:\n"
+            "  - Pass mode='native' (or set ETW_MCP_MODE=native) to use the "
+            "in-process ETW consumer when its bindings load on this host.\n"
+            "  - Build the .NET sidecar (cd dotnet && dotnet publish -c Release "
+            "-r win-x64 --self-contained), set ETW_MCP_DOTNET_SIDECAR to the "
+            "published etw-extract.exe path, and pass mode='dotnet' (or "
+            "set ETW_MCP_MODE=dotnet)."
+        )
+
+    sym_path = _resolve_sym_path(symbol_path, extra_symbol_paths)
+    load_notices: list[str] = [guardrail_notice] if guardrail_notice else []
+    trace_id = make_trace_id(path)
+    export_dir = path.parent / f".etw-export-{path.stem}"
+    wait_budget = load_jobs.load_wait_seconds(wait_seconds)
+
+    if not force:
+        ready = _try_register_cache_hit(path, export_dir, sym_path, resolved_mode, load_notices)
+        if ready is not None:
+            return ready
+
+    active = load_jobs.active_job(trace_id)
+    if active is not None:
+        if active.wait(wait_budget):
+            return active.result or _format_json_status(active.snapshot())
+        return _format_extracting_response(active.snapshot(), etl_path=path, reused=True)
+
+    marker = load_jobs.read_extracting_marker(export_dir)
+    if marker is not None:
+        if load_jobs.marker_is_fresh(marker):
+            status = load_jobs.marker_to_status(marker)
+            return _format_extracting_response(status, etl_path=path, reused=True)
+        load_jobs.reclaim_cache_dir(export_dir)
+
+    def _loader(progress_callback: Callable[[dict], None]) -> str:
+        return _load_trace_blocking(
+            etl_path,
+            symbol_path=symbol_path,
+            timeout_seconds=timeout_seconds,
+            force=force,
+            mode=mode,
+            extra_symbol_paths=extra_symbol_paths,
+            progress_callback=progress_callback,
+            emit_start=False,
+            skip_initial_cache=True,
+        )
+
+    job = load_jobs.start_job(
+        trace_id=trace_id,
+        etl_path=path,
+        export_dir=export_dir,
+        mode=resolved_mode,
+        loader=_loader,
+    )
+    if job.wait(wait_budget):
+        return job.result or _format_json_status(job.snapshot())
+    return _format_extracting_response(job.snapshot(), etl_path=path, reused=False)
 
 
 def _register_cached_trace(
@@ -793,6 +1035,7 @@ def _load_native_with_worker(
     path: Path,
     export_dir: Path,
     sym_path: str | None,
+    progress_callback: Callable[[dict], None] | None = None,
 ):
     from etw_analyzer.native.worker_supervisor import run_native_worker_extraction
 
@@ -802,6 +1045,7 @@ def _load_native_with_worker(
         trace_id=make_trace_id(path),
         symbol_path=sym_path,
         requested_event_classes=_DUMPER_EVENT_CLASSES.keys(),
+        progress_callback=progress_callback,
     )
 
 
@@ -809,6 +1053,7 @@ def _load_dotnet_with_worker(
     path: Path,
     export_dir: Path,
     sym_path: str | None,
+    progress_callback: Callable[[dict], None] | None = None,
 ):
     """Dispatch to the C# sidecar via worker_supervisor.run_dotnet_worker_extraction.
 
@@ -825,6 +1070,7 @@ def _load_dotnet_with_worker(
         trace_id=make_trace_id(path),
         symbol_path=sym_path,
         requested_event_classes=_DUMPER_EVENT_CLASSES.keys(),
+        progress_callback=progress_callback,
     )
 
 
@@ -2558,9 +2804,10 @@ def trace_info(trace_id: str) -> str:
 
 @mcp.tool()
 def list_loaded_traces() -> str:
-    """Show traces currently loaded in this MCP server process."""
+    """Show traces currently loaded, plus in-progress async load jobs."""
     traces = get_loaded_traces()
-    if not traces:
+    jobs = load_jobs.list_jobs()
+    if not traces and not jobs:
         return "*No traces loaded. Call `load_trace` first.*"
 
     rows = []
@@ -2574,7 +2821,156 @@ def list_loaded_traces() -> str:
             "Duration (s)": f"{trace.duration_seconds:.1f}" if trace.duration_seconds is not None else "",
         })
 
-    return f"**Loaded Traces** ({len(rows)})\n\n{format_table(pd.DataFrame(rows))}"
+    sections: list[str] = []
+    if rows:
+        sections.append(f"**Loaded Traces** ({len(rows)})\n\n{format_table(pd.DataFrame(rows))}")
+
+    job_rows = []
+    for job in jobs:
+        status = job.snapshot()
+        if status.get("status") == "ready" and any(t.trace_id == job.trace_id for t in traces):
+            continue
+        job_rows.append({
+            "Trace ID": status.get("trace_id") or "",
+            "Name": Path(str(status.get("etl_path") or "")).name,
+            "Status": status.get("status") or "",
+            "Pct": f"{float(status.get('pct') or 0.0):.1f}",
+            "Dataset": status.get("current_dataset") or status.get("current_phase") or "",
+            "ETA (s)": status.get("eta_seconds") if status.get("eta_seconds") is not None else "",
+        })
+    if job_rows:
+        sections.append(f"**Load Jobs** ({len(job_rows)})\n\n{format_table(pd.DataFrame(job_rows))}")
+
+    return "\n\n".join(sections) if sections else "*No traces loaded. Call `load_trace` first.*"
+
+
+@mcp.tool()
+def get_load_status(
+    etl_path: str | None = None,
+    trace_id: str | None = None,
+    job_id: str | None = None,
+) -> str:
+    """Return async load status for an ETL path, trace_id, or job_id.
+
+    Status is one of ``extracting``, ``ready``, ``failed``, or ``not_found``.
+    The result is JSON with progress percent, current dataset/phase, ETA,
+    start time, elapsed seconds, and error details when available.
+    """
+    lookup_id = job_id or trace_id
+    if lookup_id:
+        for trace in get_loaded_traces():
+            if trace.trace_id == lookup_id:
+                return _format_json_status({
+                    "trace_id": trace.trace_id,
+                    "job_id": trace.trace_id,
+                    "status": "ready",
+                    "pct": 100.0,
+                    "current_dataset": None,
+                    "eta_seconds": 0,
+                    "started_at": None,
+                    "elapsed": None,
+                    "etl_path": str(trace.etl_path),
+                    "cache_dir": str(trace.export_dir),
+                    "error": None,
+                })
+        job = load_jobs.job_by_id(lookup_id)
+        if job is not None:
+            return _format_json_status(job.snapshot())
+        return _format_json_status({
+            "trace_id": lookup_id,
+            "job_id": lookup_id,
+            "status": "not_found",
+            "pct": 0.0,
+            "current_dataset": None,
+            "eta_seconds": None,
+            "started_at": None,
+            "elapsed": None,
+            "error": "No loaded trace or load job has this trace_id/job_id.",
+        })
+
+    if not etl_path:
+        return _format_json_status({
+            "status": "not_found",
+            "pct": 0.0,
+            "error": "Pass etl_path, trace_id, or job_id.",
+        })
+
+    path = Path(etl_path)
+    if not path.exists() or path.suffix.lower() != ".etl":
+        return _format_json_status({
+            "status": "not_found",
+            "pct": 0.0,
+            "etl_path": etl_path,
+            "error": "ETL path not found or not an .etl file.",
+        })
+
+    trace_id = make_trace_id(path)
+    for trace in get_loaded_traces():
+        if trace.trace_id == trace_id:
+            return _format_json_status({
+                "trace_id": trace.trace_id,
+                "job_id": trace.trace_id,
+                "status": "ready",
+                "pct": 100.0,
+                "current_dataset": None,
+                "eta_seconds": 0,
+                "started_at": None,
+                "elapsed": None,
+                "etl_path": str(trace.etl_path),
+                "cache_dir": str(trace.export_dir),
+                "error": None,
+            })
+
+    job = load_jobs.job_by_id(trace_id)
+    if job is not None:
+        return _format_json_status(job.snapshot())
+
+    export_dir = path.parent / f".etw-export-{path.stem}"
+    failed = load_jobs.read_failed_marker(export_dir)
+    if failed is not None:
+        status = load_jobs.marker_to_status(failed)
+        status["status"] = "failed"
+        return _format_json_status(status)
+    marker = load_jobs.read_extracting_marker(export_dir)
+    if marker is not None:
+        status = load_jobs.marker_to_status(marker)
+        if load_jobs.marker_is_fresh(marker):
+            status["status"] = "extracting"
+        else:
+            status["status"] = "failed"
+            status["error"] = status.get("error") or "Extraction marker is stale."
+            status["failure_kind"] = status.get("failure_kind") or "stale-marker"
+        return _format_json_status(status)
+
+    for cache_mode in ("dotnet", "native", "xperf"):
+        if _load_from_cache(export_dir, path, mode=cache_mode) is not None:
+            return _format_json_status({
+                "trace_id": trace_id,
+                "job_id": trace_id,
+                "status": "ready",
+                "pct": 100.0,
+                "current_dataset": None,
+                "eta_seconds": 0,
+                "started_at": None,
+                "elapsed": None,
+                "etl_path": str(path.resolve()),
+                "cache_dir": str(export_dir.resolve()),
+                "error": None,
+            })
+
+    return _format_json_status({
+        "trace_id": trace_id,
+        "job_id": trace_id,
+        "status": "not_found",
+        "pct": 0.0,
+        "current_dataset": None,
+        "eta_seconds": None,
+        "started_at": None,
+        "elapsed": None,
+        "etl_path": str(path.resolve()),
+        "cache_dir": str(export_dir.resolve()),
+        "error": "No finalized cache, active extraction, or failed marker was found.",
+    })
 
 
 @mcp.tool()

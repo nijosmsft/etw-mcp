@@ -266,7 +266,7 @@ def test_load_trace_native_mode_sets_trace_mode(isolate_traces):
     from etw_analyzer.trace_state import get_trace
 
     _clear_export_dir(MULTI_PROVIDER_ETL)
-    result = load_trace(str(MULTI_PROVIDER_ETL), mode="native")
+    result = load_trace(str(MULTI_PROVIDER_ETL), mode="native", async_load=False)
     tid = _extract_trace_id(result)
     trace = get_trace(tid)
     assert trace is not None
@@ -280,7 +280,7 @@ def test_load_trace_native_produces_sampled_profile_df(isolate_traces):
     from etw_analyzer.trace_state import get_trace
 
     _clear_export_dir(MULTI_PROVIDER_ETL)
-    result = load_trace(str(MULTI_PROVIDER_ETL), mode="native")
+    result = load_trace(str(MULTI_PROVIDER_ETL), mode="native", async_load=False)
     tid = _extract_trace_id(result)
     trace = get_trace(tid)
 
@@ -302,7 +302,7 @@ def test_load_trace_xperf_mode_is_unchanged(isolate_traces):
     # Phase N5: ``"xperf"`` is now opt-in (the default is ``"auto"``
     # which prefers native). This test pins the contract that the
     # legacy pipeline is still reachable on demand.
-    result = load_trace(str(MULTI_PROVIDER_ETL), mode="xperf")
+    result = load_trace(str(MULTI_PROVIDER_ETL), mode="xperf", async_load=False)
     tid = _extract_trace_id(result)
     trace = get_trace(tid)
     assert trace.mode == "xperf"
@@ -332,7 +332,7 @@ def test_load_trace_default_uses_native(isolate_traces, monkeypatch, tmp_path):
     monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
 
     _clear_export_dir(MULTI_PROVIDER_ETL)
-    result = load_trace(str(MULTI_PROVIDER_ETL))
+    result = load_trace(str(MULTI_PROVIDER_ETL), async_load=False)
     tid = _extract_trace_id(result)
     trace = get_trace(tid)
     assert trace.mode == "native"
@@ -348,7 +348,7 @@ def test_etw_mcp_mode_env_var_can_force_xperf(isolate_traces, monkeypatch):
     _clear_export_dir(MULTI_PROVIDER_ETL)
     # No explicit ``mode=`` arg — the env var takes over and forces
     # the legacy xperf pipeline.
-    result = load_trace(str(MULTI_PROVIDER_ETL))
+    result = load_trace(str(MULTI_PROVIDER_ETL), async_load=False)
     tid = _extract_trace_id(result)
     trace = get_trace(tid)
     assert trace.mode == "xperf"
@@ -364,7 +364,7 @@ def test_etw_mcp_mode_env_var_overrides_arg(isolate_traces, monkeypatch):
     _clear_export_dir(MULTI_PROVIDER_ETL)
     # Explicit mode='xperf' beats the env var per the documented
     # precedence (arg > env > default).
-    result = load_trace(str(MULTI_PROVIDER_ETL), mode="xperf")
+    result = load_trace(str(MULTI_PROVIDER_ETL), mode="xperf", async_load=False)
     tid = _extract_trace_id(result)
     trace = get_trace(tid)
     assert trace.mode == "xperf"
@@ -406,7 +406,7 @@ def test_load_trace_native_large_produces_sampled_profile(isolate_traces):
     from etw_analyzer.trace_state import get_trace
 
     _clear_export_dir(LARGE_ETL)
-    result = load_trace(str(LARGE_ETL), mode="native")
+    result = load_trace(str(LARGE_ETL), mode="native", async_load=False)
     tid = _extract_trace_id(result)
     trace = get_trace(tid)
     df = trace.wait_for_dumper()
@@ -487,7 +487,7 @@ def test_native_mode_populates_cpu_sampling(isolate_traces):
     from etw_analyzer.trace_state import get_trace
 
     _clear_export_dir(LARGE_ETL)
-    result = load_trace(str(LARGE_ETL), mode="native")
+    result = load_trace(str(LARGE_ETL), mode="native", async_load=False)
     tid = _extract_trace_id(result)
     trace = get_trace(tid)
     trace.wait_for_dumper()
@@ -507,7 +507,7 @@ def test_native_mode_populates_dpc_isr(isolate_traces):
     from etw_analyzer.trace_state import get_trace
 
     _clear_export_dir(LARGE_ETL)
-    result = load_trace(str(LARGE_ETL), mode="native")
+    result = load_trace(str(LARGE_ETL), mode="native", async_load=False)
     tid = _extract_trace_id(result)
     trace = get_trace(tid)
     trace.wait_for_dumper()
@@ -529,7 +529,7 @@ def test_native_mode_get_cpu_samples_returns_data(isolate_traces):
     from etw_analyzer.tools.cpu_sampling import get_cpu_samples
 
     _clear_export_dir(LARGE_ETL)
-    result = load_trace(str(LARGE_ETL), mode="native")
+    result = load_trace(str(LARGE_ETL), mode="native", async_load=False)
     tid = _extract_trace_id(result)
 
     text = get_cpu_samples(trace_id=tid, group_by="module", max_rows=10)
@@ -548,7 +548,7 @@ def test_native_mode_emits_tracestats(isolate_traces):
     from etw_analyzer.trace_state import get_trace
 
     _clear_export_dir(LARGE_ETL)
-    result = load_trace(str(LARGE_ETL), mode="native")
+    result = load_trace(str(LARGE_ETL), mode="native", async_load=False)
     tid = _extract_trace_id(result)
     trace = get_trace(tid)
     trace.wait_for_dumper()
