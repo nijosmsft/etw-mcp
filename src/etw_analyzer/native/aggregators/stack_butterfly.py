@@ -355,7 +355,7 @@ def _resolve_address_pairs(
 
     labels: dict[int, str] = {}
     symbolizer = getattr(trace, "symbolizer", None)
-    if symbolizer is not None:
+    if symbolizer is not None and not bool(getattr(trace, "_defer_symbolization", False)):
         to_symbolize = unique[:max_symbol_addresses]
         try:
             labels = symbolizer.bulk_resolve(to_symbolize)

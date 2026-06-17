@@ -8,7 +8,10 @@ from etw_analyzer.formatting.markdown import format_table, format_pct
 
 import pandas as pd
 
-from etw_analyzer.native.aggregators.dpcisr import build_dpc_per_cpu_dataframe
+from etw_analyzer.native.aggregators.dpcisr import (
+    aggregate_dpc_isr,
+    build_dpc_per_cpu_dataframe,
+)
 
 
 def _get_dpc_df(trace: TraceData) -> pd.DataFrame:
@@ -22,6 +25,16 @@ def _get_dpc_df(trace: TraceData) -> pd.DataFrame:
             df = trace.raw_csv[key]
             if "Module" in df.columns and "Count" in df.columns:
                 return df.copy()
+
+    # Native/dotnet loads keep DPC event rows structured and defer the
+    # expensive per-module histogram until this explicit query.
+    try:
+        df = aggregate_dpc_isr(trace)
+    except Exception:
+        df = None
+    if df is not None and not df.empty:
+        trace.raw_csv["dpc_isr"] = df
+        return df.copy()
 
     raise ValueError(
         "No DPC/ISR data available. The trace was likely collected with "

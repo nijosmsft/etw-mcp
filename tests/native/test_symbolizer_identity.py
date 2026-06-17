@@ -34,6 +34,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import pandas as pd
 
 
 pytestmark = pytest.mark.skipif(
@@ -187,6 +188,130 @@ def _make_load_fake(calls: list[dict[str, Any]]):
     return _fake
 
 
+def _force_lazy_load(sym) -> None:
+    sym._ensure_pdb_loaded(_FAKE_BASE)
+
+
+def test_add_module_defers_dbghelp_file_lookups(monkeypatch):
+    """add_module stores RSDS identity but does not touch PDB files/servers."""
+    from etw_analyzer.native.symbolizer import Symbolizer
+
+    find_calls: list[dict[str, Any]] = []
+    load_calls: list[dict[str, Any]] = []
+
+    with Symbolizer() as sym:
+        monkeypatch.setattr(
+            sym._dbghelp, "SymFindFileInPathW",
+            _make_find_fake(found_path=_FAKE_FOUND_PDB, calls=find_calls),
+        )
+        monkeypatch.setattr(
+            sym._dbghelp, "SymLoadModuleExW",
+            _make_load_fake(load_calls),
+        )
+
+        sym.add_module(
+            _FAKE_BASE, _FAKE_SIZE, _FAKE_IMAGE,
+            pdb_guid=_NTOSKRNL_GUID,
+            pdb_age=_NTOSKRNL_AGE,
+            pdb_name=_NTOSKRNL_PDB,
+        )
+
+        entry = sym._modules[_FAKE_BASE]
+        assert entry["PdbGuid"] == _NTOSKRNL_GUID
+        assert entry["PdbAge"] == _NTOSKRNL_AGE
+        assert entry["PdbName"] == _NTOSKRNL_PDB
+        assert entry["pdb_load_attempted"] is False
+
+    assert find_calls == []
+    assert load_calls == []
+
+
+def test_build_symbolizer_from_dotnet_images_defers_dbghelp_lookups(monkeypatch):
+    """Many image rows with a remote symbol path must not do PDB lookups."""
+    import etw_analyzer.native as native_pkg
+    from etw_analyzer.native.aggregation_worker_adapters import (
+        build_symbolizer_from_dotnet_images,
+    )
+    from etw_analyzer.native.symbolizer import Symbolizer
+
+    find_calls: list[dict[str, Any]] = []
+    load_calls: list[dict[str, Any]] = []
+    original_symbolizer = getattr(native_pkg, "Symbolizer")
+
+    class _SpyingSymbolizer(Symbolizer):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            monkeypatch.setattr(
+                self._dbghelp, "SymFindFileInPathW",
+                _make_find_fake(found_path=None, calls=find_calls),
+            )
+            monkeypatch.setattr(
+                self._dbghelp, "SymLoadModuleExW",
+                _make_load_fake(load_calls),
+            )
+
+    monkeypatch.setattr(native_pkg, "Symbolizer", _SpyingSymbolizer)
+
+    class _Trace:
+        symbolizer = None
+        symbol_path = r"srv*C:\definitely-empty*https://example.invalid/symbols"
+        pdb_identity: dict[int, dict] = {}
+
+        def __init__(self) -> None:
+            self.raw_csv = {
+                "image": pd.DataFrame([
+                    {
+                        "ImageBase": 0x10000000 + i * 0x10000,
+                        "ImageSize": 0x10000,
+                        "FileName": f"mod{i}.sys",
+                        "PdbGuid": _NTOSKRNL_GUID,
+                        "PdbAge": _NTOSKRNL_AGE,
+                        "PdbName": _NTOSKRNL_PDB,
+                    }
+                    for i in range(64)
+                ])
+            }
+
+    try:
+        trace = _Trace()
+        assert build_symbolizer_from_dotnet_images(trace) is True
+        assert trace.symbolizer.module_count() == 64
+        assert find_calls == []
+        assert load_calls == []
+    finally:
+        monkeypatch.setattr(native_pkg, "Symbolizer", original_symbolizer)
+
+
+def test_first_resolve_ensures_pdb_once(monkeypatch):
+    """First resolve loads a module lazily; cache hits do not reload it."""
+    from etw_analyzer.native.symbolizer import Symbolizer
+
+    with Symbolizer() as sym:
+        sym.add_module(
+            _FAKE_BASE, _FAKE_SIZE, _FAKE_IMAGE,
+            pdb_guid=_NTOSKRNL_GUID,
+            pdb_age=_NTOSKRNL_AGE,
+            pdb_name=_NTOSKRNL_PDB,
+        )
+        ensure_calls: list[int] = []
+
+        def _ensure(base: int) -> None:
+            ensure_calls.append(base)
+
+        monkeypatch.setattr(sym, "_ensure_pdb_loaded", _ensure)
+        monkeypatch.setattr(
+            sym,
+            "_resolve_one",
+            lambda address: ("ntoskrnl.exe!KiFake+0x0", "pdb"),
+        )
+
+        addr = _FAKE_BASE + 0x1234
+        assert sym.resolve(addr) == "ntoskrnl.exe!KiFake+0x0"
+        assert sym.resolve(addr) == "ntoskrnl.exe!KiFake+0x0"
+
+    assert ensure_calls == [_FAKE_BASE]
+
+
 def test_k2_add_module_calls_sym_find_with_correct_guid(monkeypatch):
     """K2: SymFindFileInPathW receives the exact GUID struct, age, pdb_name,
     and SSRVOPT_GUIDPTR flag derived from the add_module identity kwargs.
@@ -218,6 +343,7 @@ def test_k2_add_module_calls_sym_find_with_correct_guid(monkeypatch):
             pdb_age=_NTOSKRNL_AGE,
             pdb_name=_NTOSKRNL_PDB,
         )
+        _force_lazy_load(sym)
 
     # SymFindFileInPathW must be called exactly once.
     assert len(find_calls) == 1, (
@@ -266,6 +392,7 @@ def test_k2_add_module_loads_from_found_pdb_path(monkeypatch):
             pdb_age=_NTOSKRNL_AGE,
             pdb_name=_NTOSKRNL_PDB,
         )
+        _force_lazy_load(sym)
 
     assert len(load_calls) == 1, (
         f"SymLoadModuleExW call count wrong: {len(load_calls)}"
@@ -300,6 +427,7 @@ def test_k2_add_module_fallback_when_guid_not_found(monkeypatch):
             pdb_age=_NTOSKRNL_AGE,
             pdb_name=_NTOSKRNL_PDB,
         )
+        _force_lazy_load(sym)
 
     # SymFindFileInPathW was attempted.
     assert len(find_calls) == 1
@@ -333,6 +461,7 @@ def test_k2_add_module_no_guid_uses_legacy_path(monkeypatch):
 
         # 3-arg call -- no identity kwargs.
         sym.add_module(_FAKE_BASE, _FAKE_SIZE, _FAKE_IMAGE)
+        _force_lazy_load(sym)
 
     assert len(find_calls) == 0, (
         "SymFindFileInPathW must not be called when pdb_guid is absent"
@@ -371,6 +500,7 @@ def test_k2_identity_source_recorded_on_rsds_success(monkeypatch):
             pdb_age=_NTOSKRNL_AGE,
             pdb_name=_NTOSKRNL_PDB,
         )
+        _force_lazy_load(sym)
 
         entry = sym._modules.get(_FAKE_BASE)
         assert entry is not None
@@ -402,6 +532,7 @@ def test_k2_identity_source_image_on_rsds_miss(monkeypatch):
             pdb_age=_NTOSKRNL_AGE,
             pdb_name=_NTOSKRNL_PDB,
         )
+        _force_lazy_load(sym)
 
         entry = sym._modules.get(_FAKE_BASE)
         assert entry is not None
@@ -449,6 +580,7 @@ def test_k1_add_module_rsds_resolves_to_pdb_source():
             pdb_age=_NTOSKRNL_AGE,
             pdb_name=_NTOSKRNL_PDB,
         )
+        _force_lazy_load(sym)
 
         entry = sym._modules.get(_FAKE_BASE)
         assert entry is not None, "Module entry must be present after add_module"

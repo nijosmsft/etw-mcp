@@ -31,6 +31,7 @@ typical traces collapse 10M samples into <50K unique IPs.
 from __future__ import annotations
 
 import re
+import ntpath
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Optional
 
@@ -66,6 +67,22 @@ def _split_resolved(label: str) -> tuple[str, str]:
     return label, ""
 
 
+def _module_from_registered_range(symbolizer: object, address: int) -> str:
+    """Return module basename from Symbolizer bookkeeping without dbghelp IO."""
+
+    finder = getattr(symbolizer, "_find_module_for_address", None)
+    if finder is None:
+        return "unknown"
+    try:
+        module = finder(address)
+    except Exception:
+        module = None
+    if not module:
+        return "unknown"
+    file_name = str(module.get("FileName") or "").lstrip("\x00 \t")
+    return ntpath.basename(file_name) or "unknown"
+
+
 def aggregate_cpu_sampling(trace: "TraceData") -> Optional[pd.DataFrame]:
     """Build the ``cpu_sampling`` DataFrame from native event DataFrames.
 
@@ -74,6 +91,16 @@ def aggregate_cpu_sampling(trace: "TraceData") -> Optional[pd.DataFrame]:
     "no data" path.
     """
     dumper = trace.dumper_df
+    if dumper is None or dumper.empty:
+        raw_csv = getattr(trace, "raw_csv", {}) or {}
+        dumper = raw_csv.get("sampled_profile")
+        if dumper is None or dumper.empty:
+            dumper = raw_csv.get("SampledProfile")
+        if dumper is not None and not dumper.empty:
+            try:
+                trace.dumper_df = dumper
+            except Exception:
+                pass
     if dumper is None or dumper.empty:
         return None
 
@@ -100,9 +127,20 @@ def aggregate_cpu_sampling(trace: "TraceData") -> Optional[pd.DataFrame]:
         unique_ips = []
 
     symbolizer = getattr(trace, "symbolizer", None)
+    defer_symbolization = bool(getattr(trace, "_defer_symbolization", False))
     ip_to_label: dict[int, str] = {}
     ip_to_source: dict[int, str] = {}
-    if symbolizer is not None and unique_ips:
+    ip_to_module: dict[int, str] = {}
+    if symbolizer is not None and unique_ips and defer_symbolization:
+        # load_trace aggregators must not force remote PDB downloads. Keep
+        # module attribution from the already-registered image ranges and
+        # retain InstructionPointer so explicit query tools can resolve the
+        # small filtered subset on demand.
+        ip_to_module = {
+            ip: _module_from_registered_range(symbolizer, ip)
+            for ip in unique_ips
+        }
+    elif symbolizer is not None and unique_ips:
         try:
             # bulk_resolve_with_source is the v0.6 API that tags each
             # resolved address with the source dbghelp pulled it from:
@@ -128,7 +166,13 @@ def aggregate_cpu_sampling(trace: "TraceData") -> Optional[pd.DataFrame]:
             ip_to_label = {}
 
     # Build a per-row (module, function) — vectorised via map for speed.
-    if ip_to_label:
+    if ip_to_module:
+        ip_values = df["InstructionPointer"].map(
+            lambda value: int(value) if pd.notna(value) else None
+        )
+        modules = ip_values.map(ip_to_module).fillna("unknown")
+        functions = pd.Series([""] * len(df), index=df.index)
+    elif ip_to_label:
         labels = df["InstructionPointer"].map(ip_to_label)
         # Pre-split into module/function — done once per unique label.
         unique_labels = set(v for v in ip_to_label.values() if v)
@@ -155,7 +199,9 @@ def aggregate_cpu_sampling(trace: "TraceData") -> Optional[pd.DataFrame]:
     # Per-row symbol source. Defaults to "" when the symbolizer didn't
     # provide one (back-compat with mocks). Otherwise map InstructionPointer
     # -> source via ip_to_source.
-    if ip_to_source:
+    if ip_to_module:
+        symbol_source = pd.Series(["unknown"] * len(df), index=df.index)
+    elif ip_to_source:
         symbol_source = df["InstructionPointer"].map(ip_to_source).fillna("unknown")
     else:
         symbol_source = pd.Series([""] * len(df))
@@ -190,6 +236,11 @@ def aggregate_cpu_sampling(trace: "TraceData") -> Optional[pd.DataFrame]:
     })
 
     group_cols = ["Process Name", "PID", "Module", "Function", "SymbolSource"]
+    if defer_symbolization and "InstructionPointer" in df.columns:
+        agg_input["InstructionPointer"] = df["InstructionPointer"].map(
+            lambda value: int(value) if pd.notna(value) else 0
+        ).values
+        group_cols.append("InstructionPointer")
     agg = (
         agg_input.groupby(group_cols, dropna=False, sort=False)["Weight"]
         .sum()

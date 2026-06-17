@@ -1773,43 +1773,69 @@ def _run_native_aggregators(trace: TraceData) -> None:
     except Exception:
         pass
 
-    # cpu_sampling — the floor everything else needs.
-    try:
-        _persist_df("cpu_sampling", "cpu_sampling", aggregate_cpu_sampling(trace))
-    except Exception:
-        pass
+    def _frame_len(name: str) -> int:
+        df = trace.raw_csv.get(name)
+        try:
+            return int(len(df)) if df is not None else 0
+        except Exception:
+            return 0
 
-    # cpu_timeline — per-CPU utilization buckets.
-    try:
-        _persist_df("cpu_timeline", "cpu_timeline", aggregate_cpu_timeline(trace))
-    except Exception:
-        pass
+    image_rows = _frame_len("Image/Load") + _frame_len("Image/DCStart") + _frame_len("image")
+    sample_rows = _frame_len("SampledProfile") + _frame_len("sampled_profile")
+    dpc_rows = (
+        _frame_len("PerfInfo/DPC")
+        + _frame_len("PerfInfo/ThreadedDPC")
+        + _frame_len("PerfInfo/TimerDPC")
+        + _frame_len("PerfInfo/ISR")
+        + _frame_len("dpc_isr")
+    )
+    defer_load_symbols = image_rows > 250 or sample_rows > 50_000
+    defer_dpc_text = dpc_rows > 500_000
 
-    # dpc_isr — per-module duration histogram.
+    previous_defer = bool(getattr(trace, "_defer_symbolization", False))
+    trace._defer_symbolization = defer_load_symbols
     try:
-        _persist_df("dpc_isr", "dpc_isr", aggregate_dpc_isr(trace))
-    except Exception:
-        pass
+        # cpu_sampling — the floor everything else needs. During load this
+        # keeps module/IP attribution but defers PDB-backed function names to
+        # explicit query tools so remote symbol servers cannot block readiness.
+        try:
+            _persist_df("cpu_sampling", "cpu_sampling", aggregate_cpu_sampling(trace))
+        except Exception:
+            pass
 
-    # dpc_isr_raw — xperf-format text with per-CPU pair lines.
-    try:
-        _persist_text("dpc_isr_raw", "dpcisr.txt", build_dpc_isr_raw_text(trace))
-    except Exception:
-        pass
+        # cpu_timeline — per-CPU utilization buckets.
+        try:
+            _persist_df("cpu_timeline", "cpu_timeline", aggregate_cpu_timeline(trace))
+        except Exception:
+            pass
 
-    # stacks — butterfly inclusive/exclusive table. Symbolization-heavy,
-    # so this can take a while on big traces. Skipped silently if no
-    # symbolizer is available.
-    try:
-        _persist_df("stacks", "stacks", aggregate_stack_butterfly(trace))
-    except Exception:
-        pass
+        # DPC histogram/raw text are kept for small traces and deferred for
+        # very large traces; structured DPC rows feed the tools on demand.
+        if not defer_dpc_text:
+            try:
+                _persist_df("dpc_isr", "dpc_isr", aggregate_dpc_isr(trace))
+            except Exception:
+                pass
+            try:
+                _persist_text("dpc_isr_raw", "dpcisr.txt", build_dpc_isr_raw_text(trace))
+            except Exception:
+                pass
 
-    # stacks_callers — caller edges (v1 — see module docstring).
-    try:
-        _persist_df("stacks_callers", "stacks_callers", aggregate_stack_callers(trace))
-    except Exception:
-        pass
+        # stacks — butterfly inclusive/exclusive table. Symbolization-heavy,
+        # so this can take a while on big traces. Skipped silently if no
+        # symbolizer is available.
+        try:
+            _persist_df("stacks", "stacks", aggregate_stack_butterfly(trace))
+        except Exception:
+            pass
+
+        # stacks_callers — caller edges (v1 — see module docstring).
+        try:
+            _persist_df("stacks_callers", "stacks_callers", aggregate_stack_callers(trace))
+        except Exception:
+            pass
+    finally:
+        trace._defer_symbolization = previous_defer
 
     # Raw-text aggregates.
     try:
@@ -1866,6 +1892,30 @@ def _synthesize_native_cpu_sampling(trace: TraceData) -> None:
     dumper_df = trace.wait_for_dumper()
     if dumper_df is None or dumper_df.empty:
         return
+
+    try:
+        from etw_analyzer.native.aggregators.profile_detail import (
+            aggregate_cpu_sampling,
+        )
+
+        previous_defer = bool(getattr(trace, "_defer_symbolization", False))
+        trace._defer_symbolization = True
+        try:
+            agg = aggregate_cpu_sampling(trace)
+        finally:
+            trace._defer_symbolization = previous_defer
+        if agg is not None and not agg.empty:
+            with trace.lock:
+                trace.raw_csv["cpu_sampling"] = agg
+                trace.event_counts["cpu_sampling"] = len(agg)
+            try:
+                trace.export_dir.mkdir(parents=True, exist_ok=True)
+                agg.to_parquet(trace.export_dir / "cpu_sampling.parquet", index=False)
+            except Exception:
+                pass
+            return
+    except Exception:
+        pass
 
     # Match the xperf schema. Process Name, PID are already there;
     # Module / Function are empty strings on the native path; Weight

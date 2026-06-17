@@ -36,6 +36,7 @@ left untouched.
 from __future__ import annotations
 
 import re
+import ntpath
 from collections import defaultdict
 from typing import TYPE_CHECKING, Optional
 
@@ -261,26 +262,43 @@ def _gather_dpc_events(trace: "TraceData") -> pd.DataFrame:
 def _modules_for_routines(trace: "TraceData", routine_col: pd.Series) -> pd.Series:
     symbolizer = getattr(trace, "symbolizer", None)
     unique_routines = routine_col.dropna().unique().tolist()
+    if symbolizer is None or not unique_routines:
+        return pd.Series(["unknown"] * len(routine_col), index=routine_col.index)
+
     label_map: dict[int, str] = {}
-    if symbolizer is not None and unique_routines:
+    if bool(getattr(trace, "_defer_symbolization", False)):
+        finder = getattr(symbolizer, "_find_module_for_address", None)
+        for routine in unique_routines:
+            try:
+                module = finder(int(routine)) if finder is not None else None
+                if module is not None:
+                    file_name = str(module.get("FileName") or "").lstrip("\x00 \t")
+                    label_map[int(routine)] = ntpath.basename(file_name) or "unknown"
+            except Exception:
+                continue
+    else:
         try:
             label_map = symbolizer.bulk_resolve([int(r) for r in unique_routines])
         except Exception:
             label_map = {}
 
-    def _label_for(value: object) -> str:
-        if value is None:
-            return ""
+    module_map: dict[object, str] = {}
+    for routine in unique_routines:
         try:
-            return label_map.get(int(value), "")
+            label = label_map.get(int(routine), "")
         except (TypeError, ValueError):
-            return ""
+            label = ""
+        module_map[routine] = _module_from_label(label)
 
-    return routine_col.map(_label_for).map(_module_from_label).fillna("unknown")
+    return routine_col.map(module_map).fillna("unknown")
 
 
 def _build_native_dpc_work_frame(trace: "TraceData") -> pd.DataFrame | None:
     """Return per-event native DPC rows with Module, CPU, and DurUs columns."""
+    cached = getattr(trace, "_native_dpc_work_frame", None)
+    if cached is not None:
+        return cached
+
     dpc_df = _gather_dpc_events(trace)
     if dpc_df.empty:
         return None
@@ -294,11 +312,16 @@ def _build_native_dpc_work_frame(trace: "TraceData") -> pd.DataFrame | None:
     routine_col = _to_uint64_series(dpc_df["Routine"])
     modules = _modules_for_routines(trace, routine_col)
 
-    return pd.DataFrame({
+    work = pd.DataFrame({
         "Module": modules.values,
         "CPU": cpus.values,
         "DurUs": durations_us.values,
     })
+    try:
+        trace._native_dpc_work_frame = work
+    except Exception:
+        pass
+    return work
 
 
 def _duration_column(df: pd.DataFrame) -> str | None:
@@ -459,22 +482,22 @@ def build_dpc_isr_raw_text(trace: "TraceData") -> Optional[str]:
     duration_us = int((trace.duration_seconds or 1.0) * 1_000_000) or 1
 
     lines: list[str] = []
+    module_totals = work["Module"].value_counts().to_dict()
+    module_bucket_counts: dict[tuple[str, int, int], int] = defaultdict(int)
+    for module, dur in zip(work["Module"].tolist(), work["DurUs"].tolist()):
+        low, high = _bucket_for(int(dur))
+        module_bucket_counts[(module, low, high)] += 1
 
     # Module-by-module: histogram block first, then per-CPU pair line.
     for module, mod_group in grouped.groupby("Module"):
-        mod_rows = work[work["Module"] == module]
-        total = len(mod_rows)
+        total = int(module_totals.get(module, 0))
         if total == 0:
             continue
 
         lines.append(f"Total = {total} for module {module.upper()}")
 
-        bucket_counts: dict[tuple[int, int], int] = defaultdict(int)
-        for dur in mod_rows["DurUs"]:
-            low, high = _bucket_for(int(dur))
-            bucket_counts[(low, high)] += 1
         for (low, high) in _BUCKETS:
-            count = bucket_counts.get((low, high), 0)
+            count = module_bucket_counts.get((module, low, high), 0)
             pct = (count / total * 100.0) if total else 0.0
             lines.append(
                 f"Elapsed Time, >  {low} usecs AND <=  {high} usecs, {count}, or {pct:.2f}%"

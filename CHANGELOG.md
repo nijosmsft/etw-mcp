@@ -26,6 +26,10 @@ All notable changes to etw-mcp are documented here. Format follows [Keep a Chang
 
 ### Fixed
 
+- Symbol resolution is now lazy/deferred per module: trace load no longer
+  blocks downloading every module's PDB from remote symbol servers (a
+  many-module server trace previously hung at the "aggregating" phase).
+  Kernel symbols still resolve by exact GUID on first query.
 - `load_trace` cache readiness now depends on an atomic finalized manifest:
   Python writes `wpr-mcp-cache-manifest.json` last via temp-file +
   `os.replace`, incomplete or partial caches are never rehydrated, and the
