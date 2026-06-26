@@ -4,6 +4,39 @@ All notable changes to etw-mcp are documented here. Format follows [Keep a Chang
 
 ## [Unreleased]
 
+## [0.8.7] - 2026-06-26
+
+### Fixed
+
+- **CSwitch stacks all-null on dotnet sidecar (#5):** CSwitch registers `NewTid`
+  but its trailing StackWalk event carries a different TID; added a QPC
+  timestamp-only fallback pairing so 168,244/168,244 CSwitch rows now carry a
+  Stack (0 → 100% paired).
+- **PendingStackBuffer drops ~24% of stacks (#6):** Raised internal FIFO
+  capacity from 1024 → 65,536 entries; added an O(1) `_byQpc` index and
+  `TsFallbackPairings` telemetry mirroring the native `extract.py` QPC path.
+  Eviction rate fell from 24% → 7.6% on the mmsg-stacks.etl oracle.
+- **dotnet sidecar extracts 0 ReadyThread events (#7):** `_wantReady` was never
+  set because `ReadyThread` was absent from `_DUMPER_EVENT_CLASSES`. It is now
+  activated whenever CSwitch is requested (same kernel-scheduler group) →
+  83,455 ReadyThread rows (exact xperf-oracle parity).
+- **CSwitch parquet missing OldProcessName/NewProcessName (#12):** Columns are
+  now synthesized Python-side from the PID→name map and explicitly created (not
+  just filled) for the dotnet schema. Fixes a latent `get_lock_contention`
+  per-process grouping crash on dotnet traces.
+- **Dotnet stacks collapse to 1 "unknown" row (#11):** Build an image index
+  from raw `Image/*` frames in the dotnet producer and attribute modules without
+  requiring a full symbolizer (`require_symbolizer=False`). Refined
+  `_stacks_are_unresolved` to a content check and surface a `resolve_symbols`
+  hint in tool output. Stack butterfly now returns 94 real modules (was 1).
+
+### Added
+
+- **Test #17 — parameterized CSwitch schema parity:** Native vs dotnet CSwitch
+  column fixture covering process-name synthesis, module-only multi-row stacks,
+  ReadyThread activation, and a slow-marked real-ETL integration test.
+  Full suite: 1097 passed / 16 skipped.
+
 ## [0.8.6] - 2026-06-26
 
 ### Fixed
