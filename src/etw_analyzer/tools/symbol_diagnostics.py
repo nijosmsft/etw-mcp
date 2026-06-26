@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import ctypes
 import os
+import re
 import shutil
 import struct
 from dataclasses import dataclass
@@ -219,27 +220,37 @@ def classify_pdb_container(pdb_path: Path) -> str:
 
 
 def read_pdb_signature(pdb_path: Path) -> Optional[tuple[str, int]]:
-    """Read the PDB 7.0 stream-0 signature: (GUID hex string, age).
+    """Read the PDB 7.0 info-stream signature: (GUID hex string, age).
 
     Returns ``None`` if the file isn't a valid PDB or the layout
-    differs from the expected MSF/Stream-0 form. This is a lightweight
+    differs from the expected MSF/stream form. This is a lightweight
     parser - it walks the MSF page directory just far enough to locate
-    stream 0, which is where the GUID+Age live.
+    the PDB Info Stream, which is where the GUID+Age live.
 
-    PDB layout (per Microsoft's microsoft-pdb repo):
+    PDB layout (per Microsoft's microsoft-pdb repo / the LLVM MSF docs):
     - Bytes 0..32  : "Microsoft C/C++ MSF 7.00\\r\\n\\x1a\\x44\\x53\\x00\\x00\\x00"
     - DWORD        : page size (usually 4096)
     - DWORD        : free page map page
     - DWORD        : pages in file
     - DWORD        : directory size in bytes
     - DWORD        : reserved
-    - DWORDs       : array of page indices for the directory pages
-    Stream 0 (PDB info stream) starts with:
+    - DWORD        : block index of the stream-directory page array
+
+    The stream directory holds, in order:
+    - DWORD        : number of streams
+    - DWORD[N]     : byte size of each stream
+    - DWORD[...]   : the block indices for each stream, concatenated
+
+    The GUID+Age live in the **PDB Info Stream**, which is **stream 1**
+    (stream 0 is the previous/old MSF directory and contains unrelated
+    bytes -- reading it yields a malformed GUID, see #3 secondary). The
+    info stream begins with:
     - DWORD        : version (20000404 etc)
     - DWORD        : signature (timestamp)
     - DWORD        : age
     - 16 bytes     : GUID
     """
+    _PDB_INFO_STREAM = 1
     try:
         with pdb_path.open("rb") as f:
             head = f.read(56)
@@ -247,9 +258,10 @@ def read_pdb_signature(pdb_path: Path) -> Optional[tuple[str, int]]:
                 return None
             page_size = struct.unpack_from("<I", head, 32)[0]
             dir_size = struct.unpack_from("<I", head, 44)[0]
+            if page_size == 0 or dir_size == 0:
+                return None
             # The first directory-pages-pointer page index lives right
-            # after the reserved DWORD (offset 52). We need only the
-            # first DWORD entry to find stream 0's directory.
+            # after the reserved DWORD (offset 52).
             dir_root_page_idx = struct.unpack_from("<I", head, 52)[0]
 
             # Read the directory: dir_size bytes spread across pages
@@ -271,26 +283,38 @@ def read_pdb_signature(pdb_path: Path) -> Optional[tuple[str, int]]:
             # Directory layout: NumStreams, then NumStreams x StreamSize,
             # then NumStreams x (array of page indices for that stream).
             num_streams = struct.unpack_from("<I", dir_buf, 0)[0]
-            if num_streams < 1:
+            if num_streams <= _PDB_INFO_STREAM:
                 return None
             stream_sizes = struct.unpack_from(
                 f"<{num_streams}I", dir_buf, 4
             )
-            stream0_size = stream_sizes[0]
-            if stream0_size == 0xFFFFFFFF or stream0_size == 0:
-                return None
-            # Pages for each stream start after the sizes.
+
+            def _block_count(size: int) -> int:
+                # 0xFFFFFFFF marks a nil (deleted) stream -> zero blocks.
+                if size == 0xFFFFFFFF or size == 0:
+                    return 0
+                return (size + page_size - 1) // page_size
+
+            # The block-index arrays for streams 0..N-1 are concatenated
+            # after the size table. Walk past the earlier streams' blocks
+            # to reach the PDB Info Stream's block array.
             page_idx_off = 4 + num_streams * 4
-            stream0_pages_count = (stream0_size + page_size - 1) // page_size
-            stream0_page_indices = struct.unpack_from(
-                f"<{stream0_pages_count}I", dir_buf, page_idx_off
+            for s in range(_PDB_INFO_STREAM):
+                page_idx_off += _block_count(stream_sizes[s]) * 4
+
+            info_size = stream_sizes[_PDB_INFO_STREAM]
+            if info_size == 0xFFFFFFFF or info_size == 0:
+                return None
+            info_pages_count = _block_count(info_size)
+            info_page_indices = struct.unpack_from(
+                f"<{info_pages_count}I", dir_buf, page_idx_off
             )
 
             buf = bytearray()
-            for pidx in stream0_page_indices:
+            for pidx in info_page_indices:
                 f.seek(pidx * page_size)
                 buf.extend(f.read(page_size))
-            buf = bytes(buf[:stream0_size])
+            buf = bytes(buf[:info_size])
 
             if len(buf) < 28:
                 return None
@@ -436,6 +460,33 @@ def _iter_candidates(
                             )
             except OSError:
                 continue
+
+
+_SYMSTORE_FOLDER_RE = re.compile(r"^[0-9A-Fa-f]{33,}$")
+
+
+def _symstore_folder_identity(cand: Path) -> tuple[str, int] | None:
+    """Derive (GUID32-uppercase, age) from a symstore GUID+Age folder name.
+
+    A symstore PDB lives at ``<dir>/<pdb_name>/<GUID32><hexAge>/<pdb_name>``.
+    The parent folder name encodes the PDB identity (GUID + uppercase hex
+    age) and is readable even when the PDB itself is MSFZ-compressed (which
+    :func:`read_pdb_signature` cannot decode). Returns ``None`` when the
+    parent folder is not a symstore GUID+Age folder.
+    """
+    try:
+        name = cand.parent.name
+    except (OSError, ValueError):
+        return None
+    if not _SYMSTORE_FOLDER_RE.match(name):
+        return None
+    guid32 = name[:32].upper()
+    age_hex = name[32:]
+    try:
+        age = int(age_hex, 16)
+    except ValueError:
+        return None
+    return (guid32, age)
 
 
 def candidate_pdb_paths(
@@ -728,12 +779,14 @@ def diagnose_symbol_load(
     for cand, redirect_desc, searched_pdb_name in all_candidate_entries:
         container = classify_pdb_container(cand)
         sig = read_pdb_signature(cand) if container == "msf7" else None
+        folder_identity = _symstore_folder_identity(cand) if sig is None else None
         candidate_infos.append({
             "path": cand,
             "redirect": redirect_desc,
             "searched_pdb_name": searched_pdb_name,
             "container": container,
             "signature": sig,
+            "folder_identity": folder_identity,
         })
     has_msfz_candidate = any(info["container"] == "msfz" for info in candidate_infos)
 
@@ -751,7 +804,33 @@ def diagnose_symbol_load(
             container = info["container"]
             sig = info["signature"]
             if sig is None:
-                if container == "msfz":
+                folder_identity = info["folder_identity"]
+                fid_guid = folder_identity[0] if folder_identity else None
+                fid_age = folder_identity[1] if folder_identity else None
+                if (
+                    folder_identity is not None
+                    and search_guid_norm
+                    and fid_guid == search_guid_norm
+                    and fid_age == search_age
+                ):
+                    match_label = (
+                        "YES (trace, symstore folder)"
+                        if trace_guid_norm
+                        else "YES (disk, symstore folder)"
+                    )
+                    guid_label = f"{fid_guid} (from symstore folder)"
+                elif (
+                    folder_identity is not None
+                    and disk_guid_norm
+                    and fid_guid == disk_guid_norm
+                    and fid_age == (rsds.age if rsds else None)
+                ):
+                    match_label = "YES (disk only, symstore folder)"
+                    guid_label = f"{fid_guid} (from symstore folder)"
+                elif folder_identity is not None:
+                    match_label = "NO (symstore folder GUID mismatch)"
+                    guid_label = f"{fid_guid} (from symstore folder)"
+                elif container == "msfz":
                     match_label = "NO (MSFZ-compressed)"
                     guid_label = "MSFZ-compressed PDB (GUID requires MSFZ-capable dbghelp)"
                 else:
@@ -768,10 +847,16 @@ def diagnose_symbol_load(
                     match_label = "NO"
                 guid_label = sig[0]
 
+            if sig is not None:
+                age_label = str(sig[1])
+            elif info["folder_identity"] is not None:
+                age_label = str(info["folder_identity"][1])
+            else:
+                age_label = "?"
             row: dict = {
                 "Path": str(cand),
                 "GUID": guid_label,
-                "Age": "?" if sig is None else str(sig[1]),
+                "Age": age_label,
                 "Match": match_label,
             }
             if len(pdb_names_to_search) > 1:
@@ -838,15 +923,29 @@ def diagnose_symbol_load(
     # Next steps (trace-GUID-aware).
     # -----------------------------------------------------------------------
     lines.append("**Next steps:**")
-    trace_pdb_found = search_guid_norm and any(
-        info["signature"] is not None
-        and _guid_to_nodashes(info["signature"][0]) == search_guid_norm
-        and info["signature"][1] == search_age
-        for info in candidate_infos
+
+    def _info_matches_trace(info: dict) -> bool:
+        sig = info["signature"]
+        if sig is not None:
+            return (
+                _guid_to_nodashes(sig[0]) == search_guid_norm
+                and sig[1] == search_age
+            )
+        fid = info.get("folder_identity")
+        return bool(fid and fid[0] == search_guid_norm and fid[1] == search_age)
+
+    def _info_matches_disk(info: dict) -> bool:
+        sig = info["signature"]
+        if sig is not None:
+            return sig == (rsds.guid_string, rsds.age)
+        fid = info.get("folder_identity")
+        return bool(fid and fid[0] == rsds.guid_string and fid[1] == rsds.age)
+
+    trace_pdb_found = bool(search_guid_norm) and any(
+        _info_matches_trace(info) for info in candidate_infos
     )
     disk_pdb_found = rsds is not None and any(
-        info["signature"] == (rsds.guid_string, rsds.age)
-        for info in candidate_infos
+        _info_matches_disk(info) for info in candidate_infos
     )
 
     cross_machine = bool(trace_guid_norm and disk_guid_norm and trace_guid_norm != disk_guid_norm)

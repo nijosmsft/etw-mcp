@@ -98,6 +98,92 @@ def _find_trace_pdb_identity(trace, module_name: str) -> dict | None:
     return None
 
 
+def _trace_pdb_disk_verdict(trace, module_name: str, sym_path: str) -> str:
+    """Cross-check a module's trace RSDS identity against the PDBs actually
+    present on disk, using the SAME strict GUID+Age rule that
+    ``diagnose_symbol_load`` applies. This keeps ``check_symbols`` and
+    ``diagnose_symbol_load`` from ever disagreeing for the same module (#3):
+    a cached ``SymbolSource='pdb'`` is only trustworthy if an exact-GUID+Age
+    PDB really exists on disk.
+
+    Matching is done against the **symstore folder name**
+    (``<GUID><hex-age>``), which is authoritative and readable even for
+    MSFZ-compressed PDBs whose bytes a pure-Python parser cannot decode.
+    This is what lets a genuine MSFZ kernel match (e.g. ``ntoskrnl.exe``)
+    stay trusted while a truly absent build (``tcpip.sys``) is flagged.
+
+    Returns one of:
+
+    - ``"match"``    -- an exact GUID+Age PDB exists on disk (trustworthy).
+    - ``"mismatch"`` -- the trace identity is known and at least one candidate
+      PDB exists for this name, but NONE match GUID+Age (names came from a
+      different build, or no matching build is reachable).
+    - ``"unknown"``  -- cannot decide (no trace identity, no symbol path, or
+      no candidate PDBs of this name found at all).
+    """
+    if not sym_path:
+        return "unknown"
+    identity = _find_trace_pdb_identity(trace, module_name)
+    if not identity or not identity.get("pdb_guid"):
+        return "unknown"
+
+    from etw_analyzer.tools.symbol_diagnostics import (
+        _guid_to_nodashes,
+        classify_pdb_container,
+        parse_symbol_path,
+        read_pdb_signature,
+    )
+
+    trace_guid_norm = _guid_to_nodashes(identity.get("pdb_guid"))
+    if not trace_guid_norm:
+        return "unknown"
+    trace_age = identity.get("pdb_age")
+    pdb_name = identity.get("pdb_name") or f"{Path(module_name).stem}.pdb"
+
+    # The symstore directory key the trace identity would live under.
+    want_keys = set()
+    if trace_age is not None:
+        want_keys.add(f"{trace_guid_norm}{int(trace_age):X}".upper())
+
+    saw_candidate = False
+    try:
+        for _kind, dir_path in parse_symbol_path(sym_path):
+            if not dir_path.exists():
+                continue
+
+            # Flat layout: <dir>/<pdb_name> -- decode the signature directly.
+            flat = dir_path / pdb_name
+            if flat.is_file() and classify_pdb_container(flat) == "msf7":
+                sig = read_pdb_signature(flat)
+                if sig is not None:
+                    saw_candidate = True
+                    age_ok = (trace_age is None) or (sig[1] == trace_age)
+                    if _guid_to_nodashes(sig[0]) == trace_guid_norm and age_ok:
+                        return "match"
+
+            # Symstore layout: <dir>/<pdb_name>/<GUID+hexAge>/<pdb_name>.
+            sym_root = dir_path / pdb_name
+            if sym_root.is_dir():
+                for sub in sym_root.iterdir():
+                    if not sub.is_dir():
+                        continue
+                    if not ((sub / pdb_name).is_file() or (sub / "file.ptr").is_file()):
+                        continue
+                    folder = sub.name.upper()
+                    if len(folder) < 33:
+                        continue
+                    saw_candidate = True
+                    if folder in want_keys:
+                        return "match"
+                    # Age-agnostic fallback: GUID matches but age differs is
+                    # still a (weaker) match only when the trace age is unknown.
+                    if trace_age is None and folder[:32] == trace_guid_norm:
+                        return "match"
+    except Exception:
+        return "unknown"
+    return "mismatch" if saw_candidate else "unknown"
+
+
 def _is_kernel_module(module_name: str) -> bool:
     """Return True when ``module_name`` looks like a kernel-mode binary.
 
@@ -3198,63 +3284,112 @@ def check_symbols(
             )
             lines.append("")
 
-        # Group by module, classify into pdb / export / unknown buckets.
-        # When SymbolSource is present we use it directly; otherwise we
-        # derive a 2-bucket (resolved / unknown) view that maps onto the
-        # legacy OK / PARTIAL / MISSING shape.
-        rows = []
+        # Group by module, classify into pdb / mismatched / export /
+        # pre-resolved / unknown buckets. When SymbolSource is present we
+        # use it directly; otherwise we derive a 2-bucket (resolved /
+        # unknown) view that maps onto the legacy OK / PARTIAL / MISSING
+        # shape.
+        #
+        # "mismatched" rows (#3): dbghelp returned a PDB symbol, but from a
+        # DIFFERENT-build PDB than the trace's RSDS identity -- the names
+        # are wrong and must NOT count as From-PDB / OK.
+        # "pre-resolved" rows (#15): the Function column is already
+        # populated (e.g. the dotnet sidecar resolved names during
+        # extraction) even though the in-process symbolizer reports
+        # SymbolSource="unknown". These are real, usable names -- reporting
+        # them as MISSING/0% PDB misleads users.
+        _UNNAMED = {"", "nan", "unknown", "<unknown>", "***unknown***"}
+
+        def _named_mask(grp):
+            fn = grp["Function"].astype(str).str.strip()
+            return ~fn.str.lower().isin(_UNNAMED)
+
+        mod_stats: list[dict] = []
         for module, group in cpu_df.groupby("Module", dropna=False):
             mod_str = str(module)
             total_funcs = len(group)
             mod_weight = int(group[weight_col].sum()) if weight_col else total_funcs
 
             if has_source:
-                source_col = group["SymbolSource"].astype(str)
-                if weight_col:
-                    # Weight-weighted classification — a module mostly hit
-                    # by export-table guesses should report that way even
-                    # if it has a handful of PDB rows.
-                    w = group[weight_col].astype(float)
-                    pdb_weight = float(w[source_col == "pdb"].sum())
-                    export_weight = float(w[source_col == "export"].sum())
-                    unknown_weight = float(w[source_col.isin(["unknown", ""])].sum())
-                    denom = pdb_weight + export_weight + unknown_weight
-                else:
-                    pdb_weight = float((source_col == "pdb").sum())
-                    export_weight = float((source_col == "export").sum())
-                    unknown_weight = float(source_col.isin(["unknown", ""]).sum())
-                    denom = total_funcs
+                source_col = group["SymbolSource"].astype(str).str.lower()
+                named = _named_mask(group)
+                is_pdb = source_col == "pdb"
+                is_mismatch = source_col == "mismatched"
+                is_export = source_col == "export"
+                is_unknown_src = source_col.isin(["unknown", ""])
+                is_pre = is_unknown_src & named
+                is_missing = is_unknown_src & ~named
 
+                if weight_col:
+                    w = group[weight_col].astype(float)
+                    pdb_weight = float(w[is_pdb].sum())
+                    mismatch_weight = float(w[is_mismatch].sum())
+                    export_weight = float(w[is_export].sum())
+                    pre_weight = float(w[is_pre].sum())
+                    unknown_weight = float(w[is_missing].sum())
+                else:
+                    pdb_weight = float(is_pdb.sum())
+                    mismatch_weight = float(is_mismatch.sum())
+                    export_weight = float(is_export.sum())
+                    pre_weight = float(is_pre.sum())
+                    unknown_weight = float(is_missing.sum())
+
+                # Cross-check cached PDB attribution against the strict
+                # GUID+Age rule diagnose_symbol_load uses. A cached
+                # SymbolSource='pdb' that has no exact-match PDB on disk is a
+                # wrong-build attribution (#3): reclassify its weight as
+                # mismatched so check_symbols agrees with diagnose_symbol_load.
+                if pdb_weight > 0:
+                    verdict = _trace_pdb_disk_verdict(trace, mod_str, sym_path)
+                    if verdict == "mismatch":
+                        mismatch_weight += pdb_weight
+                        pdb_weight = 0.0
+
+                denom = (
+                    pdb_weight + mismatch_weight + export_weight
+                    + pre_weight + unknown_weight
+                )
                 if denom <= 0:
-                    pct_pdb = pct_export = pct_unknown = 0.0
+                    pct_pdb = pct_mismatch = pct_export = pct_pre = pct_unknown = 0.0
                 else:
                     pct_pdb = pdb_weight / denom * 100.0
+                    pct_mismatch = mismatch_weight / denom * 100.0
                     pct_export = export_weight / denom * 100.0
+                    pct_pre = pre_weight / denom * 100.0
                     pct_unknown = unknown_weight / denom * 100.0
 
-                # Honest 3-category status. EXPORT_ONLY is the new bucket
-                # that tells users "yes, function names appear in the
-                # output, but they are nearest-export guesses - the PDB
-                # is missing or stale and the names should not be
-                # trusted." Threshold mirrors the spec: export >= 90 AND
-                # pdb < 10.
+                # Honest classification. Order matters: a wrong-build PDB
+                # (MISMATCHED_PDB) must never be reported as OK (#3); a
+                # sidecar-pre-resolved module must never be reported as
+                # MISSING (#15).
                 if pct_pdb >= 90:
                     status_icon = "OK"
+                elif pct_mismatch >= 50 and pct_pdb < 10:
+                    status_icon = "MISMATCHED_PDB"
                 elif pct_export >= 90 and pct_pdb < 10:
                     status_icon = "EXPORT_ONLY"
-                elif pct_pdb + pct_export > 0:
+                elif (
+                    pct_pre >= 90
+                    and pct_pdb < 10
+                    and pct_export < 10
+                    and pct_mismatch < 10
+                ):
+                    status_icon = "PRE_RESOLVED"
+                elif pdb_weight + mismatch_weight + export_weight + pre_weight > 0:
                     status_icon = "PARTIAL"
                 else:
                     status_icon = "MISSING"
 
-                rows.append({
+                mod_stats.append({
                     "Module": mod_str,
                     "Functions": total_funcs,
-                    "From PDB": int(round(pdb_weight)) if weight_col else int(pdb_weight),
-                    "From Export": int(round(export_weight)) if weight_col else int(export_weight),
-                    "Unknown": int(round(unknown_weight)) if weight_col else int(unknown_weight),
-                    "% PDB": f"{pct_pdb:.0f}%",
-                    "% Export": f"{pct_export:.0f}%",
+                    "pdb": pdb_weight,
+                    "mismatch": mismatch_weight,
+                    "export": export_weight,
+                    "pre": pre_weight,
+                    "unknown": unknown_weight,
+                    "pct_pdb": pct_pdb,
+                    "pct_export": pct_export,
                     "Weight": mod_weight,
                     "Status": status_icon,
                 })
@@ -3273,7 +3408,7 @@ def check_symbols(
                 else:
                     status_icon = "MISSING"
 
-                rows.append({
+                mod_stats.append({
                     "Module": mod_str,
                     "Functions": total_funcs,
                     "Resolved": resolved,
@@ -3281,6 +3416,55 @@ def check_symbols(
                     "% Resolved": f"{pct_resolved:.0f}%",
                     "Weight": mod_weight,
                     "Status": status_icon,
+                })
+
+        # Only surface the Mismatched / Pre-resolved columns when at least
+        # one module actually uses them, so the common-case table stays
+        # uncluttered.
+        any_mismatch = has_source and any(s.get("mismatch", 0) > 0 for s in mod_stats)
+        any_pre = has_source and any(s.get("pre", 0) > 0 for s in mod_stats)
+
+        rows = []
+        for s in mod_stats:
+            if has_source:
+                denom = (
+                    s["pdb"] + s["mismatch"] + s["export"] + s["pre"] + s["unknown"]
+                )
+                pct_pdb = (s["pdb"] / denom * 100.0) if denom > 0 else 0.0
+                pct_export = (s["export"] / denom * 100.0) if denom > 0 else 0.0
+                row = {
+                    "Module": s["Module"],
+                    "Functions": s["Functions"],
+                    "From PDB": int(round(s["pdb"])) if weight_col else int(s["pdb"]),
+                }
+                if any_mismatch:
+                    row["Mismatched"] = (
+                        int(round(s["mismatch"])) if weight_col else int(s["mismatch"])
+                    )
+                row["From Export"] = (
+                    int(round(s["export"])) if weight_col else int(s["export"])
+                )
+                if any_pre:
+                    row["Pre-resolved"] = (
+                        int(round(s["pre"])) if weight_col else int(s["pre"])
+                    )
+                row["Unknown"] = (
+                    int(round(s["unknown"])) if weight_col else int(s["unknown"])
+                )
+                row["% PDB"] = f"{pct_pdb:.0f}%"
+                row["% Export"] = f"{pct_export:.0f}%"
+                row["Weight"] = s["Weight"]
+                row["Status"] = s["Status"]
+                rows.append(row)
+            else:
+                rows.append({
+                    "Module": s["Module"],
+                    "Functions": s["Functions"],
+                    "Resolved": s["Resolved"],
+                    "Unknown": s["Unknown"],
+                    "% Resolved": s["% Resolved"],
+                    "Weight": s["Weight"],
+                    "Status": s["Status"],
                 })
 
         result_df = pd.DataFrame(rows)
@@ -3294,16 +3478,70 @@ def check_symbols(
         missing_weight = missing_df["Weight"].sum()
         missing_pct = (missing_weight / total_weight * 100) if total_weight > 0 else 0
 
+        mismatched_df = result_df[result_df["Status"] == "MISMATCHED_PDB"]
+        preresolved_df = result_df[result_df["Status"] == "PRE_RESOLVED"]
+
         lines.append("**Summary:**")
         lines.append(f"- Total modules: {len(result_df)}")
         lines.append(f"- Fully resolved (PDB): {len(result_df[result_df['Status'] == 'OK'])}")
         if has_source:
             export_only_df = result_df[result_df["Status"] == "EXPORT_ONLY"]
+            lines.append(
+                f"- Mismatched PDB (wrong build, names untrusted): {len(mismatched_df)}"
+            )
             lines.append(f"- Export-only (no PDB, names heuristic): {len(export_only_df)}")
+            lines.append(
+                f"- Pre-resolved by extractor (names from sidecar/cache): "
+                f"{len(preresolved_df)}"
+            )
         lines.append(f"- Partially resolved: {len(result_df[result_df['Status'] == 'PARTIAL'])}")
         lines.append(f"- No symbols: {len(missing_df)}")
         lines.append(f"- Unresolved weight: {missing_pct:.1f}% of total CPU samples")
         lines.append("")
+
+        if has_source and not mismatched_df.empty:
+            lines.append("**Mismatched-PDB modules (WRONG build — names untrustworthy):**")
+            lines.append("")
+            lines.append(
+                "dbghelp loaded a PDB for these modules, but its GUID/Age "
+                "does NOT match the identity captured in the trace. The "
+                "function names came from a DIFFERENT build and are almost "
+                "certainly wrong (the addresses map to different functions "
+                "in the real binary). This is a silent corruption risk for "
+                "`get_hot_stacks` / `butterfly_chain`. Treat these names as "
+                "untrusted and run "
+                "`diagnose_symbol_load(trace_id, '<module>')` to confirm — "
+                "it uses the same strict GUID+Age rule and will agree."
+            )
+            lines.append("")
+            for _, row in mismatched_df.head(10).iterrows():
+                lines.append(
+                    f"- `{row['Module']}` — {row['Weight']:,} weight "
+                    f"({row['Weight']/total_weight*100:.1f}%)"
+                )
+                identity = _find_trace_pdb_identity(trace, row["Module"])
+                if identity and identity.get("pdb_guid"):
+                    lines.append(
+                        f"  - Trace identity: GUID `{identity['pdb_guid']}` "
+                        f"age `{identity['pdb_age']}` (`{identity['pdb_name']}`). "
+                        f"No exact-GUID PDB was found; a non-matching build "
+                        f"was loaded non-strictly."
+                    )
+            lines.append("")
+
+        if has_source and not preresolved_df.empty:
+            lines.append("**Pre-resolved modules (names from the extractor, not in-process PDBs):**")
+            lines.append("")
+            lines.append(
+                "These modules already have function names in the cached "
+                "sample data (the dotnet/native extractor resolved them "
+                "during extraction), even though the in-process symbolizer "
+                "loaded no PDB for them at analysis time. The names in "
+                "`get_hot_functions` are real and usable — this is NOT a "
+                "missing-symbols condition."
+            )
+            lines.append("")
+
 
         if has_source:
             export_only_df = result_df[result_df["Status"] == "EXPORT_ONLY"]
@@ -3382,18 +3620,52 @@ def check_symbols(
     return "\n".join(lines)
 
 
-@mcp.tool()
+def _is_crash_exit_code(code: int) -> bool:
+    """True if ``code`` is an NTSTATUS error/crash exit (e.g. 0xC0000005
+    access violation). Windows surfaces a crashed child process via an
+    exit code whose top two bits are set (severity ``11`` == error), i.e.
+    ``(code & 0xC0000000) == 0xC0000000`` once normalized to unsigned
+    32-bit. Covers 0xC0000005 (AV), 0xC000001D (illegal instruction),
+    0xC00000FD (stack overflow), etc.
+    """
+    return (int(code) & 0xFFFFFFFF) & 0xC0000000 == 0xC0000000
+
+
+def _xperf_crash_exit_code(exc: Exception) -> int | None:
+    """If ``exc`` is a ``_run_xperf`` failure whose embedded exit code is a
+    crash (NTSTATUS error) code, return that code; otherwise ``None``.
+
+    ``_run_xperf`` raises ``RuntimeError("xperf -a ... failed (exit <code>):
+    ...")`` — we parse ``<code>`` and classify it. This lets the resolver
+    distinguish an xperf *crash* (0xC0000005, issue #8) from an ordinary
+    non-zero exit so it can fail gracefully with an actionable message.
+    """
+    import re
+
+    m = re.search(r"exit (-?\d+)", str(exc))
+    if not m:
+        return None
+    code = int(m.group(1))
+    return code if _is_crash_exit_code(code) else None
+
+
 @mcp.tool()
 def resolve_symbols(
     trace_id: str,
     modules: str | None = None,
     extra_symbol_paths: list[str] | None = None,
 ) -> str:
-    """Build symbol cache for a trace using xperf.
+    """Build symbol cache for a trace.
 
-    Runs xperf -a symcache -build which uses dbghelp.dll to download PDBs
-    from the symbol servers configured in _NT_SYMBOL_PATH. Also shows debug
-    IDs for any modules that fail to resolve.
+    Prefers the in-process native dbghelp symbolizer when one is already
+    attached to the trace (mode='native' / 'dotnet'): symbols are resolved
+    in-process without spawning the external ``xperf`` symcache builder,
+    which has been observed to crash with 0xC0000005 on some traces
+    (issue #8). When no native symbolizer is available, falls back to
+    ``xperf -a symcache -build`` (downloads PDBs via dbghelp.dll); if that
+    external process crashes, the failure is reported gracefully with a
+    recommendation to reload under ``mode='native'`` rather than
+    propagating the raw access-violation.
 
     Args:
         trace_id: ID returned by load_trace.
@@ -3433,6 +3705,38 @@ def _resolve_symbols_impl(
     lines.append(f"Trace ID: `{trace.trace_id}`")
     lines.append(f"Symbol path: `{sym_path[:120]}{'...' if len(sym_path) > 120 else ''}`")
     lines.append("")
+
+    # Prefer the in-process native dbghelp symbolizer when one is attached.
+    # The external `xperf -a symcache` builder has been observed to crash
+    # with 0xC0000005 on some traces (issue #8); the native symbolizer
+    # resolves PDBs in-process and never spawns xperf, so use it when we can.
+    symbolizer = getattr(trace, "symbolizer", None)
+    native_available = False
+    if symbolizer is not None:
+        try:
+            native_available = bool(symbolizer.is_available())
+        except Exception:
+            native_available = False
+
+    if native_available:
+        lines.append(
+            "**Using native in-process dbghelp symbolizer (xperf not required).**"
+        )
+        lines.append("")
+        lines.append(
+            "A native symbolizer is attached to this trace, so PDBs are "
+            "resolved in-process via `dbghelp.dll`. The external "
+            "`xperf -a symcache` builder is skipped to avoid its known crash "
+            "(0xC0000005) on some traces (issue #8). Symbol status below is "
+            "reported by `check_symbols`; addresses are resolved on demand "
+            "by the analysis tools."
+        )
+        lines.append("")
+        try:
+            lines.append(check_symbols(trace_id, extra_symbol_paths))
+        except Exception as e:
+            lines.append(f"check_symbols failed: {e}")
+        return "\n".join(lines)
 
     xperf = find_xperf()
     if xperf is None:
@@ -3489,6 +3793,27 @@ def _resolve_symbols_impl(
         else:
             lines.append("All symbols resolved successfully")
     except Exception as e:
+        crash_code = _xperf_crash_exit_code(e)
+        if crash_code is not None:
+            lines.append(
+                f"**xperf symcache builder CRASHED (exit 0x{crash_code & 0xFFFFFFFF:08X}).**"
+            )
+            lines.append("")
+            lines.append(
+                "The external `xperf -a symcache` process terminated with an "
+                "access-violation-class exit code (issue #8). This is a crash "
+                "in xperf/dbghelp, not a symbol-path problem. Symbol resolution "
+                "via xperf is unavailable for this trace."
+            )
+            lines.append("")
+            lines.append(
+                "**Recommended:** reload the trace under the native symbolizer, "
+                "which resolves PDBs in-process and does not spawn xperf:"
+            )
+            lines.append("- `load_trace(etl_path=..., mode='native')`")
+            lines.append("- then `check_symbols(trace_id)` / `resolve_symbols(trace_id)`")
+            lines.append("")
+            return "\n".join(lines)
         lines.append(f"symcache build error: {e}")
 
     lines.append("")
