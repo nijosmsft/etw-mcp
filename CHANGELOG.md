@@ -4,6 +4,30 @@ All notable changes to etw-mcp are documented here. Format follows [Keep a Chang
 
 ## [Unreleased]
 
+## [0.8.8] - 2026-06-26
+
+### Fixed
+
+- **Strict GUID+Age PDB matching — check_symbols & diagnose now always agree (#3 #8 #15 #19 #21):**
+  `check_symbols` previously trusted a cached `SymbolSource="pdb"` without
+  verifying the PDB on disk actually matched the trace's RSDS GUID+Age. All
+  tools now apply the same strict GUID+Age rule and match on the authoritative
+  symstore folder name (`<GUID32><hexAge>`), readable even for MSFZ-compressed
+  PDBs.
+  - **#3:** New `MISMATCHED_PDB` status for wrong-GUID PDBs (tcpip.sys, afd.sys).
+    `diagnose_symbol_load` is now folder-name aware so ntoskrnl.exe MSFZ folder
+    match stays trusted. The two tools never disagree for the same module/trace.
+  - **#3 (secondary):** `read_pdb_signature` now reads the PDB Info Stream
+    (stream 1), not stream 0, fixing the GUID misread on normal PDBs.
+  - **#8:** `resolve_symbols` prefers the native in-process symbolizer and
+    handles any `xperf` access-violation (`0xC0000005`) gracefully instead of
+    crashing.
+  - **#15 / #19:** `check_symbols` recognises the dotnet pre-symbolized path;
+    rows already resolved by the extractor get `PRE_RESOLVED` instead of a
+    false 0% / MISSING.
+  - **#21:** Stack rebuild surfaces a clear warning when the symbolizer raises
+    on `bulk_resolve`, instead of silently producing an all-unknown frame.
+
 ### Added
 
 - **First-class memory-mode selection on the capture-command tools (#9):**
@@ -16,6 +40,10 @@ All notable changes to etw-mcp are documented here. Format follows [Keep a Chang
   `mode` returns a friendly error. Completes #9 on top of the 0.8.4 `.wprp`
   Memory twins (the bundled profiles already shipped both variants; the tools
   could only emit the `-filemode` form).
+- **Tests — symbols regression suite (#3 #8 #15 #19 #21) + capture-mode suite (#9):**
+  16 new symbol regression tests (`test_symbols_regression.py`) + 7 new
+  capture-profile mode tests (`test_capture_profiles.py`).
+  Full suite: 1111 passed / 16 skipped.
 
 ## [0.8.7] - 2026-06-26
 
