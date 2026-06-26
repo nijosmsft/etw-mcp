@@ -142,8 +142,8 @@ def test_image_schema_version_in_parquet_metadata():
         f"image schema metadata version must equal EVENT_SCHEMA_VERSION={EVENT_SCHEMA_VERSION}, "
         f"got {stored_version}"
     )
-    assert EVENT_SCHEMA_VERSION == 3, (
-        f"Async-load Phase A bumped EVENT_SCHEMA_VERSION to 3; found {EVENT_SCHEMA_VERSION}"
+    assert EVENT_SCHEMA_VERSION == 4, (
+        f"Image/DCEnd kernel stop-rundown bumped EVENT_SCHEMA_VERSION to 4; found {EVENT_SCHEMA_VERSION}"
     )
 
 

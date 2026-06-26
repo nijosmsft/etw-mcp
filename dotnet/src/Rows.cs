@@ -189,13 +189,13 @@ internal sealed class ProcessRow
     public string? CommandLine;
 }
 
-/// <summary>Image load / dcstart row (for symbol resolution downstream).</summary>
+/// <summary>Image load / dcstart / dcend row (for symbol resolution downstream).</summary>
 internal sealed class ImageRow
 {
     public ulong EventSequence;
     public long TimeStampQpc;
     public int Cpu;
-    public string Kind = ""; // "Load" | "DCStart"
+    public string Kind = ""; // "Load" | "DCStart" | "DCEnd"
     public long Pid;
     public ulong ImageBase;
     public long ImageSize;

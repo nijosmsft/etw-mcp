@@ -104,7 +104,7 @@ internal sealed class ExtractRunner
         _wantProcess = Want("Process", "process", "Process/Start", "Process/End", "Process/DCStart",
                             "Process/DCEnd", "Process/Defunct",
                             "process_start", "process_end", "process_dcstart", "process_dcend", "process_defunct");
-        _wantImage = Want("Image/Load", "Image/DCStart", "image", "images", "image_load", "image_dcstart");
+        _wantImage = Want("Image/Load", "Image/DCStart", "Image/DCEnd", "image", "images", "image_load", "image_dcstart", "image_dcend");
         _wantDiskIo = Want("DiskIo", "diskio", "DiskIo/Read", "DiskIo/Write", "DiskIo/FlushBuffers",
                             "diskio_read", "diskio_write", "diskio_flushbuffers");
         _wantDpcIsr = Want("PerfInfo", "PerfInfo/DPC", "PerfInfo/ThreadedDPC", "PerfInfo/TimerDPC", "PerfInfo/ISR",
@@ -343,6 +343,12 @@ internal sealed class ExtractRunner
         {
             kernel.ImageLoad += (ImageLoadTraceData data) => Wrap(() => AddImage(data, "Load"));
             kernel.ImageDCStart += (ImageLoadTraceData data) => Wrap(() => AddImage(data, "DCStart"));
+            // Image/DCEnd carries the loaded-module rundown emitted when the
+            // kernel logger STOPS. For most captures the already-loaded kernel
+            // modules (ntoskrnl, tcpip, ndis, NIC drivers, ...) appear ONLY here,
+            // not in DCStart. Dropping it left every kernel sample address
+            // unmapped ("unknown" module). Mirror Process/Thread DCStop handling.
+            kernel.ImageDCStop += (ImageLoadTraceData data) => Wrap(() => AddImage(data, "DCEnd"));
 
             // Subscribe to the SymbolTraceEventParser to capture DbgID/RSDS records.
             // These events carry the PDB GUID, Age, and PdbFileName for every image.

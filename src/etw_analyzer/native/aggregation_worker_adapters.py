@@ -588,6 +588,7 @@ def adapt_dotnet_diskio_dataframe(df: pd.DataFrame | None) -> pd.DataFrame | Non
 PHASE_B_IMAGE_STEMS: dict[str, str] = {
     "image_load":    "Image/Load",
     "image_dcstart": "Image/DCStart",
+    "image_dcend":   "Image/DCEnd",
 }
 
 
@@ -614,10 +615,12 @@ def adapt_dotnet_image_dataframe(df: pd.DataFrame | None) -> pd.DataFrame | None
 def build_symbolizer_from_dotnet_images(trace) -> bool:
     """Build a dbghelp-backed Symbolizer from Phase B image parquets.
 
-    Reads ``trace.raw_csv['Image/Load']`` and ``trace.raw_csv['Image/DCStart']``
-    (whichever are present), deduplicates by ImageBase, and registers
-    every module with the symbolizer so subsequent
-    ``aggregate_stack_butterfly`` calls can resolve addresses.
+    Reads ``trace.raw_csv['Image/Load']``, ``trace.raw_csv['Image/DCStart']``,
+    and ``trace.raw_csv['Image/DCEnd']`` (whichever are present), deduplicates
+    by ImageBase, and registers every module with the symbolizer so subsequent
+    ``aggregate_stack_butterfly`` calls can resolve addresses. Image/DCEnd is
+    the kernel stop-rundown and is usually where the already-loaded kernel
+    modules live, so it must be included or kernel addresses stay unresolved.
 
     On a dotnet cache hit, the sidecar's combined image parquet is keyed
     by stem (``raw_csv["image"]``) rather than by canonical class name.
@@ -649,7 +652,7 @@ def build_symbolizer_from_dotnet_images(trace) -> bool:
         return False
 
     rows: list[dict] = []
-    for canonical in ("Image/Load", "Image/DCStart"):
+    for canonical in ("Image/Load", "Image/DCStart", "Image/DCEnd"):
         df = trace.raw_csv.get(canonical)
         if df is None or df.empty:
             continue

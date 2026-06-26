@@ -47,7 +47,10 @@ internal static class ManifestEmitter
             strategy,
             complete,
             finalized = complete,
-            event_schema_version = 3,
+            // event_schema_version MUST track schemas.py::EVENT_SCHEMA_VERSION.
+            // Bumped 3 -> 4 when Image/DCEnd (kernel stop-rundown) was added to
+            // the image set so kernel sample addresses resolve to real modules.
+            event_schema_version = 4,
             finalizer = complete ? "dotnet-sidecar" : (string?)null,
             etl = new
             {

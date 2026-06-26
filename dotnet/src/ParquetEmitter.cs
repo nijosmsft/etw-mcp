@@ -76,6 +76,7 @@ internal static class ParquetEmitter
             // Phase B per-opcode Image parquets — power the Python symbolizer build.
             total += await WriteImageByKindAsync(imageList, "Load",    Path.Combine(stagingDir, "image_load.parquet"));
             total += await WriteImageByKindAsync(imageList, "DCStart", Path.Combine(stagingDir, "image_dcstart.parquet"));
+            total += await WriteImageByKindAsync(imageList, "DCEnd",   Path.Combine(stagingDir, "image_dcend.parquet"));
         }
         if (ec.DiskIo.Count > 0)
         {

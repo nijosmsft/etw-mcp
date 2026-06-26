@@ -101,6 +101,7 @@ _SIDECAR_STEM_TO_ATTR: dict[str, tuple[str, str]] = {
     "diskio_flushbuffers":   ("diskio_flushbuffers_df",   "DiskIo/FlushBuffers"),
     "image_load":            ("image_load_df",            "Image/Load"),
     "image_dcstart":         ("image_dcstart_df",         "Image/DCStart"),
+    "image_dcend":           ("image_dcend_df",           "Image/DCEnd"),
     "eventtrace_header":     ("eventtrace_header_df",     "EventTrace/Header"),
 }
 

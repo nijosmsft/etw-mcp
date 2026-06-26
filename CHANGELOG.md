@@ -4,6 +4,20 @@ All notable changes to etw-mcp are documented here. Format follows [Keep a Chang
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-06-25
+
+### Fixed
+
+- Kernel sample addresses no longer collapse into the `unknown` module. Both
+  the native in-process extractor and the .NET sidecar now capture the
+  `Image/DCEnd` kernel stop-rundown, which on most captures is the only place
+  the already-loaded kernel modules (`ntoskrnl.exe`, `tcpip.sys`, `ndis.sys`,
+  NIC drivers, ...) are enumerated. Previously only `Image/Load` +
+  `Image/DCStart` were consumed, so traces that relied on stop-rundown showed
+  ~99% of CPU samples as `unknown` while `xperf` mode resolved them correctly.
+  `EVENT_SCHEMA_VERSION` is bumped 3 -> 4; existing `.etw-export-*` caches are
+  invalidated and re-extracted on next `load_trace`.
+
 ## [0.8.0] - 2026-06-17
 
 ### Added

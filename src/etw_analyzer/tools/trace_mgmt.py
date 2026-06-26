@@ -51,7 +51,7 @@ def _find_trace_pdb_identity(trace, module_name: str) -> dict | None:
     """
     module_lower = module_name.lower()
 
-    for key in ("image", "Image/Load", "Image/DCStart"):
+    for key in ("image", "Image/Load", "Image/DCStart", "Image/DCEnd"):
         img_df = trace.raw_csv.get(key)
         if img_df is None or img_df.empty:
             continue
@@ -1241,6 +1241,7 @@ _DUMPER_EVENT_CLASSES: dict[str, tuple[str, str]] = {
     "DiskIo/FlushBuffers":   ("diskio_flushbuffers_df",   "diskio_flushbuffers"),
     "Image/Load":            ("image_load_df",            "image_load"),
     "Image/DCStart":         ("image_dcstart_df",         "image_dcstart"),
+    "Image/DCEnd":           ("image_dcend_df",           "image_dcend"),
     "EventTrace/Header":     ("eventtrace_header_df",     "eventtrace_header"),
 }
 
@@ -1377,7 +1378,7 @@ def _start_background_dumper(trace: TraceData) -> None:
                 # until the aggregators digest them.
                 wanted_with_aux = set(wanted)
                 wanted_with_aux.update({
-                    "Image/Load", "Image/DCStart",
+                    "Image/Load", "Image/DCStart", "Image/DCEnd",
                     "ImageID/DbgID_RSDS",           # M5b: PDB identity for kernel symbol resolution
                     "PerfInfo/DPC", "PerfInfo/ThreadedDPC",
                     "PerfInfo/TimerDPC", "PerfInfo/ISR",
@@ -1520,12 +1521,14 @@ def _build_symbolizer_from_images(
     except Exception:
         return
 
-    # Combine Image/Load and Image/DCStart rows. DCStart events are
-    # emitted at trace start for already-loaded modules; Load events
-    # fire as new modules come online during capture. Together they
-    # cover every module a SampledProfile stack could reference.
+    # Combine Image/Load, Image/DCStart, and Image/DCEnd rows. Load events
+    # fire as new modules come online during capture; DCStart is the start
+    # rundown of already-loaded modules; DCEnd is the STOP rundown. The kernel
+    # logger typically emits the already-loaded kernel modules (ntoskrnl,
+    # tcpip, ndis, NIC drivers, ...) only in DCEnd, so it must be included or
+    # every kernel sample address resolves to the "unknown" module.
     rows: list[dict] = []
-    for class_name in ("Image/Load", "Image/DCStart"):
+    for class_name in ("Image/Load", "Image/DCStart", "Image/DCEnd"):
         df = results.get(class_name)
         if df is None or df.empty:
             continue
@@ -1780,7 +1783,7 @@ def _run_native_aggregators(trace: TraceData) -> None:
         except Exception:
             return 0
 
-    image_rows = _frame_len("Image/Load") + _frame_len("Image/DCStart") + _frame_len("image")
+    image_rows = _frame_len("Image/Load") + _frame_len("Image/DCStart") + _frame_len("Image/DCEnd") + _frame_len("image")
     sample_rows = _frame_len("SampledProfile") + _frame_len("sampled_profile")
     dpc_rows = (
         _frame_len("PerfInfo/DPC")
@@ -2034,6 +2037,7 @@ _PARQUET_EXCLUDED = frozenset({
     "diskio_flushbuffers",
     "image_load",
     "image_dcstart",
+    "image_dcend",
     "eventtrace_header",
 })
 
@@ -2802,7 +2806,7 @@ def _format_load_summary(trace: TraceData) -> str:
             lines.append(f"- {err}")
 
     if getattr(trace, "symbolizer", None) is None:
-        _image_keys = ("Image/Load", "Image/DCStart", "image")
+        _image_keys = ("Image/Load", "Image/DCStart", "Image/DCEnd", "image")
         _has_image_rows = any(
             trace.raw_csv.get(k) is not None and not trace.raw_csv[k].empty
             for k in _image_keys

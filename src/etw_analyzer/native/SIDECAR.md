@@ -173,9 +173,10 @@ Enforcement:
 
 ## Known limitations
 
-* **Symbol resolution stays Python-side** — the sidecar emits `Image/Load`
-  + `Image/DCStart` events but does not symbolicate. The symbolizer lives
-  in `etw_analyzer.native.symbolizer` and runs after the cache promotes.
+* **Symbol resolution stays Python-side** — the sidecar emits `Image/Load`,
+  `Image/DCStart`, and `Image/DCEnd` events but does not symbolicate. The
+  symbolizer lives in `etw_analyzer.native.symbolizer` and runs after the
+  cache promotes.
 
 ## Source layout
 

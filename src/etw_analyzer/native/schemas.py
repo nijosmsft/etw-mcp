@@ -8,7 +8,7 @@ from typing import Any, Iterable
 import pyarrow as pa
 
 
-EVENT_SCHEMA_VERSION = 3  # async-load Phase A: finalized-manifest cache gate
+EVENT_SCHEMA_VERSION = 4  # M-DCEnd: include Image/DCEnd kernel stop-rundown in image set
 
 
 @dataclass(frozen=True)

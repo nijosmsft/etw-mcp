@@ -58,13 +58,16 @@ load_trace(etl_path)               # mode defaults to "auto"
   → _start_background_dumper() launches the native pipeline in a thread:
        OpenTraceW + ProcessTrace decode every requested event class
        (SampledProfile, CSwitch, TCPIP, UDP, AFD, NDIS, HTTP.sys, MsQuic,
-        Image/Load, Image/DCStart, ImageID/DbgID_RSDS (GUID b3e675d7),
+        Image/Load, Image/DCStart, Image/DCEnd, ImageID/DbgID_RSDS (GUID b3e675d7),
         PerfInfo DPC/ISR, Process, DiskIo, SystemConfig)
        events flow through native_handlers + text_adapter → EVENT_HANDLERS
-  → Image/Load + Image/DCStart rows carry PdbGuid/PdbAge/PdbName/TimeDateStamp
+  → Image/Load + Image/DCStart + Image/DCEnd rows carry PdbGuid/PdbAge/PdbName/TimeDateStamp
        (populated from matched DbgID_RSDS records decoded in-process)
-  → Symbolizer is built from Image/Load + Image/DCStart rows, loading each PDB
-       via SymFindFileInPathW(SSRVOPT_GUIDPTR) with the RSDS identity
+  → Symbolizer is built from Image/Load + Image/DCStart + Image/DCEnd rows, loading each PDB
+       via SymFindFileInPathW(SSRVOPT_GUIDPTR) with the RSDS identity. Image/DCEnd is the
+       kernel STOP-rundown and is usually the only place the already-loaded kernel modules
+       (ntoskrnl, tcpip, ndis, NIC drivers, ...) appear; omitting it leaves kernel sample
+       addresses in the "unknown" module
   → _run_native_aggregators() turns the per-event DataFrames into the
     xperf-equivalent aggregates (cpu_sampling, cpu_timeline, dpc_isr,
     stacks, stacks_callers, sysconfig, process_info, diskio, tracestats)

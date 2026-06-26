@@ -1017,6 +1017,50 @@ class TestBuildSymbolizerFromDotnetImages:
         assert size == 0x80_000
         assert name.endswith("mod_0.sys")
 
+    def test_registers_modules_from_image_dcend(self, tmp_path: Path, monkeypatch):
+        # Regression (kernel stop-rundown): the already-loaded kernel modules
+        # (ntoskrnl, tcpip, ndis, NIC drivers, ...) are emitted in Image/DCEnd
+        # when the kernel logger STOPS, not in DCStart. Dropping DCEnd left
+        # 99.7% of kernel sample addresses resolving to the "unknown" module.
+        from etw_analyzer.trace_state import TraceData
+        from etw_analyzer.native import aggregation_worker_adapters as ad
+
+        import etw_analyzer.native as native_pkg
+        monkeypatch.setattr(native_pkg, "Symbolizer", _FakeSymbolizer, raising=False)
+
+        trace = TraceData(
+            trace_id="t", etl_path=tmp_path / "x.etl",
+            export_dir=tmp_path, raw_csv={},
+        )
+        trace.raw_csv["Image/DCEnd"] = _make_image_dcstart(rows=3)
+        ok = ad.build_symbolizer_from_dotnet_images(trace)
+        assert ok is True
+        assert trace.symbolizer is not None
+        assert len(trace.symbolizer.modules) == 3
+
+    def test_image_dcend_merges_with_load(self, tmp_path: Path, monkeypatch):
+        # Real-world shape: a few Image/Load rows during the capture plus the
+        # full kernel module list only in Image/DCEnd. All must register,
+        # deduplicated by ImageBase.
+        from etw_analyzer.trace_state import TraceData
+        from etw_analyzer.native import aggregation_worker_adapters as ad
+
+        import etw_analyzer.native as native_pkg
+        monkeypatch.setattr(native_pkg, "Symbolizer", _FakeSymbolizer, raising=False)
+
+        trace = TraceData(
+            trace_id="t", etl_path=tmp_path / "x.etl",
+            export_dir=tmp_path, raw_csv={},
+        )
+        trace.raw_csv["Image/Load"] = _make_image_dcstart(rows=1, base=0x00007FF000000000)
+        trace.raw_csv["Image/DCEnd"] = _make_image_dcstart(rows=3, base=0xFFFFF800_AABB0000)
+        ad.build_symbolizer_from_dotnet_images(trace)
+        assert len(trace.symbolizer.modules) == 4
+
+    def test_phase_b_image_stems_includes_dcend(self):
+        from etw_analyzer.native import aggregation_worker_adapters as ad
+        assert ad.PHASE_B_IMAGE_STEMS.get("image_dcend") == "Image/DCEnd"
+
     def test_deduplicates_by_imagebase(self, tmp_path: Path, monkeypatch):
         from etw_analyzer.trace_state import TraceData
         from etw_analyzer.native import aggregation_worker_adapters as ad
