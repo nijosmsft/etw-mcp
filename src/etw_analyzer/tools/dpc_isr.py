@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+
 from etw_analyzer.app import mcp
 from etw_analyzer.trace_state import TraceData, require_trace
 from etw_analyzer.formatting.markdown import format_table, format_pct
@@ -11,7 +13,57 @@ import pandas as pd
 from etw_analyzer.native.aggregators.dpcisr import (
     aggregate_dpc_isr,
     build_dpc_per_cpu_dataframe,
+    _gather_dpc_events,
 )
+
+logger = logging.getLogger(__name__)
+
+
+_NO_DPC_DATA_MESSAGE = (
+    "No DPC/ISR data available in this trace. It was likely collected with a "
+    "CPU-sampling-only profile (e.g. `wpr -start CPU`) that does not record "
+    "DPC/ISR events.\n\n"
+    "To capture DPC/ISR data, use a profile that includes the DPC/ISR kernel "
+    "flag:\n"
+    "  wpr -start GeneralProfile    (includes DPC/ISR + context switches)\n"
+    "  wpr -start CPU -start DPC    (CPU sampling + DPC events)\n\n"
+    "Or use a custom .wprp profile with the DPC/ISR kernel flag enabled."
+)
+
+
+def _symbol_resolution_message(dpc_rows: int, detail: str | None = None) -> str:
+    """Actionable message for the case where DPC events exist but the
+    per-module histogram could not be built (symbolizer missing/failed).
+
+    Surfaces the real remediation — call ``resolve_symbols`` — instead of the
+    misleading "re-collect with GeneralProfile" advice. Re-collection is not
+    required because the DPC/ISR events are already present.
+    """
+    reason = f" ({detail})" if detail else ""
+    return (
+        f"DPC/ISR data is present ({dpc_rows:,} event rows) but the per-module "
+        f"histogram could not be built{reason}. This usually means module "
+        f"symbol resolution has not run yet.\n\n"
+        f"Call resolve_symbols(trace_id) to load module symbols, then retry "
+        f"get_dpc_summary / get_network_dpcs. Re-collecting the trace is NOT "
+        f"required — the DPC/ISR events are already in the trace."
+    )
+
+
+def _count_dpc_event_rows(trace: TraceData) -> int:
+    """Return the number of raw DPC/ISR event rows present in the trace.
+
+    Used to distinguish "the trace genuinely has no DPC data" from "DPC data
+    is present but the histogram build failed" so the user gets the correct
+    remediation advice.
+    """
+    try:
+        events = _gather_dpc_events(trace)
+    except Exception:  # pragma: no cover — defensive
+        return 0
+    if events is None or events.empty:
+        return 0
+    return int(len(events))
 
 
 def _get_dpc_df(trace: TraceData) -> pd.DataFrame:
@@ -27,23 +79,41 @@ def _get_dpc_df(trace: TraceData) -> pd.DataFrame:
                 return df.copy()
 
     # Native/dotnet loads keep DPC event rows structured and defer the
-    # expensive per-module histogram until this explicit query.
+    # expensive per-module histogram until this explicit query. Whether or
+    # not the histogram builds, the raw DPC events tell us if data exists —
+    # capture that first so we never claim "No DPC/ISR data" when 11M+ rows
+    # are sitting in the cache (issue #13).
+    dpc_rows = _count_dpc_event_rows(trace)
+
     try:
         df = aggregate_dpc_isr(trace)
-    except Exception:
+    except Exception as exc:
+        # Never swallow silently: log the failure and surface an actionable
+        # message. When DPC events are present the build typically fails on
+        # symbol resolution, so point the user at resolve_symbols rather than
+        # telling them to re-collect the trace (issue #13 / BUG-3 / BUG-6).
+        logger.warning(
+            "DPC/ISR aggregation failed for trace %s: %s",
+            getattr(trace, "trace_id", "?"),
+            exc,
+            exc_info=True,
+        )
+        if dpc_rows:
+            raise ValueError(
+                _symbol_resolution_message(dpc_rows, f"{type(exc).__name__}: {exc}")
+            ) from exc
         df = None
+
     if df is not None and not df.empty:
         trace.raw_csv["dpc_isr"] = df
         return df.copy()
 
-    raise ValueError(
-        "No DPC/ISR data available. The trace was likely collected with "
-        "`wpr -start CPU` which only captures CPU sampling, not DPC/ISR events.\n\n"
-        "To capture DPC/ISR data, use a profile that includes DPC/ISR recording:\n"
-        "  wpr -start GeneralProfile    (includes DPC/ISR + context switches)\n"
-        "  wpr -start CPU -start DPC    (CPU sampling + DPC events)\n\n"
-        "Or use a custom .wprp profile with the DPC/ISR kernel flag enabled."
-    )
+    if dpc_rows:
+        # DPC events exist but no histogram was produced — surface the
+        # symbol-resolution remediation, not the false re-collect advice.
+        raise ValueError(_symbol_resolution_message(dpc_rows))
+
+    raise ValueError(_NO_DPC_DATA_MESSAGE)
 
 
 @mcp.tool()
