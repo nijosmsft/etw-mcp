@@ -882,6 +882,43 @@ def load_trace(
     return _format_extracting_response(job.snapshot(), etl_path=path, reused=False)
 
 
+def _hydrate_cached_image_frames(trace: TraceData) -> None:
+    """Load per-opcode image parquets from the cache dir into ``raw_csv``.
+
+    The glob cache loader excludes ``image_load`` / ``image_dcstart`` /
+    ``image_dcend`` (they are in :data:`_PARQUET_EXCLUDED`) and no combined
+    ``image.parquet`` is written, so a cache hit leaves ``raw_csv`` without any
+    image rows. Without them the symbolizer cannot be rebuilt and on-demand
+    function resolution fails. This best-effort helper rehydrates the canonical
+    ``Image/Load`` / ``Image/DCStart`` / ``Image/DCEnd`` keys (only when absent)
+    so ``build_symbolizer_from_dotnet_images`` can reconstruct the RSDS
+    identity map. ``Image/DCEnd`` is the kernel stop-rundown carrying the
+    already-loaded kernel modules.
+    """
+
+    export_dir = getattr(trace, "export_dir", None)
+    if export_dir is None:
+        return
+    stem_to_canonical = {
+        "image_load": "Image/Load",
+        "image_dcstart": "Image/DCStart",
+        "image_dcend": "Image/DCEnd",
+    }
+    for stem, canonical in stem_to_canonical.items():
+        existing = trace.raw_csv.get(canonical)
+        if existing is not None and not existing.empty:
+            continue
+        parquet_path = export_dir / f"{stem}.parquet"
+        if not parquet_path.exists():
+            continue
+        try:
+            df = pd.read_parquet(parquet_path)
+        except Exception:
+            continue
+        if df is not None and not df.empty:
+            trace.raw_csv[canonical] = df
+
+
 def _register_cached_trace(
     path: Path,
     export_dir: Path,
@@ -920,6 +957,13 @@ def _register_cached_trace(
     # back to "unknown+0x..." just as they would today.
     if resolved_mode in ("dotnet", "native") and getattr(trace, "symbolizer", None) is None:
         try:
+            # The glob cache loader excludes the per-opcode image parquets
+            # (they are in _PARQUET_EXCLUDED), and the sidecar no longer emits
+            # a combined image.parquet, so raw_csv has no image rows on a cache
+            # hit. Hydrate them from disk first so the symbolizer rebuild has
+            # the RSDS PDB identities (incl. the Image/DCEnd kernel rundown)
+            # needed to resolve kernel-mode function names on demand.
+            _hydrate_cached_image_frames(trace)
             from etw_analyzer.native.aggregation_worker_adapters import (
                 build_symbolizer_from_dotnet_images,
             )

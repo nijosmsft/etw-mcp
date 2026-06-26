@@ -4,6 +4,25 @@ All notable changes to etw-mcp are documented here. Format follows [Keep a Chang
 
 ## [Unreleased]
 
+## [0.8.2] - 2026-06-26
+
+### Fixed
+
+- Function-level symbol names now resolve in `get_hot_functions` and
+  `get_cpu_samples` (group_by=function) after a normal load. A large trace
+  defers per-PDB function symbolization at load time (keeping only module
+  attribution), and two plumbing gaps left the `Function` column empty forever:
+  (1) on a cache hit no symbolizer was rebuilt, because the per-opcode image
+  parquets are excluded from `raw_csv`; (2) the query tools read the aggregated
+  `cpu_sampling` frame, whose groupby had dropped `InstructionPointer`, so the
+  on-demand resolver had nothing to resolve. The cache loader now rehydrates the
+  `image_load`/`image_dcstart`/`image_dcend` parquets and rebuilds the
+  symbolizer, and the query tools resolve function names on demand from the raw
+  `sampled_profile` samples (memoized per trace). Symbol resolution itself was
+  never broken (it produces real PDB names, e.g. `tcpip.sys!UdpSend`); only the
+  pipeline that surfaced them was. xperf mode and small (non-deferred) traces
+  are unchanged.
+
 ## [0.8.1] - 2026-06-25
 
 ### Fixed

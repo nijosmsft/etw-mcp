@@ -127,6 +127,21 @@ These four columns are what `build_symbolizer_from_dotnet_images` and the native
 1. **RSDS identity path (M3):** when `pdb_guid` and `pdb_name` are provided, calls `SymFindFileInPathW(SSRVOPT_GUIDPTR)` with the exact GUID from the trace. dbghelp uses the symbol server to download and verify the PDB that matches the recorded trace binary, not the analyst box's local copy.
 2. **Fallback path:** when RSDS identity is absent (pre-v2 cache or xperf mode), falls back to `SymLoadModuleEx` with the local image path and accepts whatever PDB dbghelp finds.
 
+**Deferred function symbolization (load vs query).** Large traces defer per-PDB function
+naming at load time: `defer_load_symbols = image_rows > 250 or sample_rows > 50_000` in
+`trace_mgmt._run_native_aggregators`. When deferred, `aggregate_cpu_sampling` does
+module-only attribution from the registered image ranges (no remote PDB downloads can block
+readiness) and the cached `cpu_sampling` parquet has a blank `Function` column. Function
+names are resolved **on demand** by the query tools: `cpu_sampling.get_hot_functions` /
+`get_cpu_samples` (group_by=function) load the raw `sampled_profile` samples (which retain
+`InstructionPointer`), resolve them through `trace.symbolizer`, and memoize the resolved
+frame on `trace._resolved_samples_df`. For this to work on a **cache hit**, the cache loader
+(`_register_cached_trace`) rehydrates the excluded `image_load`/`image_dcstart`/`image_dcend`
+parquets via `_hydrate_cached_image_frames` and rebuilds the symbolizer with
+`build_symbolizer_from_dotnet_images`. The aggregated `cpu_sampling` groupby drops
+`InstructionPointer`, so the raw `sampled_profile.parquet` (on disk, excluded from `raw_csv`)
+is the source of truth for on-demand naming.
+
 **dbghelp preference order.** `dbghelp.py::_load_dbghelp()` probes these locations in order and uses the first that exists:
 1. `C:\Debuggers\dbghelp.dll` + `C:\Debuggers\symsrv.dll` (WinDbg, v10.0.29507+, MSFZ-capable)
 2. `C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\dbghelp.dll` (WDK, usually older)

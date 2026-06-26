@@ -133,6 +133,77 @@ def _resolve_deferred_instruction_pointers(
     return out
 
 
+def _function_col_all_empty(df: pd.DataFrame, function_col: str) -> bool:
+    """True when the aggregated frame carries no real function names.
+
+    This is the signature of a deferred load: ``cpu_sampling`` has module
+    attribution but the per-PDB function names were postponed to query time.
+    """
+    if function_col not in df.columns:
+        return True
+    values = df[function_col].astype(str).str.strip()
+    return not values.replace("nan", "").astype(bool).any()
+
+
+def _load_raw_samples(trace: TraceData) -> pd.DataFrame | None:
+    """Return the per-sample SampledProfile frame (with InstructionPointer).
+
+    Prefers an already-materialized ``dumper_df``; otherwise reads the cached
+    ``sampled_profile.parquet`` directly from the export dir (it is excluded
+    from the glob cache loader, so it is on disk but not in ``raw_csv``). The
+    raw frame carries ``InstructionPointer`` + ``Weight`` (+ Process Name / CPU)
+    with empty Module/Function — symbolization happens on demand.
+    """
+    df = getattr(trace, "dumper_df", None)
+    if df is not None and not df.empty and "InstructionPointer" in df.columns:
+        return df
+    export_dir = getattr(trace, "export_dir", None)
+    if export_dir is None:
+        return None
+    parquet_path = export_dir / "sampled_profile.parquet"
+    if not parquet_path.exists():
+        return None
+    try:
+        df = pd.read_parquet(parquet_path)
+    except Exception:
+        return None
+    if df is None or df.empty or "InstructionPointer" not in df.columns:
+        return None
+    return df
+
+
+def _resolved_samples(trace: TraceData) -> pd.DataFrame | None:
+    """Per-sample frame with Module/Function resolved from the symbolizer.
+
+    Used by the no-cpu_filter query path when the aggregated ``cpu_sampling``
+    deferred function symbolization. Resolves every unique InstructionPointer
+    once via the trace symbolizer and memoizes the result on the trace so
+    repeat queries are cheap. Returns ``None`` when no symbolizer or no raw
+    samples are available (e.g. xperf mode), so callers fall back to the
+    aggregated frame unchanged.
+    """
+    if getattr(trace, "symbolizer", None) is None:
+        return None
+    cached = getattr(trace, "_resolved_samples_df", None)
+    if cached is not None:
+        return cached
+    raw = _load_raw_samples(trace)
+    if raw is None:
+        return None
+    resolved = _resolve_deferred_instruction_pointers(
+        trace, raw, module_col="Module", function_col="Function"
+    )
+    if _function_col_all_empty(resolved, "Function"):
+        # Symbolizer produced no function names (e.g. PDBs unreachable); don't
+        # mask the aggregated frame with an equally-empty one.
+        return None
+    try:
+        trace._resolved_samples_df = resolved
+    except Exception:
+        pass
+    return resolved
+
+
 def _cpu_denominator_info(
     trace: TraceData,
     cpu_filter: str | None,
@@ -321,12 +392,22 @@ def get_cpu_samples(
         time_col = _find_col(df, ["TimeStamp", "Time", "Timestamp (s)"]) or "TimeStamp"
 
         if function_filter or group_by == "function":
-            df = _resolve_deferred_instruction_pointers(
-                trace,
-                df,
-                module_col=module_col,
-                function_col=function_col,
-            )
+            if _function_col_all_empty(df, function_col):
+                resolved = _resolved_samples(trace)
+                if resolved is not None:
+                    df = resolved
+                    weight_col, module_col, process_col, function_col = (
+                        "Weight", "Module", "Process Name", "Function",
+                    )
+                    cpu_col = _find_col(df, ["CPU", "Cpu", "Processor"]) or "CPU"
+                    time_col = _find_col(df, ["TimeStamp", "Time", "Timestamp (s)"]) or "TimeStamp"
+            else:
+                df = _resolve_deferred_instruction_pointers(
+                    trace,
+                    df,
+                    module_col=module_col,
+                    function_col=function_col,
+                )
 
         # Apply filters
         df = apply_filters(
@@ -431,6 +512,19 @@ def get_hot_functions(
         function_col = _find_col(df, ["Function", "Function Name", "Symbol"]) or "Function"
         cpu_col = _find_col(df, ["CPU", "Cpu"]) or "CPU"
         time_col = _find_col(df, ["TimeStamp", "Time"]) or "TimeStamp"
+
+        # When the load deferred function symbolization (cpu_sampling has
+        # module attribution but blank Function), resolve names on demand from
+        # the raw per-sample frame. Falls back to the aggregated frame when no
+        # symbolizer / raw samples exist (e.g. xperf mode) or when functions
+        # were already resolved at load time.
+        if _function_col_all_empty(df, function_col):
+            resolved = _resolved_samples(trace)
+            if resolved is not None:
+                df = resolved
+                weight_col, module_col, function_col = "Weight", "Module", "Function"
+                cpu_col = _find_col(df, ["CPU", "Cpu"]) or "CPU"
+                time_col = _find_col(df, ["TimeStamp", "Time"]) or "TimeStamp"
 
         # Apply time/CPU filters
         df = apply_filters(
