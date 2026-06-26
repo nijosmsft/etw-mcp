@@ -38,8 +38,10 @@ _CACHE_ATTR = "_export_only_modules"
 
 def _compute_export_only_modules(cpu_df: pd.DataFrame) -> frozenset[str]:
     """Walk the cpu_sampling DataFrame and return the lowercased names
-    of modules whose function names came (almost) entirely from the
-    PE export table fallback.
+    of modules whose function names are low-confidence — either (almost)
+    entirely from the PE export-table fallback, or resolved from a
+    wrong-build (GUID-mismatched) PDB (#3). Both cases produce names that
+    may be wrong and should be flagged.
     """
     if cpu_df is None or cpu_df.empty:
         return frozenset()
@@ -54,16 +56,18 @@ def _compute_export_only_modules(cpu_df: pd.DataFrame) -> frozenset[str]:
         if not mod_str:
             continue
 
-        source_col = group["SymbolSource"].astype(str)
+        source_col = group["SymbolSource"].astype(str).str.lower()
         if weight_col:
             w = group[weight_col].astype(float)
             pdb_weight = float(w[source_col == "pdb"].sum())
             export_weight = float(w[source_col == "export"].sum())
+            mismatch_weight = float(w[source_col == "mismatched"].sum())
             unknown_weight = float(w[source_col.isin(["unknown", ""])].sum())
-            denom = pdb_weight + export_weight + unknown_weight
+            denom = pdb_weight + export_weight + mismatch_weight + unknown_weight
         else:
             pdb_weight = float((source_col == "pdb").sum())
             export_weight = float((source_col == "export").sum())
+            mismatch_weight = float((source_col == "mismatched").sum())
             unknown_weight = float(source_col.isin(["unknown", ""]).sum())
             denom = float(len(group))
 
@@ -72,8 +76,12 @@ def _compute_export_only_modules(cpu_df: pd.DataFrame) -> frozenset[str]:
 
         pct_pdb = pdb_weight / denom * 100.0
         pct_export = export_weight / denom * 100.0
+        pct_mismatch = mismatch_weight / denom * 100.0
 
         if pct_export >= _EXPORT_THRESHOLD_PCT and pct_pdb < _PDB_THRESHOLD_PCT:
+            export_only.add(mod_str.lower())
+        elif pct_mismatch >= 50.0 and pct_pdb < _PDB_THRESHOLD_PCT:
+            # Wrong-build PDB — names are untrustworthy just like exports.
             export_only.add(mod_str.lower())
 
     return frozenset(export_only)

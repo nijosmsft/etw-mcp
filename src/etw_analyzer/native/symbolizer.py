@@ -91,6 +91,21 @@ def is_available() -> bool:
     return True
 
 
+def _guids_equal(a: Optional[str], b: Optional[str]) -> bool:
+    """Compare two GUID strings ignoring dashes, braces, and case.
+
+    Accepts both the dashed UUID form (``D195DCC3-DF4C-...``) the trace
+    rundown carries and the canonical ``GUID.__str__`` form. Returns
+    ``False`` when either side is empty.
+    """
+
+    if not a or not b:
+        return False
+    na = a.replace("-", "").replace("{", "").replace("}", "").lower()
+    nb = b.replace("-", "").replace("{", "").replace("}", "").lower()
+    return na == nb
+
+
 class SymbolizerError(RuntimeError):
     """Raised when dbghelp initialization fails."""
 
@@ -139,14 +154,18 @@ class Symbolizer:
         self._cache: dict[int, str] = {}
 
         # Parallel per-address symbol-source cache: "pdb" | "export" |
-        # "unknown". Populated alongside ``_cache`` by ``_resolve_one``.
-        # "pdb" means SymFromAddrW returned a result without
-        # ``SYMFLAG_EXPORT`` set — i.e. dbghelp matched a real PDB
-        # symbol. "export" means SymFromAddrW returned a name from the
-        # PE export table (nearest-neighbour heuristic, no PDB hit).
-        # "unknown" covers misses where we fell back to ``module+0xRVA``
-        # or ``unknown+0xADDR``. Lets check_symbols and the hot-function
-        # tools report resolution honesty (item 63).
+        # "mismatched" | "unknown". Populated alongside ``_cache`` by
+        # ``_resolve_one``. "pdb" means SymFromAddrW returned a result
+        # without ``SYMFLAG_EXPORT`` set AND the loaded PDB's GUID+Age
+        # matches the trace's captured RSDS identity -- i.e. dbghelp
+        # matched the CORRECT PDB. "mismatched" means a PDB symbol was
+        # returned but from a different-build PDB (GUID/Age disagree with
+        # the trace identity); the name is from the wrong build and must
+        # not be trusted (#3). "export" means SymFromAddrW returned a name
+        # from the PE export table (nearest-neighbour heuristic, no PDB
+        # hit). "unknown" covers misses where we fell back to
+        # ``module+0xRVA`` or ``unknown+0xADDR``. Lets check_symbols and
+        # the hot-function tools report resolution honesty (item 63).
         self._source_cache: dict[int, str] = {}
 
         # Lock guards _modules + _cache for thread-safe symbol calls.
@@ -279,8 +298,94 @@ class Symbolizer:
         module_label = _module_label(module_entry) if module_entry else "unknown"
 
         label = f"{module_label}!{name_str}+0x{displacement.value:x}"
-        source = "export" if (int(sym.Flags) & d.SYMFLAG_EXPORT) else "pdb"
+        if int(sym.Flags) & d.SYMFLAG_EXPORT:
+            source = "export"
+        elif module_entry is not None and not self._module_pdb_matches(module_entry):
+            # dbghelp resolved a PDB symbol, but the loaded PDB's GUID+Age
+            # does NOT match the identity the trace captured for this module
+            # (e.g. a different-build local image was loaded non-strictly).
+            # The function name is from the WRONG build and must not be
+            # counted as a trustworthy "From PDB" hit (#3).
+            source = "mismatched"
+        else:
+            source = "pdb"
         return (label, source)
+
+    def _loaded_module_identity(
+        self, image_base: int
+    ) -> Optional[tuple[int, Optional[str], int]]:
+        """Return ``(sym_type, loaded_guid_str_or_None, loaded_age)`` for the
+        PDB dbghelp currently has loaded at ``image_base``.
+
+        Returns ``None`` when ``SymGetModuleInfoW64`` reports no module. The
+        GUID is the canonical dashed string form (or ``None`` when the SDK
+        reports an all-zero signature). Caller holds ``self._lock``.
+        """
+
+        d = self._dbghelp
+        mi = self._IMAGEHLP_MODULEW64()
+        mi.SizeOfStruct = ctypes.sizeof(self._IMAGEHLP_MODULEW64)
+        try:
+            ok = d.SymGetModuleInfoW64(
+                self._handle, ctypes.c_ulonglong(image_base), ctypes.byref(mi)
+            )
+        except OSError:
+            return None
+        if not ok:
+            return None
+        guid_str = str(mi.PdbSig70)
+        if guid_str.replace("-", "").strip("0") == "":
+            guid_str = None
+        return (int(mi.SymType), guid_str, int(mi.PdbAge))
+
+    def _module_pdb_matches(self, module: dict) -> bool:
+        """Whether the PDB dbghelp loaded for ``module`` matches the trace's
+        captured RSDS identity (GUID+Age).
+
+        Returns ``True`` when we cannot prove a mismatch -- i.e. the trace
+        carried no identity, dbghelp loaded the file via the exact-GUID RSDS
+        path, or ``SymGetModuleInfoW64`` is unavailable. Only an explicit
+        GUID/Age disagreement between the loaded PDB and the trace identity
+        yields ``False``. The verdict is memoized on the module entry so the
+        ``SymGetModuleInfoW64`` round-trip happens at most once per module.
+        Caller holds ``self._lock``.
+        """
+
+        cached = module.get("pdb_match")
+        if cached is not None:
+            return bool(cached)
+
+        # Exact-GUID RSDS load already proved the identity matches.
+        if module.get("identity_source") == "rsds":
+            module["pdb_match"] = True
+            return True
+
+        trace_guid = module.get("PdbGuid")
+        if not trace_guid:
+            # No captured identity to compare against -- never downgrade.
+            module["pdb_match"] = True
+            return True
+
+        info = self._loaded_module_identity(int(module["ImageBase"]))
+        if info is None:
+            module["pdb_match"] = True
+            return True
+        sym_type, loaded_guid, loaded_age = info
+        if sym_type != self._dbghelp.SymPdb or not loaded_guid:
+            # Not a real PDB load (export/deferred/none) -- the export-flag
+            # check already governs those rows; don't flag as mismatched.
+            module["pdb_match"] = True
+            return True
+
+        guid_ok = _guids_equal(str(trace_guid), loaded_guid)
+        trace_age = module.get("PdbAge")
+        age_ok = trace_age is None or int(trace_age) == int(loaded_age)
+        match = bool(guid_ok and age_ok)
+        module["pdb_match"] = match
+        if not match:
+            module["loaded_pdb_guid"] = loaded_guid
+            module["loaded_pdb_age"] = int(loaded_age)
+        return match
 
     # -- public API ----------------------------------------------------
 
@@ -543,10 +648,10 @@ class Symbolizer:
 
     def get_source(self, address: int) -> str:
         """Return the symbol source for ``address``: ``"pdb"`` | ``"export"``
-        | ``"unknown"``.
+        | ``"mismatched"`` | ``"unknown"``.
 
         Calls ``resolve()`` first if the address has not been seen, so the
-        return is always one of the three documented strings. Used by item
+        return is always one of the four documented strings. Used by item
         63 (honest ``check_symbols``) and the export-fallback annotators in
         ``get_hot_functions`` / ``get_hot_stacks``.
         """

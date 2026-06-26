@@ -403,8 +403,19 @@ def _resolve_address_pairs(
         to_symbolize = unique[:max_symbol_addresses]
         try:
             labels = symbolizer.bulk_resolve(to_symbolize)
-        except Exception:
+        except Exception as exc:
+            # The symbolizer raised while resolving stack frame addresses
+            # (e.g. a dbghelp fault). Don't silently produce an all-unknown
+            # stacks frame (issue #21) -- surface a clear, actionable warning
+            # so callers know the names are missing because symbolization
+            # FAILED, not because there were no samples.
             labels = {}
+            warnings.append(
+                "Stack symbolization failed: the symbolizer raised while "
+                f"resolving frame addresses ({type(exc).__name__}: {exc}). "
+                "Function names are unavailable for this rebuild; reload the "
+                "trace (e.g. mode='native') with a working symbol path."
+            )
         if len(unique) > max_symbol_addresses:
             warnings.append(
                 "Native streaming stack symbolization reached the safety cap "
