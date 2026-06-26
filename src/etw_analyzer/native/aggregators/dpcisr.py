@@ -194,6 +194,31 @@ def _metadata_duration_seconds(trace: "TraceData") -> float | None:
     return max(durations) if durations else None
 
 
+def _effective_duration_seconds(trace: "TraceData") -> float | None:
+    """Best-available wall-clock trace duration in seconds.
+
+    ``trace.duration_seconds`` is ``None`` on dotnet/native cache loads, so we
+    fall back to the authoritative ``trace_metadata['DurationSeconds']`` value
+    (issue #4). Returns ``None`` only when no positive duration is known
+    anywhere, leaving callers to choose a safe default.
+    """
+    val = _positive_float(getattr(trace, "duration_seconds", None))
+    if val:
+        return val
+    return _metadata_duration_seconds(trace)
+
+
+def _effective_duration_us(trace: "TraceData") -> int:
+    """Duration denominator in microseconds, never zero.
+
+    Falls back to 1 second only when no real duration is recoverable, matching
+    the previous behaviour but preferring the real trace duration so per-CPU
+    DPC percentages stay bounded by ~100% (issue #4).
+    """
+    seconds = _effective_duration_seconds(trace)
+    return int((seconds or 1.0) * 1_000_000) or 1
+
+
 def _timestamps_are_relative_microseconds(
     trace: "TraceData",
     timestamps: pd.Series,
@@ -385,7 +410,7 @@ def build_dpc_per_cpu_dataframe(trace: "TraceData") -> Optional[pd.DataFrame]:
             .rename(columns={"DurUs": "DPC_us"})
         )
         grouped["Count"] = 0
-        duration_us = int((getattr(trace, "duration_seconds", None) or 1.0) * 1_000_000) or 1
+        duration_us = _effective_duration_us(trace)
         grouped["Pct"] = grouped["DPC_us"].astype(float) / duration_us * 100.0
         return grouped
 
@@ -401,7 +426,7 @@ def build_dpc_per_cpu_dataframe(trace: "TraceData") -> Optional[pd.DataFrame]:
         .agg(DPC_us=("DurUs", "sum"), Count=("DurUs", "size"))
         .reset_index()
     )
-    duration_us = int((getattr(trace, "duration_seconds", None) or 1.0) * 1_000_000) or 1
+    duration_us = _effective_duration_us(trace)
     grouped["Pct"] = grouped["DPC_us"].astype(float) / duration_us * 100.0
     return grouped
 
@@ -508,8 +533,9 @@ def build_dpc_isr_raw_text(trace: "TraceData") -> Optional[str]:
 
     # Each CPU's % of its own walltime — we use trace duration as the
     # walltime baseline. Approximate but matches xperf's calculation
-    # within rounding.
-    duration_us = int((trace.duration_seconds or 1.0) * 1_000_000) or 1
+    # within rounding. Prefer the real trace duration (issue #4) so the
+    # per-CPU percentages stay bounded by ~100% on dotnet/native loads.
+    duration_us = _effective_duration_us(trace)
 
     lines: list[str] = []
     module_totals = work["Module"].value_counts().to_dict()
