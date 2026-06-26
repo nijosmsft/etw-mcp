@@ -88,6 +88,32 @@ class TestAggregateDpcIsr:
         assert result is not None
         assert "unknown" in set(result["Module"].unique())
 
+    def test_consumes_combined_elapsed_micros_frame(self):
+        # dotnet/native sidecar schema: combined dpc_isr frame already carries
+        # the per-event duration (ElapsedMicros) + routine, no start/end pairing.
+        import types as _types
+        sym = _FakeSymbolizer({0x1: "ndis.sys!NdisRecv+0x10", 0x2: "tcpip.sys!Foo+0x4"})
+        df = pd.DataFrame({
+            "EventSequence": [0, 1, 2, 3],
+            "TimeStampQpc": [10, 20, 30, 40],
+            "CPU": [0, 1, 2, 3],
+            "Kind": ["DPC", "DPC", "ISR", "DPC"],
+            "Routine": [0x1, 0x1, 0x1, 0x2],
+            "ElapsedMicros": [1, 7, 100, 3],
+        })
+        trace = _types.SimpleNamespace(
+            raw_csv={"dpc_isr": df}, symbolizer=sym,
+            duration_seconds=10.0, timestamp_frequency=10_000_000, mode="dotnet",
+        )
+        result = aggregate_dpc_isr(trace)
+        assert result is not None
+        modules = set(result["Module"].unique())
+        assert "ndis.sys" in modules
+        assert "tcpip.sys" in modules
+        ndis = result[result["Module"] == "ndis.sys"]
+        # 1us, 7us, 100us -> three distinct buckets.
+        assert (ndis["Count"] > 0).sum() == 3
+
     def test_duration_uses_trace_timestamp_frequency(self):
         rows = [
             {"TimeStamp": 150, "InitialTime": 50, "Routine": 0x1, "CPU": 0},

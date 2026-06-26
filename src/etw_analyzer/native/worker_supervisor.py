@@ -1038,6 +1038,9 @@ def run_dotnet_worker_extraction(
                 sidecar_wall_seconds=_perf.get("wall_seconds"),
                 events_per_second=_perf.get("events_per_second"),
                 peak_rss_mb=_perf.get("peak_rss_mb"),
+                stack_eligible_events=_perf.get("stack_eligible_events"),
+                stacks_paired=_perf.get("stacks_paired"),
+                pending_evictions=_perf.get("pending_evictions"),
                 event_classes=len((_result_payload.get("event_counts") or {})),
             )
         if not sidecar_result.ok:

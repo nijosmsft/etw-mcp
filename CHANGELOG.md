@@ -4,6 +4,35 @@ All notable changes to etw-mcp are documented here. Format follows [Keep a Chang
 
 ## [Unreleased]
 
+## [0.8.5] - 2026-06-26
+
+### Fixed
+
+- DPC/ISR tools now work on dotnet/native traces. The sidecar emits a combined
+  `dpc_isr` frame carrying `Routine` + `ElapsedMicros` + `Kind` per event, but
+  `aggregate_dpc_isr` only understood the PerfInfo start/end-pairing schema and
+  ignored it, so `get_dpc_summary` / `get_dpc_per_cpu` / `get_network_dpcs`
+  reported "No DPC/ISR data" despite millions of rows. The aggregator now
+  consumes the combined frame directly (duration = `ElapsedMicros`).
+- Stack tools (`get_hot_stacks`, `butterfly_chain`, `walk_stack`) now resolve on
+  dotnet/native traces. A deferred load left the cached `stacks` dataset as a
+  1-row "unknown" placeholder; the tools now rebuild the butterfly on demand
+  from `sampled_profile.parquet`. The Stack column is read via pyarrow because
+  `pandas.read_parquet` coerces the nullable `list<uint64>` to float64 and
+  corrupts the low bits of every frame address (making symbolization fail).
+- `get_lock_contention` / `get_network_lock_contention` now surface native
+  `cswitch_events` (a 0-row `readythread` placeholder no longer short-circuits
+  the lookup) and show a switch-out WaitReason breakdown when the capture has no
+  ReadyThread readying stacks, instead of reporting no context-switch events.
+- The dotnet result telemetry now records `stacks_paired`, `stack_eligible_events`,
+  and `pending_evictions` for stack-pairing observability.
+
+### Known limitations
+
+- Full readying-stack lock attribution still requires a capture that records
+  ReadyThread events with stacks. CSwitch-attached stacks from the sidecar are
+  not yet surfaced (a sidecar stack-pairing/serialization follow-up).
+
 ## [0.8.4] - 2026-06-26
 
 ### Fixed

@@ -24,7 +24,7 @@ def _get_stacks_df(trace: TraceData) -> pd.DataFrame | None:
     for key in ["stacks", "stack_butterfly"]:
         if key in trace.raw_csv:
             df = trace.raw_csv[key]
-            if not df.empty and "Module" in df.columns:
+            if not df.empty and "Module" in df.columns and not _stacks_are_unresolved(df):
                 return df.copy()
     _ensure_lazy_stack_aggregates(trace, include_callers=False)
     for key in ["stacks", "stack_butterfly"]:
@@ -38,7 +38,7 @@ def _get_stacks_df(trace: TraceData) -> pd.DataFrame | None:
 def _get_callers_df(trace: TraceData) -> pd.DataFrame | None:
     """Get caller/callee edge data if available."""
     df = trace.raw_csv.get("stacks_callers")
-    if df is None or df.empty:
+    if df is None or df.empty or _stacks_are_unresolved(trace.raw_csv.get("stacks")):
         _ensure_lazy_stack_aggregates(trace, include_callers=True)
         df = trace.raw_csv.get("stacks_callers")
     if df is None or df.empty:
@@ -46,18 +46,116 @@ def _get_callers_df(trace: TraceData) -> pd.DataFrame | None:
     return df.copy()
 
 
+def _stacks_are_unresolved(df: pd.DataFrame | None) -> bool:
+    """True when the cached ``stacks`` frame is the deferred placeholder.
+
+    A deferred load leaves a 1-row/all-"unknown" stacks frame because
+    symbolization was postponed. We rebuild from the raw sampled-profile
+    stacks on demand in that case.
+    """
+    if df is None or df.empty or len(df) <= 1:
+        return True
+    if "Function" not in df.columns:
+        return True
+    funcs = df["Function"].astype(str).str.strip()
+    return not funcs.replace("nan", "").astype(bool).any()
+
+
+def _build_stacks_from_sampled_parquet(
+    trace: TraceData,
+    *,
+    include_callers: bool,
+) -> None:
+    """Build ``stacks`` / ``stacks_callers`` on demand from sampled_profile.
+
+    The dotnet/native sidecar persists per-sample stack frames in
+    ``sampled_profile.parquet`` (``list<uint64>`` Stack column), but the load
+    defers symbolization, so the cached ``stacks`` dataset is an empty
+    placeholder. This reads the Stack column losslessly via pyarrow (pandas
+    coerces the nullable uint64 list to float64 and corrupts the low bits of
+    every frame address) and drives the butterfly aggregator with
+    symbolization enabled. Results are cached in ``raw_csv`` for the session.
+    """
+    if getattr(trace, "symbolizer", None) is None:
+        return
+    export_dir = getattr(trace, "export_dir", None)
+    if export_dir is None:
+        return
+    parquet_path = export_dir / "sampled_profile.parquet"
+    if not parquet_path.exists():
+        return
+    try:
+        import pyarrow.parquet as pq
+
+        schema_names = pq.read_schema(parquet_path).names
+        cols = [c for c in ("Stack", "Weight") if c in schema_names]
+        if "Stack" not in cols:
+            return
+        table = pq.read_table(parquet_path, columns=cols)
+    except Exception:
+        return
+
+    # ``to_pylist`` keeps each frame as an exact Python int (uint64), unlike
+    # ``pandas.read_parquet`` which downcasts the list column to float64.
+    stack_lists = table.column("Stack").to_pylist()
+    if not any(s for s in stack_lists):
+        return
+    if "Weight" in table.schema.names:
+        weights = table.column("Weight").to_pylist()
+    else:
+        weights = [1] * len(stack_lists)
+    frame = pd.DataFrame({"Stack": stack_lists, "Weight": weights})
+
+    from etw_analyzer.native.aggregators.stack_butterfly import (
+        aggregate_stack_butterfly,
+        aggregate_stack_callers,
+    )
+
+    prev_dumper = getattr(trace, "dumper_df", None)
+    prev_defer = bool(getattr(trace, "_defer_symbolization", False))
+    stacks_df = None
+    callers_df = None
+    try:
+        trace.dumper_df = frame
+        trace._defer_symbolization = False
+        stacks_df = aggregate_stack_butterfly(trace)
+        callers_df = aggregate_stack_callers(trace)
+    except Exception:
+        stacks_df = callers_df = None
+    finally:
+        trace.dumper_df = prev_dumper
+        trace._defer_symbolization = prev_defer
+
+    if stacks_df is not None and not stacks_df.empty:
+        trace.raw_csv["stacks"] = stacks_df
+    if callers_df is not None and not callers_df.empty:
+        trace.raw_csv["stacks_callers"] = callers_df
+
+
 def _ensure_lazy_stack_aggregates(
     trace: TraceData,
     *,
     include_callers: bool,
 ) -> None:
-    if getattr(trace, "mode", None) != "native" or getattr(trace, "event_store", None) is None:
-        return
-    try:
-        from etw_analyzer.native.aggregators.stack_butterfly import ensure_stack_aggregates
-    except Exception:
-        return
-    ensure_stack_aggregates(trace, include_callers=include_callers)
+    if getattr(trace, "mode", None) == "native" and getattr(trace, "event_store", None) is not None:
+        try:
+            from etw_analyzer.native.aggregators.stack_butterfly import ensure_stack_aggregates
+
+            ensure_stack_aggregates(trace, include_callers=include_callers)
+        except Exception:
+            pass
+
+    # Fallback for dotnet/native parquet caches: the on-disk sampled_profile
+    # carries the per-sample stacks but the cached ``stacks`` dataset was
+    # deferred. Build it once, on demand, from the raw frames.
+    if _stacks_are_unresolved(trace.raw_csv.get("stacks")) and not getattr(
+        trace, "_stacks_raw_attempted", False
+    ):
+        try:
+            trace._stacks_raw_attempted = True
+        except Exception:
+            pass
+        _build_stacks_from_sampled_parquet(trace, include_callers=include_callers)
 
 
 def _stack_warning_text(trace: TraceData) -> str:

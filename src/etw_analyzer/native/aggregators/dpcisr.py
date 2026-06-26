@@ -244,7 +244,11 @@ def _gather_dpc_events(trace: "TraceData") -> pd.DataFrame:
     if (
         structured is not None
         and not structured.empty
-        and {"TimeStamp", "CPU", "Routine", "InitialTime"}.issubset(structured.columns)
+        and (
+            {"TimeStamp", "CPU", "Routine", "InitialTime"}.issubset(structured.columns)
+            # dotnet/native combined schema: duration already computed per event.
+            or {"CPU", "Routine", "ElapsedMicros"}.issubset(structured.columns)
+        )
     ):
         return structured
 
@@ -302,6 +306,32 @@ def _build_native_dpc_work_frame(trace: "TraceData") -> pd.DataFrame | None:
     dpc_df = _gather_dpc_events(trace)
     if dpc_df.empty:
         return None
+
+    # Path A: the dotnet/native combined ``dpc_isr`` frame already carries a
+    # per-event duration (``ElapsedMicros``) and the routine address, so no
+    # start/end pairing is needed. This is what the sidecar emits (Kind in
+    # DPC/ISR/TimerDPC/ThreadedDPC).
+    if "ElapsedMicros" in dpc_df.columns and {"CPU", "Routine"}.issubset(dpc_df.columns):
+        durations_us = (
+            pd.to_numeric(dpc_df["ElapsedMicros"], errors="coerce")
+            .fillna(0).clip(lower=0).round().astype("int64")
+        )
+        cpus = pd.to_numeric(dpc_df["CPU"], errors="coerce").fillna(-1).astype("int64")
+        routine_col = _to_uint64_series(dpc_df["Routine"])
+        modules = _modules_for_routines(trace, routine_col)
+        work = pd.DataFrame({
+            "Module": modules.values,
+            "CPU": cpus.values,
+            "DurUs": durations_us.values,
+        })
+        try:
+            trace._native_dpc_work_frame = work
+        except Exception:
+            pass
+        return work
+
+    # Path B: PerfInfo start/end events — pair by (CPU, Routine) and derive
+    # the duration from TimeStamp - InitialTime.
     required = {"TimeStamp", "CPU", "Routine", "InitialTime"}
     if not required.issubset(dpc_df.columns):
         return None

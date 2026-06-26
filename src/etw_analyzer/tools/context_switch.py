@@ -34,8 +34,27 @@ def _get_cswitch_df(
             if key in trace.raw_csv:
                 df = trace.raw_csv[key]
                 # Skip raw-text wrapper DataFrames (single "raw_text" column)
-                if "raw_text" not in df.columns:
+                # and empty placeholders (e.g. a 0-row readythread the sidecar
+                # wrote when no ReadyThread events were captured).
+                if "raw_text" not in df.columns and not df.empty:
                     return df.copy()
+
+        # Native/dotnet sidecar: the CSwitch events live on a dedicated
+        # attribute / parquet (excluded from raw_csv), not under the keys
+        # above. Surface them so the context-switch summary works even
+        # though the capture lacks ReadyThread readying stacks.
+        native_cswitch = _load_native_cswitch_df(trace)
+        if native_cswitch is not None and not native_cswitch.empty:
+            trace.raw_csv["cswitch"] = native_cswitch
+            return native_cswitch.copy()
+
+        # An empty pre-loaded placeholder (e.g. a 0-row readythread/cswitch)
+        # means the trace was decoded but carried no such events. Return it
+        # gracefully so callers report "no data" rather than triggering an
+        # xperf on-demand pass (which would fail on native/dotnet caches).
+        for key in ["readythread", "cswitch", "CSwitch", "CPU Usage (Precise)", "context_switch"]:
+            if key in trace.raw_csv and "raw_text" not in trace.raw_csv[key].columns:
+                return trace.raw_csv[key].copy()
 
         # On-demand: run xperf -a readythread -stacks -symbols
         from etw_analyzer.parsing.wpa_exporter import run_readythread
@@ -59,6 +78,33 @@ def _get_cswitch_df(
         # Cache for future calls
         trace.raw_csv["readythread"] = df
         return df.copy()
+
+
+def _load_native_cswitch_df(trace: TraceData) -> pd.DataFrame | None:
+    """Return the native/dotnet CSwitch events frame, if present.
+
+    The sidecar persists CSwitch events (NewTID/OldTID/NewPID/OldPID/
+    WaitReason/CPU/TimeStamp) on ``trace.cswitch_events_df`` or in
+    ``cswitch_events.parquet`` (excluded from raw_csv). This capture form has
+    no readying stacks, so only a context-switch / WaitReason summary is
+    possible — but that is far better than reporting no data at all.
+    """
+    df = getattr(trace, "cswitch_events_df", None)
+    if df is not None and not df.empty:
+        return df
+    export_dir = getattr(trace, "export_dir", None)
+    if export_dir is None:
+        return None
+    parquet_path = export_dir / "cswitch_events.parquet"
+    if not parquet_path.exists():
+        return None
+    try:
+        df = pd.read_parquet(parquet_path)
+    except Exception:
+        return None
+    if df is None or df.empty:
+        return None
+    return df
 
 
 @mcp.tool()
@@ -219,9 +265,31 @@ def get_lock_contention(
             "",
             f"Total context switches: {len(df):,}",
             "",
-            "For lock contention analysis, collect trace with CpuCswitchSample profile.",
+            "For lock contention analysis, collect a trace with ReadyThread "
+            "stacks (e.g. the cpu_dpc_isr profile with ReadyThread keyword + "
+            "stacks); readying stacks are required to attribute lock holders.",
             "",
         ]
+
+        # WaitReason distribution — the one contention signal a stackless
+        # native CSwitch frame carries (why threads were switched out).
+        wait_reason_col = _find_col(df, ["WaitReason", "Wait Reason", "OldThreadWaitReason"])
+        if wait_reason_col and wait_reason_col in df.columns:
+            wr = (
+                df[wait_reason_col].astype(str).replace("", "(unset)")
+                .value_counts().head(max_rows)
+            )
+            if not wr.empty:
+                total = int(wr.sum())
+                wr_df = pd.DataFrame({
+                    "Wait Reason": wr.index,
+                    "Count": wr.values,
+                    "% of Switches": [format_pct(c / total * 100) for c in wr.values],
+                })
+                lines.append("**Switch-Out Wait Reasons:**")
+                lines.append("")
+                lines.append(format_table(wr_df))
+                lines.append("")
 
         # Group by process
         if new_process_col in df.columns:
