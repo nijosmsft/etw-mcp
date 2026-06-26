@@ -4,6 +4,33 @@ All notable changes to etw-mcp are documented here. Format follows [Keep a Chang
 
 ## [Unreleased]
 
+## [0.8.6] - 2026-06-26
+
+### Fixed
+
+- **get_dpc_per_cpu >100% bug (#4):** DPC per-CPU percentages now use the trace
+  duration as the denominator (from `trace.duration_seconds` /
+  `trace_metadata.DurationSeconds`), eliminating the >100% values that arose
+  when the old 1-second default was used. NDIS.SYS CPU40 dropped from 278.7%
+  → 22.27%; all per-CPU values are now ≤100%.
+- **DPC silent exception swallow (#13):** `_get_dpc_df` now counts raw DPC rows
+  before aggregation. If aggregation fails with rows present, it logs the
+  exception with `exc_info=True` and raises a `ValueError` pointing to
+  `resolve_symbols(trace_id)` for remediation, rather than silently returning a
+  misleading "No DPC/ISR data" message.
+- **get_diskio_summary no-data bug (#14):** `_gather_diskio()` now handles
+  xperf slash-key format (`DiskIo/Read`), native/dotnet underscore-key format
+  (`diskio_read`), and combined `diskio` parquet with `Kind`/`Type`/`Operation`
+  columns, while avoiding double-counting when per-operation rows exist.
+  Verified exact match: reads=12, writes=755, flushes=2 against xperf oracle.
+
+### Added
+
+- **Tests #16, #18, #20:** `test_dpc_isr_tools.py` covers DPC exception/message
+  paths and metadata-duration handling (12/12 pass); `test_system_info_summary.py`
+  covers diskio Kind/Type/underscore key normalization; `test_integration_real_etl.py`
+  provides end-to-end real ETL validation (5 pass, 1 expected xfail for BUG-1/#11).
+
 ## [0.8.5] - 2026-06-26
 
 ### Fixed
