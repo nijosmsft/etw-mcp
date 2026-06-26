@@ -37,6 +37,7 @@ from etw_analyzer.profiles.metadata import (
 
 
 _VALID_TARGETS = ("local", "remote")
+_VALID_MODES = ("file", "memory")
 _MIN_DURATION = 1
 _MAX_DURATION = 3600
 
@@ -70,6 +71,29 @@ def _target_or_error(target: str) -> str | None:
             f"{', '.join(_VALID_TARGETS)}. Use `local` for "
             "captures on the same machine you're calling from, "
             "or `remote` to get the transfer-back examples."
+        )
+    return None
+
+
+def _mode_or_error(mode: str) -> str | None:
+    """Return None when the logging mode is valid, else an error string.
+
+    ``mode`` selects the WPR logging mode (and therefore which bundled
+    ``<Profile>`` variant ``wpr -start`` resolves):
+
+    - ``"file"``   -> ``wpr -start <p>.wprp -filemode`` (writes straight
+      to disk; the safe default).
+    - ``"memory"`` -> ``wpr -start <p>.wprp`` (fixed-size RAM ring,
+      merged to the ETL at ``-stop``; preferred for high-rate captures
+      where file mode drops events).
+    """
+    if mode not in _VALID_MODES:
+        return (
+            f"Unknown mode `{mode}`. Valid: "
+            f"{', '.join(_VALID_MODES)}. Use `file` to write straight to "
+            "disk (default), or `memory` for a fixed-size RAM ring that "
+            "is merged to the ETL at `wpr -stop` (preferred for high-rate "
+            "captures where file mode drops events)."
         )
     return None
 
@@ -130,20 +154,51 @@ def _metadata_table(meta: ProfileMeta) -> str:
 
 
 def _build_wpr_commands(
-    scenario: str, output_path: str, duration_s: int
+    scenario: str, output_path: str, duration_s: int, mode: str = "file"
 ) -> str:
-    """Render the 3-step PowerShell block for a WPR scenario."""
+    """Render the 3-step PowerShell block for a WPR scenario.
+
+    ``mode`` is ``"file"`` (emit ``-filemode``) or ``"memory"`` (omit
+    ``-filemode`` so WPR uses the bundled ``LoggingMode="Memory"``
+    variant). The unused mode is shown as a commented-out alternative.
+    """
     wprp_filename = f"{scenario}.wprp"
+    if mode == "memory":
+        start_line = f"wpr -start .\\{wprp_filename}"
+        mode_comment = (
+            "# Memory (ring-buffer) logging mode: events are held in a "
+            "fixed-size RAM ring and\n"
+            "# merged to the ETL at -stop. Preferred for high-rate "
+            "captures where file mode drops events.\n"
+            "# Uses the bundled LoggingMode='Memory' profile variant "
+            "(no '-filemode').\n"
+        )
+        alt_comment = (
+            "# File-mode alternative (writes straight to disk) - add "
+            "'-filemode':\n"
+            f"#   wpr -start .\\{wprp_filename} -filemode\n"
+        )
+    else:
+        start_line = f"wpr -start .\\{wprp_filename} -filemode"
+        mode_comment = (
+            "# File logging mode ('-filemode'): events are written "
+            "straight to disk. Safe default.\n"
+        )
+        alt_comment = (
+            "# Memory (ring-buffer) mode alternative - omit '-filemode' "
+            "(preferred for high-rate captures):\n"
+            f"#   wpr -start .\\{wprp_filename}\n"
+        )
     return (
         "```powershell\n"
         "# Step 1 - Start capture.\n"
         f"# Save the XML from get_capture_profile('{scenario}') to "
         f".\\{wprp_filename} in the current directory first.\n"
-        "# These profiles ship BOTH a File and a Memory logging-mode variant.\n"
-        "# '-filemode' selects file mode (writes straight to disk - recommended).\n"
-        f"wpr -start .\\{wprp_filename} -filemode\n"
-        "# Memory (ring-buffer) mode alternative - omit '-filemode':\n"
-        f"#   wpr -start .\\{wprp_filename}\n"
+        "# These profiles ship BOTH a File and a Memory logging-mode "
+        "variant.\n"
+        f"{mode_comment}"
+        f"{start_line}\n"
+        f"{alt_comment}"
         "\n"
         f"# Step 2 - Wait {duration_s} seconds (or do work during this window).\n"
         f"Start-Sleep -Seconds {duration_s}\n"
@@ -318,6 +373,7 @@ def get_capture_commands(
     scenario: str,
     output_path: str,
     duration_s: int = 10,
+    mode: str = "file",
 ) -> str:
     """Return paste-ready 3-step PowerShell to capture a trace.
 
@@ -328,6 +384,14 @@ def get_capture_commands(
             For the ``pktmon`` scenario the file should end in ``.etl``.
         duration_s: Capture window in seconds. Must be between 1 and
             3600. Default 10.
+        mode: WPR logging mode for the bundled profile - ``"file"``
+            (default; emits ``wpr -start <p>.wprp -filemode``, writing
+            straight to disk) or ``"memory"`` (emits ``wpr -start
+            <p>.wprp`` with no ``-filemode``, using the bundled
+            ``LoggingMode="Memory"`` variant - a fixed-size RAM ring
+            merged to the ETL at ``-stop``). Memory mode is preferred
+            for high-rate captures where file mode drops events. Ignored
+            for the ``pktmon`` scenario, which has no WPR logging mode.
 
     Returns:
         A markdown document with one ```powershell``` fenced block
@@ -344,19 +408,39 @@ def get_capture_commands(
         commands = _build_pktmon_commands(output_path, duration_s)
         note = (
             "`pktmon` captures all traffic by default. Add filters via "
-            "`pktmon filter add` before Step 1 to scope the capture."
+            "`pktmon filter add` before Step 1 to scope the capture. "
+            "(The `mode` argument is a WPR logging mode and does not "
+            "apply to pktmon.)"
         )
     else:
-        commands = _build_wpr_commands(scenario, output_path, duration_s)
-        note = (
-            f"Save `get_capture_profile('{scenario}')` XML to "
-            f"`.\\{scenario}.wprp` in the working directory before "
-            "running Step 1."
+        mode_err = _mode_or_error(mode)
+        if mode_err is not None:
+            return mode_err
+        commands = _build_wpr_commands(
+            scenario, output_path, duration_s, mode
         )
+        if mode == "memory":
+            note = (
+                f"Save `get_capture_profile('{scenario}')` XML to "
+                f"`.\\{scenario}.wprp` in the working directory before "
+                "running Step 1. Memory (ring-buffer) logging mode is "
+                "selected: events are held in RAM and merged to the ETL "
+                "at `wpr -stop`. Make sure the host has enough free RAM "
+                "for the ring."
+            )
+        else:
+            note = (
+                f"Save `get_capture_profile('{scenario}')` XML to "
+                f"`.\\{scenario}.wprp` in the working directory before "
+                "running Step 1. File logging mode is selected; pass "
+                "`mode='memory'` for a RAM-ring capture (preferred for "
+                "high-rate workloads where file mode drops events)."
+            )
 
+    mode_label = "" if meta.capture_tool == "pktmon" else f", mode `{mode}`"
     return (
         f"**Capture commands** - scenario `{scenario}`, output "
-        f"`{output_path}`, duration `{duration_s}s`\n"
+        f"`{output_path}`, duration `{duration_s}s`{mode_label}\n"
         "\n"
         f"{commands}\n"
         f"{note}\n"
@@ -371,6 +455,7 @@ def get_capture_instructions(
     scenario: str,
     target: str = "local",
     output_path: str = "C:\\traces\\capture.etl",
+    mode: str = "file",
 ) -> str:
     """Return a full step-by-step capture runbook for a scenario.
 
@@ -381,6 +466,11 @@ def get_capture_instructions(
             transfer-back transport examples. Default ``"local"``.
         output_path: Where the ETL should be written on the target.
             Default ``"C:\\traces\\capture.etl"``.
+        mode: WPR logging mode - ``"file"`` (default; ``wpr -start
+            <p>.wprp -filemode``) or ``"memory"`` (``wpr -start
+            <p>.wprp``, the bundled ``LoggingMode="Memory"`` variant -
+            a RAM ring merged to the ETL at ``-stop``, preferred for
+            high-rate captures). Ignored for ``pktmon``.
 
     Returns:
         A long-form markdown runbook covering prerequisites, profile
@@ -397,6 +487,10 @@ def get_capture_instructions(
     if isinstance(result, str):
         return result
     meta = result
+    if meta.capture_tool != "pktmon":
+        mode_err = _mode_or_error(mode)
+        if mode_err is not None:
+            return mode_err
 
     sections: list[str] = []
 
@@ -468,10 +562,11 @@ def get_capture_instructions(
     # 4. Start the capture
     sections.append("## 4. Start the capture")
     sections.append("")
+    mode_arg = "" if meta.capture_tool == "pktmon" else f", mode='{mode}'"
     sections.append(
         "Run the start / wait / stop / verify commands. Equivalent to "
         f"calling `get_capture_commands('{scenario}', '{output_path}', "
-        f"{meta.recommended_duration_s})`:"
+        f"{meta.recommended_duration_s}{mode_arg})`:"
     )
     sections.append("")
     if meta.capture_tool == "pktmon":
@@ -481,7 +576,7 @@ def get_capture_instructions(
     else:
         sections.append(
             _build_wpr_commands(
-                scenario, output_path, meta.recommended_duration_s
+                scenario, output_path, meta.recommended_duration_s, mode
             )
         )
 

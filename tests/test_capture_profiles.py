@@ -293,6 +293,116 @@ def test_capture_commands_document_memory_mode():
     assert "Memory" in out
 
 
+# ---------------------------------------------------------------------------
+# Issue #9 - first-class memory logging-mode selection
+# ---------------------------------------------------------------------------
+
+
+def test_get_capture_commands_memory_mode_omits_filemode_on_start():
+    """`mode='memory'` must emit `wpr -start <p>.wprp` with NO `-filemode`.
+
+    This is the first-class fix for the silent 0xc5584017 failure: memory
+    mode starts the bundled LoggingMode="Memory" variant and is merged to
+    the ETL at -stop.
+    """
+    out = get_capture_commands(
+        "cpu_dpc_isr", r"C:\traces\cpu.etl", duration_s=12, mode="memory"
+    )
+    assert "```powershell" in out
+    # The live start command must NOT carry -filemode (the commented-out
+    # alternative line legitimately mentions it).
+    live_lines = [
+        ln.strip() for ln in out.splitlines() if not ln.lstrip().startswith("#")
+    ]
+    assert "wpr -start .\\cpu_dpc_isr.wprp" in live_lines
+    assert "wpr -start .\\cpu_dpc_isr.wprp -filemode" not in live_lines
+    # Stop + sleep still rendered.
+    assert "Start-Sleep -Seconds 12" in out
+    assert "wpr -stop 'C:\\traces\\cpu.etl'" in out
+    # Header advertises the selected mode.
+    assert "mode `memory`" in out
+    # File-mode shown as the commented-out alternative.
+    assert "#   wpr -start .\\cpu_dpc_isr.wprp -filemode" in out
+
+
+def test_get_capture_commands_file_mode_is_default_and_keeps_filemode():
+    out_default = get_capture_commands("cpu", r"C:\traces\cpu.etl", duration_s=10)
+    out_explicit = get_capture_commands(
+        "cpu", r"C:\traces\cpu.etl", duration_s=10, mode="file"
+    )
+    for out in (out_default, out_explicit):
+        # The live start command carries -filemode in file mode.
+        assert "wpr -start .\\cpu.wprp -filemode" in out
+        # Memory mode is surfaced as the commented alternative.
+        assert "#   wpr -start .\\cpu.wprp\n" in out
+        assert "mode `file`" in out
+
+
+def test_get_capture_commands_rejects_unknown_mode():
+    out = get_capture_commands(
+        "cpu", r"C:\traces\cpu.etl", duration_s=10, mode="ram"
+    )
+    assert "Unknown mode" in out
+    assert "ram" in out
+    # No command emitted on validation failure.
+    assert "```powershell" not in out
+
+
+def test_get_capture_commands_pktmon_ignores_mode():
+    """pktmon has no WPR logging mode - `mode` must not break it or leak in."""
+    out = get_capture_commands(
+        "pktmon", r"C:\traces\pktmon.etl", duration_s=10, mode="memory"
+    )
+    assert "pktmon start --capture --pkt-size 0" in out
+    assert "wpr -start" not in out
+    # Header must not advertise a mode for pktmon.
+    assert "mode `memory`" not in out
+
+
+def test_get_capture_instructions_memory_mode_threads_through():
+    out = get_capture_instructions(
+        "cpu_dpc_isr",
+        target="local",
+        output_path=r"C:\traces\cpu.etl",
+        mode="memory",
+    )
+    assert "# Capture runbook: `cpu_dpc_isr`" in out
+    # The rendered Step 4 command must be memory-mode (no -filemode on the
+    # live start line).
+    assert "wpr -start .\\cpu_dpc_isr.wprp\n" in out
+    # The equivalence pointer mentions the selected mode.
+    assert "mode='memory'" in out
+
+
+def test_get_capture_instructions_rejects_unknown_mode():
+    out = get_capture_instructions(
+        "cpu", target="local", output_path=r"C:\traces\cpu.etl", mode="nope"
+    )
+    assert "Unknown mode" in out
+    assert "# Capture runbook" not in out
+
+
+def test_memory_mode_command_references_existing_memory_profile_variant():
+    """The memory-mode command must line up with a real LoggingMode='Memory'
+    variant in every bundled profile, so `wpr -start <p>.wprp` resolves."""
+    import xml.etree.ElementTree as ET
+
+    for scenario in _WPR_SCENARIOS:
+        out = get_capture_commands(
+            scenario, rf"C:\traces\{scenario}.etl", duration_s=10, mode="memory"
+        )
+        # Memory mode never emits a live -filemode start line.
+        assert f"wpr -start .\\{scenario}.wprp\n" in out
+        # And the bundled profile actually has the Memory variant.
+        root = ET.fromstring(load_wprp_text(scenario))
+        modes = {
+            e.get("LoggingMode")
+            for e in root.iter()
+            if e.tag.endswith("Profile") and e.get("Id")
+        }
+        assert "Memory" in modes, f"{scenario}.wprp lacks a Memory variant"
+
+
 def test_strict_true_only_on_xdp_aware_profiles():
     import re
 
