@@ -83,6 +83,24 @@ def _raw_samples() -> pd.DataFrame:
     })
 
 
+def _raw_samples_native_schema() -> pd.DataFrame:
+    """Native-decoder schema: no Module / Function / Process Name columns.
+
+    The native event-store writes raw samples without the dumper-normalized
+    Module/Function columns, so the resolver must derive Module from the
+    symbolizer label, not assume the column pre-exists.
+    """
+    ips = [_BASE + 0x100] * 5 + [_BASE + 0x9000] * 3 + [0x1234] * 2
+    return pd.DataFrame({
+        "EventSequence": list(range(len(ips))),
+        "TimeStampQpc": list(range(len(ips))),
+        "CPU": [0] * len(ips),
+        "ProcessId": [10] * len(ips),
+        "Weight": [1] * len(ips),
+        "InstructionPointer": ips,
+    })
+
+
 def _deferred_cpu_sampling() -> pd.DataFrame:
     # Module attribution present, Function blank — the deferred-load shape.
     return pd.DataFrame({
@@ -114,6 +132,45 @@ def _make_trace(tmp_path: Path, *, with_symbolizer: bool, raw_on_disk: bool) -> 
         _raw_samples().to_parquet(export_dir / "sampled_profile.parquet", index=False)
     trace_mgmt.register_trace(trace)
     return trace
+
+
+def test_resolver_creates_module_column_for_native_schema(tmp_path: Path):
+    # Native-schema raw samples have no Module column; the resolver must
+    # derive it from the symbolizer label so module filtering works.
+    trace = _make_trace(tmp_path, with_symbolizer=True, raw_on_disk=False)
+    raw = _raw_samples_native_schema()
+    assert "Module" not in raw.columns
+    out = cs._resolve_deferred_instruction_pointers(
+        trace, raw, module_col="Module", function_col="Function"
+    )
+    assert "Module" in out.columns
+    assert (out["Module"] == "tcpip.sys").sum() == 8  # 5 + 3 resolved
+    assert "UdpSend" in set(out["Function"])
+    assert "UdpRecv" in set(out["Function"])
+
+
+def test_get_hot_functions_module_filter_applies_native_schema(tmp_path: Path):
+    # Regression: with native-schema samples (no Module column), the module
+    # filter must still narrow results to the requested module.
+    trace = _make_trace(tmp_path, with_symbolizer=True, raw_on_disk=False)
+    _raw_samples_native_schema().to_parquet(
+        trace.export_dir / "sampled_profile.parquet", index=False
+    )
+    out = cs.get_hot_functions("trace_func", modules="tcpip.sys", max_rows=10)
+    assert "tcpip.sys" in out
+    assert "UdpSend" in out and "UdpRecv" in out
+
+
+def test_check_symbols_resolves_deferred(tmp_path: Path):
+    # check_symbols must reflect on-demand resolution, not the deferred
+    # placeholder (which would misreport 0% PDB).
+    trace = _make_trace(tmp_path, with_symbolizer=True, raw_on_disk=True)
+    out = trace_mgmt.check_symbols("trace_func")
+    assert "Resolved on demand" in out
+    assert "tcpip.sys" in out
+    # The resolved tcpip.sys samples are SymbolSource="pdb" -> not MISSING.
+    tcpip_line = next((ln for ln in out.splitlines() if "| tcpip.sys |" in ln), "")
+    assert tcpip_line and "MISSING" not in tcpip_line
 
 
 def test_function_col_all_empty():

@@ -4,6 +4,23 @@ All notable changes to etw-mcp are documented here. Format follows [Keep a Chang
 
 ## [Unreleased]
 
+## [0.8.3] - 2026-06-26
+
+### Fixed
+
+- `check_symbols` no longer misreports 0% PDB resolution on a deferred load. It
+  now resolves function names on demand from the raw samples (the same path
+  `get_hot_functions` uses) before classifying, so its per-module PDB/Export/
+  Unknown breakdown matches reality and is annotated as resolved-on-demand.
+  Previously it classified the deferred `cpu_sampling` placeholder whose
+  `SymbolSource` is all "unknown", reporting 100% unresolved even while function
+  names resolved fine elsewhere — this was a real inconsistency, not report lag.
+- Module filtering now applies when resolving from native-decoder raw samples.
+  `_resolve_deferred_instruction_pointers` derives the `Module` column from the
+  symbolizer label even when the raw frame has no `Module` column (the native
+  event-store schema omits it), so `get_hot_functions(modules=...)` correctly
+  narrows results instead of silently returning all modules.
+
 ## [0.8.2] - 2026-06-26
 
 ### Fixed

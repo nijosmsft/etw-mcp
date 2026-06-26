@@ -121,9 +121,16 @@ def _resolve_deferred_instruction_pointers(
         if function:
             function_map[addr] = function
 
-    if module_map and module_col in out.columns:
+    if module_map:
         resolved_modules = ip_values.map(module_map)
-        out[module_col] = resolved_modules.fillna(out[module_col]).astype(str)
+        if module_col in out.columns:
+            # Prefer the symbolizer's module; keep the existing value where the
+            # address didn't resolve (e.g. range-attributed module from load).
+            out[module_col] = resolved_modules.fillna(out[module_col]).astype(str)
+        else:
+            # Raw native-schema samples carry no Module column; derive it from
+            # the resolved label so module filters / groupings work.
+            out[module_col] = resolved_modules.fillna("unknown").astype(str)
     if function_map:
         out[function_col] = ip_values.map(function_map).fillna("").astype(str)
     elif function_col not in out.columns:

@@ -3149,9 +3149,36 @@ def check_symbols(
             cpu_df = trace.raw_csv[key]
             break
 
+    # When the load deferred function symbolization, the cached cpu_sampling
+    # carries module attribution but SymbolSource is all "unknown" -- classifying
+    # it would report a misleading 0% PDB while get_hot_functions resolves names
+    # fine on demand. Use the same on-demand resolved per-sample frame so the
+    # classification reflects reality rather than the deferred placeholder.
+    deferred_note = False
+    if cpu_df is not None:
+        try:
+            from etw_analyzer.tools.cpu_sampling import (
+                _function_col_all_empty,
+                _resolved_samples,
+            )
+
+            if _function_col_all_empty(cpu_df, "Function"):
+                resolved = _resolved_samples(trace)
+                if resolved is not None:
+                    cpu_df = resolved
+                    deferred_note = True
+        except Exception:
+            pass
+
     if cpu_df is not None and "Module" in cpu_df.columns and "Function" in cpu_df.columns:
         lines.append("**Per-Module Symbol Resolution:**")
         lines.append("")
+        if deferred_note:
+            lines.append(
+                "_Resolved on demand from raw samples (this trace deferred "
+                "function symbolization at load time)._"
+            )
+            lines.append("")
 
         weight_col = "Weight" if "Weight" in cpu_df.columns else None
         has_source = "SymbolSource" in cpu_df.columns
