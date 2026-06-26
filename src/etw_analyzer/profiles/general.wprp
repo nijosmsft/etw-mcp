@@ -73,6 +73,19 @@
                 </EventCollectorId>
             </Collectors>
         </Profile>
+
+        <Profile Id="General.Verbose.Memory" Name="General" Description="CPU + DPC + ISR + CSwitch + ReadyThread + TCPIP (informational) - default when scenario is unclear" LoggingMode="Memory" DetailLevel="Verbose">
+            <Collectors>
+                <SystemCollectorId Value="SystemCollector_General">
+                    <SystemProviderId Value="SystemProvider_General"/>
+                </SystemCollectorId>
+                <EventCollectorId Value="EC_General">
+                    <EventProviders>
+                        <EventProviderId Value="EP_General_Tcpip"/>
+                    </EventProviders>
+                </EventCollectorId>
+            </Collectors>
+        </Profile>
     </Profiles>
 
     <!--

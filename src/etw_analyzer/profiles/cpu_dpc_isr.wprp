@@ -53,6 +53,14 @@
                 </SystemCollectorId>
             </Collectors>
         </Profile>
+
+        <Profile Id="CpuDpcIsr.Verbose.Memory" Name="CpuDpcIsr" Description="CPU + DPC + ISR + CSwitch + ReadyThread with stacks (kernel pressure analysis)" LoggingMode="Memory" DetailLevel="Verbose">
+            <Collectors>
+                <SystemCollectorId Value="SystemCollector_CpuDpc">
+                    <SystemProviderId Value="SystemProvider_CpuDpc"/>
+                </SystemCollectorId>
+            </Collectors>
+        </Profile>
     </Profiles>
 
     <!--

@@ -60,6 +60,14 @@
                 </SystemCollectorId>
             </Collectors>
         </Profile>
+
+        <Profile Id="Cpu.Verbose.Memory" Name="Cpu" Description="Low-overhead CPU profiling (SampledProfile + stacks + IdleStates)" LoggingMode="Memory" DetailLevel="Verbose">
+            <Collectors>
+                <SystemCollectorId Value="SystemCollector_Cpu">
+                    <SystemProviderId Value="SystemProvider_Cpu"/>
+                </SystemCollectorId>
+            </Collectors>
+        </Profile>
     </Profiles>
 
     <!--

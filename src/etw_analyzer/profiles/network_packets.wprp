@@ -87,6 +87,24 @@
                 </EventCollectorId>
             </Collectors>
         </Profile>
+
+        <Profile Id="NetworkPackets.Verbose.Memory" Name="NetworkPackets" Description="Networking + NDIS PacketCapture verbose with 2 GB ring (100 GbE packet decode)" LoggingMode="Memory" DetailLevel="Verbose">
+            <Collectors>
+                <SystemCollectorId Value="SystemCollector_NetPkt">
+                    <SystemProviderId Value="SystemProvider_NetPkt"/>
+                </SystemCollectorId>
+                <EventCollectorId Value="EC_NetPkt">
+                    <EventProviders>
+                        <EventProviderId Value="EP_NetPkt_Tcpip"/>
+                        <EventProviderId Value="EP_NetPkt_WinsockAfd"/>
+                        <EventProviderId Value="EP_NetPkt_NdisPacketCapture"/>
+                        <EventProviderId Value="EP_NetPkt_MsQuic"/>
+                        <EventProviderId Value="EP_NetPkt_HttpService"/>
+                        <EventProviderId Value="EP_NetPkt_KernelNetwork"/>
+                    </EventProviders>
+                </EventCollectorId>
+            </Collectors>
+        </Profile>
     </Profiles>
 
     <!--

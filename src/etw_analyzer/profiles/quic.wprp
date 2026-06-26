@@ -101,6 +101,22 @@
                 </EventCollectorId>
             </Collectors>
         </Profile>
+
+        <Profile Id="Quic.Verbose.Memory" Name="Quic" Description="MsQuic + Schannel + TCPIP + AFD with kernel CPU/DPC stacks" LoggingMode="Memory" DetailLevel="Verbose">
+            <Collectors>
+                <SystemCollectorId Value="SystemCollector_Quic">
+                    <SystemProviderId Value="SystemProvider_Quic"/>
+                </SystemCollectorId>
+                <EventCollectorId Value="EC_Quic">
+                    <EventProviders>
+                        <EventProviderId Value="EP_Quic_MsQuic"/>
+                        <EventProviderId Value="EP_Quic_Tcpip"/>
+                        <EventProviderId Value="EP_Quic_WinsockAfd"/>
+                        <EventProviderId Value="EP_Quic_Schannel"/>
+                    </EventProviders>
+                </EventCollectorId>
+            </Collectors>
+        </Profile>
     </Profiles>
 
     <!--

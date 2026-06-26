@@ -4,6 +4,18 @@ All notable changes to etw-mcp are documented here. Format follows [Keep a Chang
 
 ## [Unreleased]
 
+## [0.8.4] - 2026-06-26
+
+### Fixed
+
+- Bundled capture profiles can now be started in memory (ring-buffer) mode.
+  Every `.wprp` previously declared only a `LoggingMode="File"` profile, so
+  `wpr -start <profile>` without `-filemode` (WPR defaults to memory mode)
+  failed with `0xc5584017` and silently produced no file. Each of the 9
+  profiles now also ships a `LoggingMode="Memory"` twin sharing the same
+  profile Name, so both file mode (`-filemode`, recommended) and memory mode
+  work. The generated capture commands document both modes.
+
 ## [0.8.3] - 2026-06-26
 
 ### Fixed

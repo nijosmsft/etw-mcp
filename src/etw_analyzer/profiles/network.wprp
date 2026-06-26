@@ -143,6 +143,25 @@
                 </EventCollectorId>
             </Collectors>
         </Profile>
+
+        <Profile Id="Network.Verbose.Memory" Name="Network" Description="Networking + CPU + DPC + TCPIP + AFD + NDIS + QUIC + HTTP + XDP" LoggingMode="Memory" DetailLevel="Verbose">
+            <Collectors>
+                <SystemCollectorId Value="SystemCollector_Network">
+                    <SystemProviderId Value="SystemProvider_Network"/>
+                </SystemCollectorId>
+                <EventCollectorId Value="EC_Network">
+                    <EventProviders>
+                        <EventProviderId Value="EP_Net_Tcpip"/>
+                        <EventProviderId Value="EP_Net_WinsockAfd"/>
+                        <EventProviderId Value="EP_Net_NdisPacketCapture"/>
+                        <EventProviderId Value="EP_Net_MsQuic"/>
+                        <EventProviderId Value="EP_Net_HttpService"/>
+                        <EventProviderId Value="EP_Net_Xdp"/>
+                        <EventProviderId Value="EP_Net_KernelNetwork"/>
+                    </EventProviders>
+                </EventCollectorId>
+            </Collectors>
+        </Profile>
     </Profiles>
 
     <!--

@@ -88,6 +88,21 @@
                 </EventCollectorId>
             </Collectors>
         </Profile>
+
+        <Profile Id="Ebpf.Verbose.Memory" Name="Ebpf" Description="eBPF runtime + verifier + netebpfext with kernel CPU/DPC stacks" LoggingMode="Memory" DetailLevel="Verbose">
+            <Collectors>
+                <SystemCollectorId Value="SystemCollector_Ebpf">
+                    <SystemProviderId Value="SystemProvider_Ebpf"/>
+                </SystemCollectorId>
+                <EventCollectorId Value="EC_Ebpf">
+                    <EventProviders>
+                        <EventProviderId Value="EP_Ebpf_ExecutionContext"/>
+                        <EventProviderId Value="EP_Ebpf_NetEbpfExt"/>
+                        <EventProviderId Value="EP_Ebpf_Tcpip"/>
+                    </EventProviders>
+                </EventCollectorId>
+            </Collectors>
+        </Profile>
     </Profiles>
 
     <!--

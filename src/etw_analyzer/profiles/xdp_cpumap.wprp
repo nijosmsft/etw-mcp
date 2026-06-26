@@ -85,6 +85,20 @@
                 </EventCollectorId>
             </Collectors>
         </Profile>
+
+        <Profile Id="XdpCpuMap.Verbose.Memory" Name="XdpCpuMap" Description="XDP CPUMAP debugging (kernel CPU/DPC + XDP per-frame ETW + XDP WPP)" LoggingMode="Memory" DetailLevel="Verbose">
+            <Collectors>
+                <SystemCollectorId Value="SystemCollector_Xdp">
+                    <SystemProviderId Value="SystemProvider_Xdp"/>
+                </SystemCollectorId>
+                <EventCollectorId Value="EC_Xdp">
+                    <EventProviders>
+                        <EventProviderId Value="EP_Xdp_PerFrame"/>
+                        <EventProviderId Value="EP_Xdp_Wpp"/>
+                    </EventProviders>
+                </EventCollectorId>
+            </Collectors>
+        </Profile>
     </Profiles>
 
     <!--

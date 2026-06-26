@@ -263,6 +263,36 @@ def test_wprp_is_well_formed_xml(scenario):
         )
 
 
+def test_every_wprp_ships_file_and_memory_variants():
+    """Each bundled profile must declare BOTH a File and a Memory logging-mode
+    Profile sharing one Name.
+
+    Regression guard for the 0xc5584017 failure: WPR defaults to memory mode,
+    so a profile with only a LoggingMode="File" variant fails when started
+    without -filemode. Both variants must exist and share the profile Name.
+    """
+    import xml.etree.ElementTree as ET
+
+    for scenario in _WPR_SCENARIOS:
+        root = ET.fromstring(load_wprp_text(scenario))
+        profiles = [e for e in root.iter() if e.tag.endswith("Profile") and e.get("Id")]
+        modes = {p.get("LoggingMode") for p in profiles}
+        assert modes == {"File", "Memory"}, (
+            f"{scenario}.wprp must ship both File and Memory variants, got {modes}"
+        )
+        names = {p.get("Name") for p in profiles}
+        assert len(names) == 1, (
+            f"{scenario}.wprp File/Memory variants must share one Name, got {names}"
+        )
+
+
+def test_capture_commands_document_memory_mode():
+    out = get_capture_commands("cpu", output_path="C:\\\\traces\\\\t.etl", duration_s=10)
+    assert "-filemode" in out
+    # Memory-mode alternative is surfaced.
+    assert "Memory" in out
+
+
 def test_strict_true_only_on_xdp_aware_profiles():
     import re
 

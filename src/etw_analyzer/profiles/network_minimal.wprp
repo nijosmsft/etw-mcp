@@ -86,6 +86,24 @@
                 </EventCollectorId>
             </Collectors>
         </Profile>
+
+        <Profile Id="NetworkMinimal.Verbose.Memory" Name="NetworkMinimal" Description="Networking stack without XDP (for labs without the XDP manifest)" LoggingMode="Memory" DetailLevel="Verbose">
+            <Collectors>
+                <SystemCollectorId Value="SystemCollector_NetMin">
+                    <SystemProviderId Value="SystemProvider_NetMin"/>
+                </SystemCollectorId>
+                <EventCollectorId Value="EC_NetMin">
+                    <EventProviders>
+                        <EventProviderId Value="EP_NetMin_Tcpip"/>
+                        <EventProviderId Value="EP_NetMin_WinsockAfd"/>
+                        <EventProviderId Value="EP_NetMin_NdisPacketCapture"/>
+                        <EventProviderId Value="EP_NetMin_MsQuic"/>
+                        <EventProviderId Value="EP_NetMin_HttpService"/>
+                        <EventProviderId Value="EP_NetMin_KernelNetwork"/>
+                    </EventProviders>
+                </EventCollectorId>
+            </Collectors>
+        </Profile>
     </Profiles>
 
     <!--
