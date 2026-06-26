@@ -4,6 +4,19 @@ All notable changes to etw-mcp are documented here. Format follows [Keep a Chang
 
 ## [Unreleased]
 
+### Added
+
+- **First-class memory-mode selection on the capture-command tools (#9):**
+  `get_capture_commands` and `get_capture_instructions` now take a `mode`
+  argument (`"file"` default, or `"memory"`). `mode="memory"` emits a live
+  `wpr -start <profile>.wprp` with **no** `-filemode`, selecting the bundled
+  `LoggingMode="Memory"` variant (a fixed-size RAM ring merged to the ETL at
+  `-stop`) — preferred for high-rate captures where file mode drops events.
+  The unselected mode is shown as a commented-out alternative, and an unknown
+  `mode` returns a friendly error. Completes #9 on top of the 0.8.4 `.wprp`
+  Memory twins (the bundled profiles already shipped both variants; the tools
+  could only emit the `-filemode` form).
+
 ## [0.8.7] - 2026-06-26
 
 ### Fixed
