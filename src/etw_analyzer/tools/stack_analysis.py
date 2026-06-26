@@ -49,16 +49,48 @@ def _get_callers_df(trace: TraceData) -> pd.DataFrame | None:
 def _stacks_are_unresolved(df: pd.DataFrame | None) -> bool:
     """True when the cached ``stacks`` frame is the deferred placeholder.
 
-    A deferred load leaves a 1-row/all-"unknown" stacks frame because
-    symbolization was postponed. We rebuild from the raw sampled-profile
-    stacks on demand in that case.
+    A deferred load can leave a degenerate stacks frame whose rows all carry
+    ``Module == "unknown"`` -- every frame address mapped to unknown because
+    symbolization was postponed and no image rundown was available, collapsing
+    the butterfly table to a single useless row. We treat such a frame as
+    unresolved and rebuild from the raw sampled-profile stacks on demand.
+
+    Module-only frames (real module names, empty ``Function``) are considered
+    resolved enough to display: the dotnet/native sidecar surfaces module-level
+    attribution without PDBs, and ``resolve_symbols`` upgrades to function
+    level. The previous ``len(df) <= 1`` / "all functions blank" heuristic
+    mis-classified those usable module-only frames as placeholders.
     """
-    if df is None or df.empty or len(df) <= 1:
+    if df is None or df.empty:
         return True
-    if "Function" not in df.columns:
-        return True
+    if "Module" not in df.columns:
+        if "Function" not in df.columns:
+            return True
+        funcs = df["Function"].astype(str).str.strip()
+        return not funcs.replace("nan", "").astype(bool).any()
+    modules = df["Module"].astype(str).str.strip().str.lower()
+    real = modules[(modules != "") & (modules != "unknown") & (modules != "nan")]
+    return real.empty
+
+
+def _stacks_are_module_only(df: pd.DataFrame | None) -> bool:
+    """True when stacks carry module attribution but no resolved functions.
+
+    Used to nudge callers toward ``resolve_symbols`` for function-level detail.
+    """
+    if df is None or df.empty or "Function" not in df.columns:
+        return False
     funcs = df["Function"].astype(str).str.strip()
     return not funcs.replace("nan", "").astype(bool).any()
+
+
+def _module_only_hint(df: pd.DataFrame | None) -> str:
+    if _stacks_are_module_only(df):
+        return (
+            "*Module-level attribution only. Call `resolve_symbols(trace_id)` "
+            "for function-level stack detail.*"
+        )
+    return ""
 
 
 def _build_stacks_from_sampled_parquet(
@@ -540,6 +572,9 @@ def _render_butterfly_stacks(
     output = f"{header}\n\n{format_table(result, max_rows=max_rows)}"
     if any_annotated:
         output += "\n\n" + export_fallback_footnote()
+    hint = _module_only_hint(result)
+    if hint:
+        output += "\n\n" + hint
     return output
 
 

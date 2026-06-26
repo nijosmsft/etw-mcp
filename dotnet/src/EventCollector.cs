@@ -3,12 +3,27 @@ using EtwExtract.Rows;
 namespace EtwExtract;
 
 /// <summary>
-/// Pending-row buffer for stack pairing. Per spike contract §10, capacity
-/// is exactly 1024. On overflow we evict the oldest entry (FIFO).
+/// Pending-row buffer for stack pairing.
+///
+/// Pairs a source event (SampledProfile / CSwitch / ReadyThread) with the
+/// StackWalk event that immediately follows it. Two fixes over the original
+/// 1024-entry FIFO (issue #6, #5):
+///
+/// 1. <b>Timestamp-only fallback</b> (mirrors the native <c>extract.py</c>
+///    path). The primary join is <c>(Qpc, Tid)</c>, but the StackWalk that
+///    trails a CSwitch is not tagged with the NewTid we registered, so that
+///    join always missed and every CSwitch lost its stack. On a miss we now
+///    pair against any pending entry that shares the StackWalk's QPC. A
+///    secondary <see cref="_byQpc"/> index keeps that lookup O(1).
+///
+/// 2. <b>Higher capacity</b>. The 1024 cap evicted source events before their
+///    StackWalk arrived on busy multi-CPU traces (~24% loss). Pairing normally
+///    drains an entry within a few events, so the live set stays far below the
+///    raised cap; it only bounds memory on pathological inputs.
 /// </summary>
 internal sealed class PendingStackBuffer
 {
-    private const int Capacity = 1024;
+    private const int Capacity = 1 << 16; // 65536 — was 1024 (issue #6).
 
     private readonly record struct Key(long Qpc, long Tid);
 
@@ -20,9 +35,26 @@ internal sealed class PendingStackBuffer
 
     private readonly LinkedList<Entry> _order = new();
     private readonly Dictionary<Key, LinkedListNode<Entry>> _index = new(Capacity);
+    // QPC -> set of pending keys sharing that timestamp. Powers the
+    // timestamp-only fallback when the (qpc, tid) join misses.
+    private readonly Dictionary<long, HashSet<Key>> _byQpc = new();
 
     public int Evictions { get; private set; }
+    /// <summary>Stacks paired via the timestamp-only fallback (TID mismatch).</summary>
+    public long TsFallbackPairings { get; private set; }
     public int Pending => _index.Count;
+
+    private void RemoveNode(LinkedListNode<Entry> node)
+    {
+        var key = node.Value.Key;
+        _order.Remove(node);
+        _index.Remove(key);
+        if (_byQpc.TryGetValue(key.Qpc, out var set))
+        {
+            set.Remove(key);
+            if (set.Count == 0) _byQpc.Remove(key.Qpc);
+        }
+    }
 
     public void Add(long qpc, long tid, Action<List<ulong>> setter)
     {
@@ -30,32 +62,53 @@ internal sealed class PendingStackBuffer
         if (_index.TryGetValue(key, out var existing))
         {
             // Same key already pending — replace (newer event wins).
-            _order.Remove(existing);
-            _index.Remove(key);
+            RemoveNode(existing);
         }
         if (_index.Count >= Capacity)
         {
             var oldest = _order.First;
             if (oldest != null)
             {
-                _order.RemoveFirst();
-                _index.Remove(oldest.Value.Key);
+                RemoveNode(oldest);
                 Evictions++;
             }
         }
         var node = _order.AddLast(new Entry { Key = key, Setter = setter });
         _index[key] = node;
+        if (!_byQpc.TryGetValue(qpc, out var qset))
+        {
+            qset = new HashSet<Key>();
+            _byQpc[qpc] = qset;
+        }
+        qset.Add(key);
     }
 
     public bool TryPair(long qpc, long tid, List<ulong> addresses)
     {
+        // Exact (qpc, tid) join first — correctly-tagged StackWalks pair here.
         var key = new Key(qpc, tid);
-        if (!_index.TryGetValue(key, out var node))
-            return false;
-        _index.Remove(key);
-        _order.Remove(node);
-        try { node.Value.Setter(addresses); } catch { /* swallow */ }
-        return true;
+        if (_index.TryGetValue(key, out var node))
+        {
+            RemoveNode(node);
+            try { node.Value.Setter(addresses); } catch { /* swallow */ }
+            return true;
+        }
+        // Timestamp-only fallback: the StackWalk shares its source event's QPC
+        // but may carry a different TID (notably CSwitch). Pair to any pending
+        // entry with the same timestamp.
+        if (_byQpc.TryGetValue(qpc, out var qset) && qset.Count > 0)
+        {
+            Key fallbackKey = default;
+            foreach (var k in qset) { fallbackKey = k; break; }
+            if (_index.TryGetValue(fallbackKey, out var fnode))
+            {
+                RemoveNode(fnode);
+                try { fnode.Value.Setter(addresses); } catch { /* swallow */ }
+                TsFallbackPairings++;
+                return true;
+            }
+        }
+        return false;
     }
 }
 

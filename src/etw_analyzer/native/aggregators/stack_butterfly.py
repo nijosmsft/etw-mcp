@@ -237,6 +237,50 @@ def _build_image_index_from_event_store(
     return image_index
 
 
+def _build_image_index_from_raw_csv(trace: "TraceData") -> _ImageIndex:
+    """Build an image-range index from the in-memory image rundown frames.
+
+    The dotnet/native sidecar populates image rows under ``trace.raw_csv``
+    (keys ``Image/Load`` / ``Image/DCStart`` / ``Image/DCEnd`` and the
+    canonical ``image`` alias) rather than the lazy event store. Mirror
+    :func:`_build_image_index_from_event_store` so the in-memory
+    ``aggregate_stack_butterfly`` / ``aggregate_stack_callers`` path can do
+    module attribution while PDB-backed symbolization is deferred at load
+    (otherwise every frame collapses to ``("unknown", "")`` -> a single
+    degenerate stacks row).
+    """
+    image_index = _ImageIndex()
+    raw_csv = getattr(trace, "raw_csv", None)
+    if not raw_csv:
+        return image_index
+    seen_bases: set[int] = set()
+    for key in ("Image/Load", "Image/DCStart", "Image/DCEnd", "image"):
+        df = raw_csv.get(key)
+        if df is None or getattr(df, "empty", True):
+            continue
+        columns = getattr(df, "columns", [])
+        base_col = next((c for c in ("ImageBase", "Base", "BaseAddress") if c in columns), None)
+        size_col = next((c for c in ("ImageSize", "Size") if c in columns), None)
+        name_col = next(
+            (c for c in ("FileName", "ImageFileName", "ImageName", "Image Name") if c in columns),
+            None,
+        )
+        if not base_col or not size_col or not name_col:
+            continue
+        for base, size, file_name in zip(
+            df[base_col].tolist(),
+            df[size_col].tolist(),
+            df[name_col].tolist(),
+        ):
+            base_i = _safe_int(base)
+            if base_i is None or base_i in seen_bases:
+                continue
+            seen_bases.add(base_i)
+            image_index.add(base, size, file_name)
+    image_index.finalize()
+    return image_index
+
+
 def _ensure_symbolizer_from_image_index(
     trace: "TraceData",
     image_index: _ImageIndex,
@@ -577,10 +621,12 @@ def aggregate_stack_butterfly(
     dumper = trace.dumper_df
     if dumper is None or dumper.empty or "Stack" not in dumper.columns:
         return None
+    image_index = _build_image_index_from_raw_csv(trace)
     result = _aggregate_stack_rows(
         trace,
         _iter_frame_stacks(dumper),
-        require_symbolizer=True,
+        image_index=image_index if image_index.has_data else None,
+        require_symbolizer=False,
     )
     _record_stack_warnings(trace, result.warnings)
     return result.stacks
@@ -606,10 +652,12 @@ def aggregate_stack_callers(
     dumper = trace.dumper_df
     if dumper is None or dumper.empty or "Stack" not in dumper.columns:
         return None
+    image_index = _build_image_index_from_raw_csv(trace)
     result = _aggregate_stack_rows(
         trace,
         _iter_frame_stacks(dumper),
-        require_symbolizer=True,
+        image_index=image_index if image_index.has_data else None,
+        require_symbolizer=False,
     )
     _record_stack_warnings(trace, result.warnings)
     return result.callers

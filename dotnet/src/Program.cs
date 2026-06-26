@@ -474,6 +474,7 @@ emit.Emit(new
         stack_eligible_events = runner.Collector.StackEligibleEvents,
         stacks_paired = runner.Collector.StacksPaired,
         pending_evictions = runner.Collector.Pending.Evictions,
+        stacks_paired_ts_fallback = runner.Collector.Pending.TsFallbackPairings,
         callback_exceptions = runner.Collector.CallbackExceptions,
     },
 });
