@@ -1757,26 +1757,41 @@ def _run_native_aggregators(trace: TraceData) -> None:
                 mutated = True
 
             if pid_map:
-                if "NewProcessName" in cswitch_df.columns and "NewPID" in cswitch_df.columns:
-                    blank = cswitch_df["NewProcessName"].astype(str).str.len() == 0
-                    if blank.any():
-                        cswitch_df.loc[blank, "NewProcessName"] = (
-                            cswitch_df.loc[blank, "NewPID"]
-                            .map(pid_map)
-                            .fillna("")
-                            .astype(str)
+                # The dotnet CSwitch schema has no NewProcessName/OldProcessName
+                # columns at all (issue #12), so we create them from the PID map
+                # when absent and otherwise backfill blank values.
+                if "NewPID" in cswitch_df.columns:
+                    if "NewProcessName" not in cswitch_df.columns:
+                        cswitch_df["NewProcessName"] = (
+                            cswitch_df["NewPID"].map(pid_map).fillna("").astype(str)
                         )
                         mutated = True
-                if "OldProcessName" in cswitch_df.columns and "OldPID" in cswitch_df.columns:
-                    blank = cswitch_df["OldProcessName"].astype(str).str.len() == 0
-                    if blank.any():
-                        cswitch_df.loc[blank, "OldProcessName"] = (
-                            cswitch_df.loc[blank, "OldPID"]
-                            .map(pid_map)
-                            .fillna("")
-                            .astype(str)
+                    else:
+                        blank = cswitch_df["NewProcessName"].astype(str).str.len() == 0
+                        if blank.any():
+                            cswitch_df.loc[blank, "NewProcessName"] = (
+                                cswitch_df.loc[blank, "NewPID"]
+                                .map(pid_map)
+                                .fillna("")
+                                .astype(str)
+                            )
+                            mutated = True
+                if "OldPID" in cswitch_df.columns:
+                    if "OldProcessName" not in cswitch_df.columns:
+                        cswitch_df["OldProcessName"] = (
+                            cswitch_df["OldPID"].map(pid_map).fillna("").astype(str)
                         )
                         mutated = True
+                    else:
+                        blank = cswitch_df["OldProcessName"].astype(str).str.len() == 0
+                        if blank.any():
+                            cswitch_df.loc[blank, "OldProcessName"] = (
+                                cswitch_df.loc[blank, "OldPID"]
+                                .map(pid_map)
+                                .fillna("")
+                                .astype(str)
+                            )
+                            mutated = True
 
             if mutated:
                 # Persist the enriched DataFrame so cache rehydration

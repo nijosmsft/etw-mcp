@@ -75,7 +75,15 @@ internal sealed class ExtractRunner
         bool Want(params string[] aliases) => aliases.Any(a => lc.Contains(a.ToLowerInvariant()));
         _wantSampled = Want("SampledProfile", "sampled_profile");
         _wantCSwitch = Want("CSwitch", "cswitch", "cswitch_events");
-        _wantReady = Want("ReadyThread", "readythread");
+        // ReadyThread events live in the same kernel scheduler group as CSwitch
+        // and are already present in any trace captured with context switches.
+        // Older Python callers never list ReadyThread in requested_event_classes
+        // (it is absent from _DUMPER_EVENT_CLASSES), which left readythread.parquet
+        // empty even though the ETL contained the events (issue #7). Activate the
+        // ReadyThread path whenever CSwitch is requested so lock-contention
+        // readying-stack attribution has data to work with. Extracting events
+        // already in the ETL adds no capture cost.
+        _wantReady = Want("ReadyThread", "readythread") || _wantCSwitch;
         _wantTcpipRecv = Want("TcpIp/Recv", "tcpip_recv");
         _wantTcpipSend = Want("TcpIp/Send", "tcpip_send");
         _wantTcpipConnect = Want("TcpIp/Connect", "tcpip_connect");

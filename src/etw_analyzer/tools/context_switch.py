@@ -80,6 +80,55 @@ def _get_cswitch_df(
         return df.copy()
 
 
+def _ensure_cswitch_process_names(trace: TraceData, df: pd.DataFrame) -> pd.DataFrame:
+    """Synthesize ``OldProcessName``/``NewProcessName`` when the frame lacks them.
+
+    The dotnet sidecar CSwitch schema is
+    ``{EventSequence, TimeStamp, CPU, NewTID, OldTID, NewPID, OldPID,
+    WaitReason, Stack}`` — it has no process-name columns, unlike the native
+    schema (issue #12). Without them, process-name filtering / grouping in
+    ``get_lock_contention`` silently produces nothing. Build a PID→name map
+    from the process-event table and add the missing columns so both schemas
+    behave the same. Best-effort: if no PID columns or no process data are
+    available, the frame is returned unchanged.
+    """
+    if df is None or df.empty:
+        return df
+    has_new = "NewProcessName" in df.columns
+    has_old = "OldProcessName" in df.columns
+    if has_new and has_old:
+        return df
+    pid_col_new = _find_col(df, ["NewPID", "NewProcessId", "New PID"])
+    pid_col_old = _find_col(df, ["OldPID", "OldProcessId", "Old PID"])
+    if not pid_col_new and not pid_col_old:
+        return df
+    try:
+        from etw_analyzer.native.aggregators.profile_detail import (
+            _build_pid_to_name_map,
+        )
+        pid_map = _build_pid_to_name_map(trace)
+    except Exception:
+        pid_map = {}
+    if not pid_map:
+        return df
+    df = df.copy()
+    if not has_new and pid_col_new:
+        df["NewProcessName"] = (
+            pd.to_numeric(df[pid_col_new], errors="coerce")
+            .map(pid_map)
+            .fillna("")
+            .astype(str)
+        )
+    if not has_old and pid_col_old:
+        df["OldProcessName"] = (
+            pd.to_numeric(df[pid_col_old], errors="coerce")
+            .map(pid_map)
+            .fillna("")
+            .astype(str)
+        )
+    return df
+
+
 def _load_native_cswitch_df(trace: TraceData) -> pd.DataFrame | None:
     """Return the native/dotnet CSwitch events frame, if present.
 
@@ -88,10 +137,14 @@ def _load_native_cswitch_df(trace: TraceData) -> pd.DataFrame | None:
     ``cswitch_events.parquet`` (excluded from raw_csv). This capture form has
     no readying stacks, so only a context-switch / WaitReason summary is
     possible — but that is far better than reporting no data at all.
+
+    The dotnet CSwitch schema lacks ``OldProcessName``/``NewProcessName``;
+    they are synthesized here from the PID→name map so process-level grouping
+    works on both schemas (issue #12).
     """
     df = getattr(trace, "cswitch_events_df", None)
     if df is not None and not df.empty:
-        return df
+        return _ensure_cswitch_process_names(trace, df)
     export_dir = getattr(trace, "export_dir", None)
     if export_dir is None:
         return None
@@ -104,7 +157,7 @@ def _load_native_cswitch_df(trace: TraceData) -> pd.DataFrame | None:
         return None
     if df is None or df.empty:
         return None
-    return df
+    return _ensure_cswitch_process_names(trace, df)
 
 
 @mcp.tool()
@@ -166,7 +219,9 @@ def get_lock_contention(
         "Wait (us)", "Wait Duration", "Time Since Last",
         "Ready Time", "Wait Time",
     ])
-    new_process_col = _find_col(df, ["New Process Name", "New Process", "Process Name"]) or "New Process Name"
+    new_process_col = _find_col(df, [
+        "New Process Name", "NewProcessName", "New Process", "Process Name",
+    ]) or "New Process Name"
     ready_process_col = _find_col(df, ["Readying Process Name", "Readying Process"]) or "Readying Process Name"
 
     # Normalize wait time
@@ -291,12 +346,21 @@ def get_lock_contention(
                 lines.append(format_table(wr_df))
                 lines.append("")
 
-        # Group by process
+        # Group by process. Without a numeric wait column there is nothing to
+        # sum, so count switches per process instead (summing the string
+        # process-name column raised "cannot insert ... already exists").
         if new_process_col in df.columns:
-            result = group_and_sum(
-                df, [new_process_col],
-                sum_col=wait_col if (wait_col and wait_col in df.columns) else new_process_col,
-            )
+            if wait_col and wait_col in df.columns:
+                result = group_and_sum(df, [new_process_col], sum_col=wait_col)
+            else:
+                counts = (
+                    df[new_process_col].astype(str).replace("", "(unknown)")
+                    .value_counts().head(max_rows)
+                )
+                result = pd.DataFrame({
+                    new_process_col: counts.index,
+                    "Count": counts.values,
+                }) if not counts.empty else pd.DataFrame()
             if not result.empty:
                 lines.append("**Context Switches by Process:**")
                 lines.append("")
