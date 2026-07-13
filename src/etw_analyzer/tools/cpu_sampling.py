@@ -39,7 +39,9 @@ _KERNEL_MODULES = [
 _DEFAULT_HOT_MODULES = _XDP_MODULES + _NETWORKING_MODULES + _NIC_DRIVER_MODULES + _KERNEL_MODULES
 
 _NO_CPU_SAMPLING_MSG = (
-    "No CPU sampling data available. The trace may not contain CPU sampling events.\n\n"
+    "Trace is loaded, but it has no CPU-sampling (SampledProfile) data — "
+    "it was likely captured with a cswitch/DPC profile. Recollect with a "
+    "CPU-sampling profile if you need CPU samples.\n\n"
     "To capture CPU sampling data, use:\n"
     "  wpr -start CPU              (CPU sampling only)\n"
     "  wpr -start GeneralProfile   (CPU + context switches + DPC/ISR)"

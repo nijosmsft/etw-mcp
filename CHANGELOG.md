@@ -4,6 +4,39 @@ All notable changes to etw-mcp are documented here. Format follows [Keep a Chang
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-07-13
+
+### Added
+
+- **`get_thread_cpu_precise` — WPA "CPU Usage (Precise)" per thread/process (#36):**
+  New tool that reconstructs per-thread scheduling from the `CSwitch`
+  (+`ReadyThread`) datasets and reports, per thread (optionally grouped per
+  process): % time Running vs Waiting, context-switches/sec, Wait->Running
+  ("park"/wake) transitions/sec, and mean/p50/p90/p99 wait-duration percentiles.
+  Supports `process_filter`, `tid`, `cpu_filter`, `start_time`/`end_time`
+  (seconds from trace start), `group_by`, `sort_by`, and `max_rows`. Computed
+  with vectorized pandas (no new dependency). This answers whether a worker
+  thread *parks* (blocks) under load — the direct per-thread wait%/park-rate WPA
+  provides.
+
+### Fixed
+
+- **Native extraction now surfaces `ReadyThread` (and a queryable `readythread`
+  dataset) (#36):** the native decoder always understood ReadyThread, but the
+  native load request was built from `_DUMPER_EVENT_CLASSES`, which included
+  `CSwitch` but omitted `ReadyThread`, so the `readythread` dataset extracted as
+  **0 rows** on captures that clearly contained context-switch data (e.g. the
+  `cpu_dpc_isr` profile). Requesting `CSwitch` now co-requests `ReadyThread`
+  across all native worker paths (mirroring the dotnet sidecar), and the
+  `readythread` per-event dataset (readied/readying thread + process identity) is
+  materialized. `EVENT_SCHEMA_VERSION` bumped 4->5 (adds CSwitch
+  `WaitMode`/`OldThreadState`/`NewPriority`/`OldPriority` and ReadyThread
+  `ReadiedThreadId`/`ReadyingThreadId`/`ReadyingProcessId`).
+- **Clearer "no CPU-sampling data" message:** when a trace *is* loaded but has no
+  `cpu_sampling` (SampledProfile) dataset, `get_cpu_samples` and `check_symbols`
+  no longer say "load a trace first" — they explain the trace was likely captured
+  with a cswitch/DPC profile, avoiding a misdiagnosis as a symbol/load failure.
+
 ## [0.8.8] - 2026-06-26
 
 ### Fixed

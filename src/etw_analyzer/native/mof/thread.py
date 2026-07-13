@@ -169,6 +169,19 @@ def decode_ready_thread(payload: bytes, hdr: dict) -> Optional[dict]:
     thread in the ready queue. ``AdjustReason`` is the priority-boost
     reason enum (``KPRIORITY_BOOST_REASON``); ``AdjustIncrement`` is the
     boost amount.
+
+    Two threads are involved:
+
+    * The **readied** thread — the one placed in the ready queue. Its TID
+      is the payload ``TThreadId``. It is surfaced as ``ThreadId`` (kept
+      for back-compat with earlier decoders) and, explicitly, as
+      ``ReadiedThreadId``.
+    * The **readying** thread — the currently-running thread that made the
+      readied thread runnable (e.g. by releasing a lock or signalling an
+      event). ETW carries its identity in the event *header*, so we lift
+      ``ReadyingThreadId`` from the header ``ThreadId`` and
+      ``ReadyingProcessId`` from the header ``ProcessId``. These enable
+      wake-attribution joins in the precise CPU tool.
     """
     if len(payload) < _READY_THREAD.size:
         return None
@@ -179,10 +192,19 @@ def decode_ready_thread(payload: bytes, hdr: dict) -> Optional[dict]:
     if cpu is None:
         cpu = hdr.get("CPU", -1)
 
+    readying_tid = hdr.get("ThreadId")
+    readying_pid = hdr.get("ProcessId")
+
     return {
         "TimeStamp": int(hdr.get("TimeStamp", 0)),
         "CPU": int(cpu),
+        # Readied (target) thread — payload TThreadId. ``ThreadId`` kept
+        # for back-compat; ``ReadiedThreadId`` is the explicit alias.
         "ThreadId": int(tid),
+        "ReadiedThreadId": int(tid),
+        # Readying (source) thread/process — from the ETW event header.
+        "ReadyingThreadId": int(readying_tid) if readying_tid is not None else 0,
+        "ReadyingProcessId": int(readying_pid) if readying_pid is not None else 0,
         "AdjustReason": int(adjust_reason),
         "AdjustIncrement": int(adjust_increment),
         "Flag": int(flag) & 0xFF,

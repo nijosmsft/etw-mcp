@@ -304,6 +304,7 @@ Run the LabLink agent elevated, or under an account with permission to start ETW
 | `butterfly_chain` | One-shot WPA-style chain export around a target function (`table`, `csv`, or `wpa_csv`) |
 | `get_dpc_summary` | DPC/ISR duration histogram per module with watchdog risk assessment |
 | `get_dpc_per_cpu` | Per-CPU DPC breakdown |
+| `get_thread_cpu_precise` | WPA "CPU Usage (Precise)" per thread/process from CSwitch (+ReadyThread): Running/Waiting %, context-switches/sec, Wait->Run (park) rate, wait-duration percentiles |
 | `get_lock_contention` | Spinlock contention from ReadyThread stacks |
 | `get_memory_pools` | Kernel pool allocations by module and tag |
 

@@ -41,6 +41,38 @@ class TestReadyThread:
         assert row is not None
         assert row["AdjustIncrement"] == -3
 
+    def test_readied_and_readying_fields(self):
+        """The payload TThreadId is the *readied* thread; the ETW header
+        ThreadId/ProcessId identify the *readying* thread/process."""
+        payload = struct.pack("<IbbH", 4242, 5, 1, 0)
+        row = decode_ready_thread(
+            payload,
+            hdr={
+                "TimeStamp": 1000,
+                "ProcessorNumber": 7,
+                "ThreadId": 999,     # readying thread (running on-CPU)
+                "ProcessId": 888,    # readying process
+            },
+        )
+        assert row is not None
+        # Readied (target) thread — payload TThreadId, back-compat ThreadId.
+        assert row["ThreadId"] == 4242
+        assert row["ReadiedThreadId"] == 4242
+        # Readying (source) thread/process — from the header.
+        assert row["ReadyingThreadId"] == 999
+        assert row["ReadyingProcessId"] == 888
+
+    def test_readying_fields_default_zero_without_header(self):
+        """When the header omits ThreadId/ProcessId, readying fields are 0."""
+        payload = struct.pack("<IbbH", 4242, 5, 1, 0)
+        row = decode_ready_thread(
+            payload, hdr={"TimeStamp": 1000, "ProcessorNumber": 7}
+        )
+        assert row is not None
+        assert row["ReadiedThreadId"] == 4242
+        assert row["ReadyingThreadId"] == 0
+        assert row["ReadyingProcessId"] == 0
+
 
 class TestThreadStartEnd:
     def _build_payload(self, with_name: bool = False, with_priorities: bool = True):

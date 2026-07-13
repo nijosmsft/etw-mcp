@@ -1317,6 +1317,11 @@ def _native_load_failed(trace: TraceData, error: str) -> str:
 _DUMPER_EVENT_CLASSES: dict[str, tuple[str, str]] = {
     "SampledProfile":   ("dumper_df",            "sampled_profile"),
     "CSwitch":          ("cswitch_events_df",    "cswitch_events"),
+    # ReadyThread is co-requested with CSwitch (the native/dotnet worker
+    # normalizes the request so asking for CSwitch also pulls ReadyThread).
+    # Both feed the scheduler analysis tools (get_lock_contention,
+    # get_network_wait_chain, get_thread_cpu_precise).
+    "ReadyThread":      ("readythread_df",       "readythread"),
     "TcpIp/Recv":       ("tcpip_recv_df",        "tcpip_recv"),
     "TcpIp/Send":       ("tcpip_send_df",        "tcpip_send"),
     "TcpIp/Retransmit": ("tcpip_retransmit_df",  "tcpip_retransmit"),
@@ -1376,6 +1381,23 @@ _DUMPER_EVENT_CLASSES: dict[str, tuple[str, str]] = {
 }
 
 
+def _normalize_scheduler_request(requested: "set[str] | frozenset[str]") -> set[str]:
+    """Co-request ``ReadyThread`` whenever ``CSwitch`` is requested.
+
+    Mirrors the dotnet ``ExtractRunner`` normalization
+    (``_wantReady = Want(...) || _wantCSwitch``): the two scheduler event
+    classes are always extracted together so tools such as
+    ``get_thread_cpu_precise`` / ``get_lock_contention`` have wake data
+    alongside context switches. Unrequested classes are dropped by the
+    native worker, so without this a CSwitch-only request would yield zero
+    ReadyThread rows.
+    """
+    normalized = set(requested)
+    if "CSwitch" in normalized:
+        normalized.add("ReadyThread")
+    return normalized
+
+
 def _persist_dumper_parquet(df: pd.DataFrame, path: Path) -> None:
     """Write a dumper DataFrame to parquet, sanitizing kernel-address columns.
 
@@ -1432,6 +1454,7 @@ def _start_background_dumper(trace: TraceData) -> None:
     Trace attributes touched (currently):
       - ``dumper_df`` ← SampledProfile
       - ``cswitch_events_df`` ← CSwitch
+      - ``readythread_df`` ← ReadyThread (co-requested with CSwitch)
       - ``tcpip_recv_df`` / ``tcpip_send_df`` / ``tcpip_retransmit_df``
       - ``tcpip_connect_df`` / ``tcpip_accept_df``
       - ``udp_recv_df`` / ``udp_send_df``
@@ -1525,6 +1548,10 @@ def _start_background_dumper(trace: TraceData) -> None:
                     "DiskIo/Read", "DiskIo/Write", "DiskIo/FlushBuffers",
                     "EventTrace/Header", "SystemConfig",
                 })
+                # ReadyThread is co-requested with CSwitch so the scheduler
+                # tools (get_thread_cpu_precise / get_lock_contention) always
+                # have wake data when context switches are present.
+                wanted_with_aux = _normalize_scheduler_request(wanted_with_aux)
 
                 stats_sink: list[ExtractStats] = []
                 results = extract_events(
@@ -2130,6 +2157,7 @@ def _load_file(file_path: Path) -> pd.DataFrame:
 _PARQUET_EXCLUDED = frozenset({
     "sampled_profile",   # Loaded into trace.dumper_df by _start_background_dumper
     "cswitch_events",    # Loaded into trace.cswitch_events_df by _start_background_dumper
+    "readythread",       # Loaded into trace.readythread_df by _start_background_dumper
     # Phase 3a networking event-class parquets. Loaded into dedicated
     # trace attributes (tcpip_recv_df, ...) by _start_background_dumper.
     "tcpip_recv",
@@ -3630,7 +3658,11 @@ def check_symbols(
             lines.append("- After downloading PDBs, re-run `load_trace` to re-analyze with symbols")
 
     else:
-        lines.append("*No CPU sampling data loaded — load a trace first with `load_trace`.*")
+        lines.append(
+            "*Trace is loaded, but it has no CPU-sampling (SampledProfile) "
+            "data — it was likely captured with a cswitch/DPC profile. "
+            "Recollect with a CPU-sampling profile if you need CPU samples.*"
+        )
 
     return "\n".join(lines)
 

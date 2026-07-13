@@ -8,7 +8,7 @@ from typing import Any, Iterable
 import pyarrow as pa
 
 
-EVENT_SCHEMA_VERSION = 4  # M-DCEnd: include Image/DCEnd kernel stop-rundown in image set
+EVENT_SCHEMA_VERSION = 5  # ReadyThread readying/readied identity + cswitch wait-state columns
 
 
 @dataclass(frozen=True)
@@ -162,6 +162,13 @@ EVENT_SCHEMAS: dict[str, EventSchema] = {
             pa.field("NewPID", pa.int64()),
             pa.field("OldPID", pa.int64()),
             pa.field("WaitReason", pa.string()),
+            # v5: scheduler wait-state detail the precise CPU tool needs to
+            # separate Waiting off-CPU intervals from other off-CPU (e.g.
+            # preempted) intervals and to report priorities.
+            pa.field("WaitMode", pa.string()),
+            pa.field("OldThreadState", pa.string()),
+            pa.field("NewPriority", pa.int32()),
+            pa.field("OldPriority", pa.int32()),
             pa.field("Stack", _STACK_TYPE),
         ],
     ),
@@ -263,6 +270,15 @@ EVENT_SCHEMAS: dict[str, EventSchema] = {
         "readythread",
         [
             * _kernel_thread_fields(),
+            # v5: split the two thread identities. ``ThreadId`` (from
+            # _kernel_thread_fields) and ``ReadiedThreadId`` are the readied
+            # (target) thread; ``ReadyingThreadId`` / ``ReadyingProcessId``
+            # are the readying (source) thread/process lifted from the ETW
+            # event header. The precise CPU tool uses these for wake
+            # attribution.
+            pa.field("ReadiedThreadId", pa.int64()),
+            pa.field("ReadyingThreadId", pa.int64()),
+            pa.field("ReadyingProcessId", pa.int64()),
             pa.field("AdjustReason", pa.int32()),
             pa.field("AdjustIncrement", pa.int32()),
             pa.field("Flag", pa.int32()),

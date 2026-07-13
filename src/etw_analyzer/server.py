@@ -12,6 +12,7 @@ import etw_analyzer.tools.cpu_sampling  # noqa: F401, E402
 import etw_analyzer.tools.stack_analysis  # noqa: F401, E402
 import etw_analyzer.tools.dpc_isr  # noqa: F401, E402
 import etw_analyzer.tools.context_switch  # noqa: F401, E402
+import etw_analyzer.tools.thread_cpu_precise  # noqa: F401, E402  — get_thread_cpu_precise (CPU Usage Precise)
 import etw_analyzer.tools.per_cpu  # noqa: F401, E402
 import etw_analyzer.tools.memory  # noqa: F401, E402
 import etw_analyzer.tools.system_info  # noqa: F401, E402

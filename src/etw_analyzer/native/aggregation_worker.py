@@ -588,6 +588,11 @@ def _build_trace_from_staging(
             warnings.append(f"failed to read {stem}.parquet: {exc}")
             continue
         trace.raw_csv[canonical] = df
+        # Bind the readythread sidecar to its dedicated trace attribute so
+        # get_thread_cpu_precise (and other scheduler tools) can read it
+        # directly, mirroring how cswitch_events lands in cswitch_events_df.
+        if stem == "readythread":
+            trace.readythread_df = df
 
     # Phase B per-opcode parquets. These take precedence over the
     # combined-buffer parquets above: when present they carry the same

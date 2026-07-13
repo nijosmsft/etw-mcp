@@ -44,6 +44,18 @@ class TraceData:
     # to block).
     cswitch_events_df: pd.DataFrame | None = None
 
+    # ReadyThread events (kernel Thread provider, opcode 50). Populated by
+    # the same background dumper extraction that fills ``cswitch_events_df``
+    # whenever CSwitch is requested (the two are co-requested — see
+    # ``_DUMPER_EVENT_CLASSES`` / native worker). Each row has TimeStamp,
+    # CPU, ThreadId/ReadiedThreadId (the readied thread), ReadyingThreadId /
+    # ReadyingProcessId (the readying thread/process from the ETW header),
+    # AdjustReason, AdjustIncrement, Flag. ``None`` until extraction
+    # completes; an empty DataFrame means the trace carried no ReadyThread
+    # events (capture profile omitted the keyword). Consumed by
+    # ``get_thread_cpu_precise`` for wake attribution.
+    readythread_df: pd.DataFrame | None = None
+
     # Phase 3a: per-event-class networking DataFrames populated by the same
     # background dumper extraction. Schema notes in
     # :mod:`parsing.wpa_exporter` (search for "Phase 3a"). All are ``None``

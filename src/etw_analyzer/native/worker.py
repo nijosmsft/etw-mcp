@@ -181,6 +181,10 @@ def build_native_cache(
         "DiskIo/Read", "DiskIo/Write", "DiskIo/FlushBuffers",
         "EventTrace/Header", "SystemConfig",
     })
+    # ReadyThread is co-requested with CSwitch (mirrors dotnet
+    # ExtractRunner ``_wantReady = Want(...) || _wantCSwitch``) so the
+    # scheduler tools always have wake data alongside context switches.
+    wanted_with_aux = trace_mgmt._normalize_scheduler_request(wanted_with_aux)
 
     symbol_path = (
         os.environ.get(request.symbol_path_env_key)
@@ -310,6 +314,10 @@ def build_streaming_event_store_cache(
     })
     if "CSwitch" in requested:
         wanted_with_aux.add("CSwitch")
+    # ReadyThread is co-requested with CSwitch so the scheduler tools always
+    # have wake data. Mirrors the dotnet ExtractRunner ``_wantReady =
+    # Want(...) || _wantCSwitch`` normalization.
+    wanted_with_aux = trace_mgmt._normalize_scheduler_request(wanted_with_aux)
     if "ReadyThread" in requested:
         wanted_with_aux.add("ReadyThread")
 

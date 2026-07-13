@@ -25,6 +25,7 @@ DEFAULT_READY_JOIN_ROW_LIMIT = 100_000
 _TRACE_ATTRS_BY_DATASET: dict[str, tuple[str, ...]] = {
     "sampled_profile": ("dumper_df",),
     "cswitch": ("cswitch_events_df",),
+    "readythread": ("readythread_df",),
     "tcpip_recv": ("tcpip_recv_df",),
     "tcpip_send": ("tcpip_send_df",),
     "tcpip_retransmit": ("tcpip_retransmit_df",),
