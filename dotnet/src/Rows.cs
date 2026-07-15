@@ -27,6 +27,10 @@ internal sealed class CSwitchRow
     public long? NewPid;
     public long? OldPid;
     public string? WaitReason;
+    // Previous scheduling state of the switched-out thread ("Waiting",
+    // "Standby", "Running", "Ready", ...). Required so downstream tooling can
+    // distinguish a genuine Wait->Running park from a preemption. See #36.
+    public string? OldThreadState;
     public List<ulong>? Stack;
 }
 
@@ -35,8 +39,15 @@ internal sealed class ReadyThreadRow
     public ulong EventSequence;
     public long TimeStampQpc;
     public int Cpu;
+    // ThreadId / ProcessId identify the READIED (awakened) thread, matching the
+    // native mof decoder contract (payload TThreadId). ReadyingThreadId /
+    // ReadyingProcessId identify the thread that performed the ready (event
+    // header). Unified schema for native + sidecar — see #36 / #28.
     public long? ProcessId;
     public long? ThreadId;
+    public long? ReadiedThreadId;
+    public long? ReadyingThreadId;
+    public long? ReadyingProcessId;
     public int? AdjustReason;
     public int? AdjustIncrement;
     public int? Flag;

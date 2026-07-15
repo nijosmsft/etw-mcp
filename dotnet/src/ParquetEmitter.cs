@@ -260,16 +260,17 @@ internal static class ParquetEmitter
         var fNewPid = Df<long>("NewPID", true);
         var fOldPid = Df<long>("OldPID", true);
         var fWait = DfStr("WaitReason");
+        var fOldState = DfStr("OldThreadState");
         var fStack = StackField();
-        var schema = new ParquetSchema(fEventSeq, fQpc, fCpu, fNewTid, fOldTid, fNewPid, fOldPid, fWait, fStack);
+        var schema = new ParquetSchema(fEventSeq, fQpc, fCpu, fNewTid, fOldTid, fNewPid, fOldPid, fWait, fOldState, fStack);
 
         return await WriteRowGroupAsync(path, schema, async rg =>
         {
             int n = rows.Count;
             var es = new ulong[n]; var qpc = new long[n]; var cpu = new int[n];
             var ntid = new long?[n]; var otid = new long?[n]; var npid = new long?[n]; var opid = new long?[n];
-            var wait = new string?[n];
-            for (int i = 0; i < n; i++) { var r = rows[i]; es[i] = r.EventSequence; qpc[i] = r.TimeStampQpc; cpu[i] = r.Cpu; ntid[i] = r.NewTid; otid[i] = r.OldTid; npid[i] = r.NewPid; opid[i] = r.OldPid; wait[i] = r.WaitReason; }
+            var wait = new string?[n]; var oldState = new string?[n];
+            for (int i = 0; i < n; i++) { var r = rows[i]; es[i] = r.EventSequence; qpc[i] = r.TimeStampQpc; cpu[i] = r.Cpu; ntid[i] = r.NewTid; otid[i] = r.OldTid; npid[i] = r.NewPid; opid[i] = r.OldPid; wait[i] = r.WaitReason; oldState[i] = r.OldThreadState; }
             await rg.WriteColumnAsync(new DataColumn(fEventSeq, es));
             await rg.WriteColumnAsync(new DataColumn(fQpc, qpc));
             await rg.WriteColumnAsync(new DataColumn(fCpu, cpu));
@@ -278,6 +279,7 @@ internal static class ParquetEmitter
             await rg.WriteColumnAsync(new DataColumn(fNewPid, npid));
             await rg.WriteColumnAsync(new DataColumn(fOldPid, opid));
             await rg.WriteColumnAsync(new DataColumn(fWait, wait));
+            await rg.WriteColumnAsync(new DataColumn(fOldState, oldState));
             var (sd, sr) = FlattenStacks(rows.Select(r => r.Stack));
             await rg.WriteColumnAsync(new DataColumn((DataField)fStack.Item, sd, sr));
         });
@@ -290,24 +292,31 @@ internal static class ParquetEmitter
         var fCpu = Df<int>("CPU", false);
         var fPid = Df<long>("ProcessId", true);
         var fTid = Df<long>("ThreadId", true);
+        var fReadied = Df<long>("ReadiedThreadId", true);
+        var fReadyingTid = Df<long>("ReadyingThreadId", true);
+        var fReadyingPid = Df<long>("ReadyingProcessId", true);
         var fReason = Df<int>("AdjustReason", true);
         var fInc = Df<int>("AdjustIncrement", true);
         var fFlag = Df<int>("Flag", true);
         var fStack = StackField();
-        var schema = new ParquetSchema(fEventSeq, fQpc, fCpu, fPid, fTid, fReason, fInc, fFlag, fStack);
+        var schema = new ParquetSchema(fEventSeq, fQpc, fCpu, fPid, fTid, fReadied, fReadyingTid, fReadyingPid, fReason, fInc, fFlag, fStack);
 
         return await WriteRowGroupAsync(path, schema, async rg =>
         {
             int n = rows.Count;
             var es = new ulong[n]; var qpc = new long[n]; var cpu = new int[n];
             var pid = new long?[n]; var tid = new long?[n];
+            var readied = new long?[n]; var ryTid = new long?[n]; var ryPid = new long?[n];
             var reason = new int?[n]; var inc = new int?[n]; var flag = new int?[n];
-            for (int i = 0; i < n; i++) { var r = rows[i]; es[i] = r.EventSequence; qpc[i] = r.TimeStampQpc; cpu[i] = r.Cpu; pid[i] = r.ProcessId; tid[i] = r.ThreadId; reason[i] = r.AdjustReason; inc[i] = r.AdjustIncrement; flag[i] = r.Flag; }
+            for (int i = 0; i < n; i++) { var r = rows[i]; es[i] = r.EventSequence; qpc[i] = r.TimeStampQpc; cpu[i] = r.Cpu; pid[i] = r.ProcessId; tid[i] = r.ThreadId; readied[i] = r.ReadiedThreadId; ryTid[i] = r.ReadyingThreadId; ryPid[i] = r.ReadyingProcessId; reason[i] = r.AdjustReason; inc[i] = r.AdjustIncrement; flag[i] = r.Flag; }
             await rg.WriteColumnAsync(new DataColumn(fEventSeq, es));
             await rg.WriteColumnAsync(new DataColumn(fQpc, qpc));
             await rg.WriteColumnAsync(new DataColumn(fCpu, cpu));
             await rg.WriteColumnAsync(new DataColumn(fPid, pid));
             await rg.WriteColumnAsync(new DataColumn(fTid, tid));
+            await rg.WriteColumnAsync(new DataColumn(fReadied, readied));
+            await rg.WriteColumnAsync(new DataColumn(fReadyingTid, ryTid));
+            await rg.WriteColumnAsync(new DataColumn(fReadyingPid, ryPid));
             await rg.WriteColumnAsync(new DataColumn(fReason, reason));
             await rg.WriteColumnAsync(new DataColumn(fInc, inc));
             await rg.WriteColumnAsync(new DataColumn(fFlag, flag));
