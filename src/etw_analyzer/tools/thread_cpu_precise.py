@@ -22,13 +22,129 @@ from etw_analyzer.tools.cpu_sampling import _find_col
 from etw_analyzer.tools.context_switch import _load_native_cswitch_df
 
 
-# CSwitch ``TimeStamp`` is already trace-relative microseconds with origin 0 by
-# the time it reaches this tool: the native/dotnet extractor converts raw QPC to
-# integer microseconds relative to trace start (see
-# ``native/extract.py:_normalize_native_timestamps`` ~lines 273-298 and
-# ``native/event_store.py`` ~lines 707-713). There is therefore no QPC frequency
-# to apply and no per-frame origin to subtract here.
+# CSwitch ``TimeStamp`` units differ by producer, so this tool normalizes both:
+#
+# * **native (in-process) extractor** — ``native/extract.py:_normalize_native_timestamps``
+#   converts raw QPC to integer MICROSECONDS relative to trace start (origin 0).
+# * **dotnet sidecar** — ``aggregation_worker_adapters.normalize_dotnet_dataframe``
+#   only RENAMES ``TimeStampQpc`` -> ``TimeStamp`` and leaves the raw ABSOLUTE
+#   QPC ticks (e.g. ~2.2e9) untouched. Dividing those by 1e6 (the old assumption)
+#   clipped every event to the window edge and made every metric bogus (#36).
+#
+# ``_normalize_timestamps`` detects which convention a frame uses (via the trace's
+# QPC frequency + authoritative duration) and returns trace-relative SECONDS for
+# both, so the rest of the tool is producer-agnostic.
 _US_PER_SECOND = 1_000_000.0
+
+# WaitReason values (from the CSwitch OldThreadWaitReason field) that indicate an
+# involuntary / still-runnable switch-out (preemption, quantum end) rather than a
+# genuine off-CPU Wait. Used ONLY as a fallback to classify Waiting-vs-Other when
+# the authoritative ``OldThreadState`` column is absent (legacy dotnet-sidecar
+# CSwitch parquet carries WaitReason but not OldThreadState — #36 bug 3). Matches
+# both TraceEvent enum names and the raw kernel WAIT_REASON ordinals TraceEvent
+# stringifies numerically (30..33) when its own enum lacks the name.
+_PREEMPT_WAIT_REASONS = frozenset(
+    {
+        "wrquantumend", "quantumend",
+        "wrdispatchint", "dispatchint",
+        "wrpreempted", "preempted",
+        "wryieldexecution", "yieldexecution",
+        "30", "31", "32", "33",
+    }
+)
+
+# OldThreadState string values that denote a genuine off-CPU *Wait*. TraceEvent's
+# ThreadState enum stringifies the waiting state as ``"Wait"`` (verified on real
+# sidecar output); the native/MOF path and some kernels spell it ``"Waiting"``,
+# and the raw kernel ordinal for Waiting is 5. Match all spellings, case-insensitive,
+# so waiting-vs-other classification works regardless of the producer (#36 bug 3).
+_WAIT_STATES = frozenset({"wait", "waiting", "5"})
+
+
+def _resolve_perf_freq(trace: TraceData) -> float | None:
+    """Return the trace's QPC frequency (Hz), or None if unknown.
+
+    Checked in priority order: the ``timestamp_frequency`` attribute (set from
+    the ETL header on dotnet caches), then the ``trace_metadata`` /
+    ``EventTrace/Header`` frames' ``PerfFreq`` column.
+    """
+    freq = getattr(trace, "timestamp_frequency", None)
+    try:
+        if freq and float(freq) > 0:
+            return float(freq)
+    except (TypeError, ValueError):
+        pass
+    with trace.lock:
+        for key in ("trace_metadata", "EventTrace/Header"):
+            df = trace.raw_csv.get(key)
+            if df is None or getattr(df, "empty", True):
+                continue
+            if "PerfFreq" in df.columns:
+                try:
+                    value = float(pd.to_numeric(df["PerfFreq"], errors="coerce").iloc[0])
+                except (TypeError, ValueError, IndexError):
+                    continue
+                if value > 0:
+                    return value
+    return None
+
+
+def _normalize_timestamps(
+    raw_ts: pd.Series,
+    trace: TraceData,
+    meta: dict,
+) -> tuple[pd.Series, float]:
+    """Convert a CSwitch ``TimeStamp`` column to trace-relative SECONDS.
+
+    Handles both producer conventions (native microseconds vs dotnet-sidecar
+    raw absolute QPC ticks). Returns ``(ts_seconds, total_window_seconds)`` and
+    records ``timestamp_units`` / ``perf_freq`` on ``meta``.
+    """
+    numeric = pd.to_numeric(raw_ts, errors="coerce")
+    valid = numeric.dropna()
+    if valid.empty:
+        return numeric * 0.0, 0.0
+
+    raw_min = float(valid.min())
+    raw_max = float(valid.max())
+    span = raw_max - raw_min
+
+    perf_freq = _resolve_perf_freq(trace)
+    meta["perf_freq"] = perf_freq
+    dur_meta = getattr(trace, "duration_seconds", None)
+    try:
+        dur_meta = float(dur_meta) if dur_meta else None
+    except (TypeError, ValueError):
+        dur_meta = None
+
+    # Decide whether the column is raw QPC ticks or already microseconds.
+    is_qpc = False
+    if perf_freq and perf_freq > 0 and span > 0:
+        us_span_s = span / _US_PER_SECOND
+        qpc_span_s = span / perf_freq
+        if dur_meta and dur_meta > 0:
+            # Pick the interpretation whose implied span best matches the
+            # authoritative trace duration from the ETL header.
+            is_qpc = abs(qpc_span_s - dur_meta) < abs(us_span_s - dur_meta)
+        else:
+            # No authoritative duration: absolute QPC-since-boot has a large
+            # origin (min >> 1s of ticks); native microseconds are relative
+            # (min ~ 0). Treat a large origin as absolute QPC ticks.
+            is_qpc = raw_min > perf_freq
+
+    if is_qpc and perf_freq:
+        meta["timestamp_units"] = "qpc"
+        ts_sec = (numeric - raw_min) / perf_freq
+        span_s = span / perf_freq
+    else:
+        meta["timestamp_units"] = "us"
+        ts_sec = numeric / _US_PER_SECOND
+        span_s = raw_max / _US_PER_SECOND
+
+    total_window = dur_meta if (dur_meta and dur_meta > 0) else span_s
+    if total_window <= 0:
+        total_window = max(span_s, 1e-9)
+    return ts_sec, total_window
 
 _SORT_COLUMNS = {
     "running_ms",
@@ -124,6 +240,9 @@ def compute_thread_cpu_precise(
         "readythread_available": False,
         "readythread_events": 0,
         "frequency_assumed": False,
+        "timestamp_units": None,
+        "perf_freq": None,
+        "state_source": None,
         "group_by": group_by,
         "error": None,
     }
@@ -137,7 +256,7 @@ def compute_thread_cpu_precise(
         meta["error"] = "no-cswitch"
         return pd.DataFrame(), meta
 
-    ts_col = _find_col(cswitch, ["TimeStamp", "Time", "Timestamp"])
+    ts_col = _find_col(cswitch, ["TimeStampQpc", "TimeStamp", "Time", "Timestamp"])
     new_tid_col = _find_col(cswitch, ["NewTID", "NewThreadId", "New TID"])
     old_tid_col = _find_col(cswitch, ["OldTID", "OldThreadId", "Old TID"])
     new_pid_col = _find_col(cswitch, ["NewPID", "NewProcessId", "New PID"])
@@ -145,6 +264,7 @@ def compute_thread_cpu_precise(
     new_proc_col = _find_col(cswitch, ["NewProcessName", "NewProcess"])
     old_proc_col = _find_col(cswitch, ["OldProcessName", "OldProcess"])
     state_col = _find_col(cswitch, ["OldThreadState", "OldState"])
+    wait_col = _find_col(cswitch, ["WaitReason", "OldThreadWaitReason", "Wait Reason"])
     cpu_col = _find_col(cswitch, ["CPU", "Cpu", "Processor"])
     # Nit: native microsecond rounding can collapse distinct QPC events to the
     # same us. When a raw ordering column is present, use it as the sort
@@ -167,20 +287,16 @@ def compute_thread_cpu_precise(
             meta["error"] = "no-rows-after-cpu-filter"
             return pd.DataFrame(), meta
 
-    # BLOCKER 1: TimeStamp is trace-relative microseconds with origin 0 — do NOT
-    # subtract min() (that anchored the window to the first CSwitch) and do NOT
-    # apply a QPC frequency (the extractor already did). Convert us -> seconds.
-    meta["frequency_assumed"] = False
-
+    # BUG 1 FIX (#36): normalize CSwitch timestamps to trace-relative seconds,
+    # detecting native microseconds vs dotnet-sidecar raw QPC ticks. Previously
+    # the raw QPC ticks were divided by 1e6 (treated as microseconds), clipping
+    # every event to the window edge and zeroing every metric on real sidecar
+    # parquet.
     raw_ts = pd.to_numeric(cswitch[ts_col], errors="coerce")
-    raw_max_us = float(raw_ts.max()) if raw_ts.notna().any() else 0.0
-
-    dur_meta = getattr(trace, "duration_seconds", None)
-    if dur_meta and dur_meta > 0:
-        total_window = float(dur_meta)
-    else:
-        # us -> s; trace start is 0, so the last timestamp is the trace width.
-        total_window = raw_max_us / _US_PER_SECOND
+    ts_sec, total_window = _normalize_timestamps(raw_ts, trace, meta)
+    meta["frequency_assumed"] = (
+        meta.get("timestamp_units") == "qpc" and not meta.get("perf_freq")
+    )
 
     # Window is anchored at trace start (0s), not the first observed CSwitch.
     # start_time/end_time are seconds from trace start; the rate denominator is
@@ -192,8 +308,6 @@ def compute_thread_cpu_precise(
         window_seconds = max(total_window - window_start, 1e-9)
         window_end = window_start + window_seconds
     meta["window_seconds"] = window_seconds
-
-    ts_sec = raw_ts / _US_PER_SECOND
 
     def _side(tid_col, pid_col, proc_col, kind: str) -> pd.DataFrame:
         frame = pd.DataFrame(
@@ -217,6 +331,11 @@ def compute_thread_cpu_precise(
                 "old_state": (
                     cswitch[state_col].astype(str)
                     if (kind == "out" and state_col)
+                    else ""
+                ),
+                "wait_reason": (
+                    cswitch[wait_col].astype(str)
+                    if (kind == "out" and wait_col)
                     else ""
                 ),
             }
@@ -283,8 +402,6 @@ def compute_thread_cpu_precise(
     grp = events.groupby("tid", sort=False)
     events["next_ts"] = grp["ts"].shift(-1)
     events["next_kind"] = grp["kind"].shift(-1)
-    # First event per thread — used for the leading-running reconstruction.
-    is_first = grp.cumcount() == 0
     # A thread still on-CPU / still waiting at the last event runs until the
     # window end.
     events["next_ts"] = events["next_ts"].fillna(window_end)
@@ -301,26 +418,55 @@ def compute_thread_cpu_precise(
 
     is_run = events["kind"] == "in"
     is_out = events["kind"] == "out"
-    is_wait = is_out & (events["old_state"] == "Waiting")
-    is_other = is_out & (events["old_state"] != "Waiting")
-    # BLOCKER 2: only waits fully contained in the window count as completed and
-    # feed wait_to_run + percentiles. A wait clipped by the window edge (started
-    # before window_start, or its switch-IN lands after window_end) still adds
-    # to Waiting ms but must NOT inflate the completed-wait count or percentiles.
-    is_completed_wait = (
+
+    # BUG 3 FIX (#36): classify Waiting vs other off-CPU. The authoritative
+    # signal is ``OldThreadState == "Waiting"``. The legacy dotnet-sidecar
+    # CSwitch parquet lacks OldThreadState and carries only ``WaitReason``, so
+    # fall back to it: every switch-out with a genuine wait reason is Waiting,
+    # except involuntary/preemption reasons (quantum end, preempted, dispatch
+    # interrupt, yield). Without this fallback waiting_ms was always 0 on
+    # sidecar traces.
+    state_vals = events["old_state"].astype(str).str.strip()
+    has_state = state_col is not None and bool((state_vals.str.len() > 0).any())
+    if has_state:
+        meta["state_source"] = "OldThreadState"
+        is_wait = is_out & state_vals.str.lower().isin(_WAIT_STATES)
+    else:
+        meta["state_source"] = "WaitReason"
+        wait_vals = events["wait_reason"].astype(str).str.strip()
+        is_preempt = wait_vals.str.lower().isin(_PREEMPT_WAIT_REASONS)
+        is_wait = is_out & (wait_vals.str.len() > 0) & ~is_preempt
+    is_other = is_out & ~is_wait
+    events["is_wait_row"] = is_wait
+
+    # Percentiles / mean cover only waits FULLY CONTAINED in the window (a wait
+    # clipped by a window edge still adds to Waiting ms but its duration is
+    # censored, so it must not skew the distribution).
+    is_contained_wait = (
         is_wait
         & (events["next_kind"] == "in")
         & (events["ts"] >= window_start)
         & (events["next_ts"] <= window_end)
     )
 
-    # BLOCKER 3: if a thread's FIRST observed event is a switch-OUT, it was
-    # running before it. Count that leading Running interval from window_start to
-    # the switch-out time (clipped). Do NOT count a switch-in for it.
-    leading_run = (ts_clip - window_start).clip(lower=0.0)
-    leading_run = leading_run.where(is_first & is_out, 0.0)
+    # BUG 4 FIX (#36): the Wait->Running (park/wake) transition count is a
+    # switch-IN inside the window whose immediately-preceding thread event was a
+    # Waiting switch-OUT — regardless of WHEN that switch-out happened. The old
+    # code reused the fully-contained-wait predicate, so it missed an in-window
+    # wake whose prior Waiting switch-out was before window_start.
+    prev_is_wait = (
+        events.groupby("tid", sort=False)["is_wait_row"].shift(1).fillna(False)
+    )
 
-    events["run_s"] = events["dur"].where(is_run, 0.0) + leading_run
+    # NOTE: running time is attributed only from an OBSERVED switch-IN, exactly
+    # like WPA's "CPU Usage (Precise)" (which keys each interval on the
+    # switched-in "New Thread"). A thread whose first in-window event is a
+    # switch-OUT is NOT credited with a synthesized [window_start, switch-out]
+    # running interval: on real traces a thread's first observed event is often
+    # a LATE switch-out (the thread's pool spun up mid-trace — see #36), so
+    # synthesizing that leading interval grossly over-attributes running_ms
+    # (measured ~1.5x inflation vs the xperf/per-CPU oracle on the i58 repro).
+    events["run_s"] = events["dur"].where(is_run, 0.0)
     events["wait_s"] = events["dur"].where(is_wait, 0.0)
     events["other_s"] = events["dur"].where(is_other, 0.0)
     # Only switch-ins that occur WITHIN the (possibly time-filtered) window count
@@ -329,7 +475,10 @@ def compute_thread_cpu_precise(
     # rate. With no filter, window is [0, total], so every event counts.
     in_window = (events["ts"] >= window_start) & (events["ts"] <= window_end)
     events["switch_in"] = (is_run & in_window).astype("int64")
-    events["completed"] = is_completed_wait.astype("int64")
+    # Wait->Running park count (in-window wake preceded by a Waiting switch-out).
+    events["wait_to_run"] = (is_run & in_window & prev_is_wait).astype("int64")
+    # Fully-contained waits feed the wait-duration percentiles only.
+    events["completed"] = is_contained_wait.astype("int64")
 
     if group_by == "process":
         keys = ["pid", "process"]
@@ -340,7 +489,7 @@ def compute_thread_cpu_precise(
                 wait_s=("wait_s", "sum"),
                 other_s=("other_s", "sum"),
                 switch_ins=("switch_in", "sum"),
-                wait_to_run=("completed", "sum"),
+                wait_to_run=("wait_to_run", "sum"),
                 threads=("tid", "nunique"),
             )
             .reset_index()
@@ -353,15 +502,15 @@ def compute_thread_cpu_precise(
                 wait_s=("wait_s", "sum"),
                 other_s=("other_s", "sum"),
                 switch_ins=("switch_in", "sum"),
-                wait_to_run=("completed", "sum"),
+                wait_to_run=("wait_to_run", "sum"),
                 pid=("pid", "first"),
                 process=("process", "first"),
             )
             .reset_index()
         )
 
-    # Percentiles over COMPLETED wait intervals only.
-    completed = events[is_completed_wait]
+    # Percentiles over fully-contained wait intervals only.
+    completed = events[is_contained_wait]
     if group_by == "process":
         pgrp = completed.groupby(["pid", "process"])["dur"]
         pkeys = ["pid", "process"]

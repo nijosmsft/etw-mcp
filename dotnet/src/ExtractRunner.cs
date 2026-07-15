@@ -217,6 +217,7 @@ internal sealed class ExtractRunner
                     NewPid = data.NewProcessID,
                     OldPid = data.OldProcessID,
                     WaitReason = data.OldThreadWaitReason.ToString(),
+                    OldThreadState = data.OldThreadState.ToString(),
                 };
                 Collector.CSwitch.Add(row);
                 Collector.StackEligibleEvents++;
@@ -235,8 +236,13 @@ internal sealed class ExtractRunner
                     EventSequence = Collector.NextSeq(),
                     TimeStampQpc = data.TimeStampQPC,
                     Cpu = data.ProcessorNumber,
-                    ProcessId = data.ProcessID,
-                    ThreadId = data.ThreadID,
+                    // ThreadId/ProcessId = the READIED (awakened) thread, to
+                    // match the native mof decoder (payload TThreadId). See #36.
+                    ProcessId = data.AwakenedProcessID,
+                    ThreadId = data.AwakenedThreadID,
+                    ReadiedThreadId = data.AwakenedThreadID,
+                    ReadyingThreadId = data.ThreadID,
+                    ReadyingProcessId = data.ProcessID,
                     AdjustReason = (int)data.AdjustReason,
                     AdjustIncrement = data.AdjustIncrement,
                     Flag = (int)data.Flags,
@@ -244,8 +250,8 @@ internal sealed class ExtractRunner
                 Collector.ReadyThread.Add(row);
                 Collector.StackEligibleEvents++;
                 var thisRow = row;
-                // The stack belongs to the readying (current) thread, not awakened.
-                Collector.Pending.Add(thisRow.TimeStampQpc, thisRow.ThreadId ?? 0, addr => thisRow.Stack = addr);
+                // The stack belongs to the readying (current header) thread.
+                Collector.Pending.Add(thisRow.TimeStampQpc, thisRow.ReadyingThreadId ?? 0, addr => thisRow.Stack = addr);
             });
         }
 
