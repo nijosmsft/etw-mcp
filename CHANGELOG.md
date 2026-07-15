@@ -4,6 +4,35 @@ All notable changes to etw-mcp are documented here. Format follows [Keep a Chang
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-07-15
+
+### Fixed
+
+- **`get_thread_cpu_precise` — correct on real dotnet-sidecar ETLs (supersedes broken v0.9.0):**
+  v0.9.0 shipped with six bugs that made the tool produce incorrect results on
+  real dotnet-sidecar traces. All six are fixed in this release:
+  - **QPC-tick timestamp conversion:** raw `TimeStampQpc` ticks were not converted
+    to microseconds, producing wildly wrong running/waiting times.
+  - **ReadyThread auto-enable on sidecar path:** the sidecar path did not request
+    `ReadyThread` extraction, so `readythread` remained at 0 rows; co-requesting
+    it alongside `CSwitch` now yields 693 K rows (DISABLED) / 470 K rows (ENABLED)
+    on repro ETLs.
+  - **Missing `OldThreadState` emission + consumption:** the dotnet sidecar did not
+    emit `OldThreadState` in the `CSwitch` row, and the tool did not consume it;
+    Running-vs-Waiting classification was therefore wrong for every context switch.
+  - **Park-rate window off-by-one:** the sliding window for Wait→Running transitions
+    was off by one interval, inflating park/s by ~1 interval at window boundaries.
+  - **Unregistered tool:** `get_thread_cpu_precise` was implemented but never
+    registered in the MCP server's tool list, so it was invisible to callers.
+  - **Native/dotnet ReadyThread schema mismatch:** column names differed between
+    producers; reads silently produced NaN/KeyError on one path.
+  - **Schema v4→v5:** canonical `TimeStampQpc` column added; old Parquet caches
+    must be re-extracted (`uv run etw-mcp --reload` or delete the `.etw_cache`
+    directory).
+- **Independently verified vs WPA "CPU Usage (Precise)" oracle** by testers Kate
+  (APPROVE) and Architect Heimdall (APPROVE): metrics match WPA to <0.02%;
+  DISABLED/ENABLED park ratio 1.51×; 1157 tests pass; no regressions.
+
 ## [0.9.0] - 2026-07-13
 
 ### Added
