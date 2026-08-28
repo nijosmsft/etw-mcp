@@ -4,6 +4,21 @@ All notable changes to etw-mcp are documented here. Format follows [Keep a Chang
 
 ## [Unreleased]
 
+## [0.9.2] - 2026-08-27
+
+### Fixed
+
+- **Startup crash on mcp SDK v2 (#37).** mcp SDK v2 removed the bundled
+  `mcp.server.fastmcp` module (FastMCP now ships as the standalone `fastmcp`
+  package), so a fresh resolve of the old unbounded `mcp>=1.0` pin pulled mcp
+  2.x and crashed at import with
+  `ModuleNotFoundError: No module named 'mcp.server.fastmcp'`. FastMCP is now
+  imported from the standalone `fastmcp` package, `fastmcp>=2.14.7,<3` is an
+  explicit dependency, and the mcp pin is bounded to `mcp>=1,<3`. Tool names
+  and behavior are unchanged. Added `tests/test_stdio_handshake.py` (real
+  JSON-RPC `initialize` + `tools/list` over stdio) plus a FastMCP-source guard
+  in the smoke test to lock the migration.
+
 ## [0.9.1] - 2026-07-15
 
 ### Fixed
