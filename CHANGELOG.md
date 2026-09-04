@@ -4,6 +4,16 @@ All notable changes to etw-mcp are documented here. Format follows [Keep a Chang
 
 ## [Unreleased]
 
+## [0.9.3] - 2026-09-04
+
+### Fixed
+
+- **C# event schema version sync and ReadyThread reclassification (61581ea).** The
+  dotnet sidecar's C# event schema was updated to v5, and ReadyThread event
+  classification was reclassified to align with native producer expectations.
+  Schema v5 canonical columns now uniformly identify time, context, and thread
+  state across native and dotnet traces.
+
 ## [0.9.2] - 2026-08-27
 
 ### Fixed
