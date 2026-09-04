@@ -50,7 +50,9 @@ internal static class ManifestEmitter
             // event_schema_version MUST track schemas.py::EVENT_SCHEMA_VERSION.
             // Bumped 3 -> 4 when Image/DCEnd (kernel stop-rundown) was added to
             // the image set so kernel sample addresses resolve to real modules.
-            event_schema_version = 4,
+            // Bumped 4 -> 5 when cswitch gained WaitMode/NewPriority/OldPriority
+            // and readythread gained the readied/readying identity columns.
+            event_schema_version = 5,
             finalizer = complete ? "dotnet-sidecar" : (string?)null,
             etl = new
             {

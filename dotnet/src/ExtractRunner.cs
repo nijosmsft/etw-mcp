@@ -218,6 +218,9 @@ internal sealed class ExtractRunner
                     OldPid = data.OldProcessID,
                     WaitReason = data.OldThreadWaitReason.ToString(),
                     OldThreadState = data.OldThreadState.ToString(),
+                    WaitMode = data.OldThreadWaitMode.ToString(),
+                    NewPriority = data.NewThreadPriority,
+                    OldPriority = data.OldThreadPriority,
                 };
                 Collector.CSwitch.Add(row);
                 Collector.StackEligibleEvents++;

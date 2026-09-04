@@ -261,8 +261,11 @@ internal static class ParquetEmitter
         var fOldPid = Df<long>("OldPID", true);
         var fWait = DfStr("WaitReason");
         var fOldState = DfStr("OldThreadState");
+        var fWaitMode = DfStr("WaitMode");
+        var fNewPrio = Df<int>("NewPriority", true);
+        var fOldPrio = Df<int>("OldPriority", true);
         var fStack = StackField();
-        var schema = new ParquetSchema(fEventSeq, fQpc, fCpu, fNewTid, fOldTid, fNewPid, fOldPid, fWait, fOldState, fStack);
+        var schema = new ParquetSchema(fEventSeq, fQpc, fCpu, fNewTid, fOldTid, fNewPid, fOldPid, fWait, fOldState, fWaitMode, fNewPrio, fOldPrio, fStack);
 
         return await WriteRowGroupAsync(path, schema, async rg =>
         {
@@ -270,7 +273,8 @@ internal static class ParquetEmitter
             var es = new ulong[n]; var qpc = new long[n]; var cpu = new int[n];
             var ntid = new long?[n]; var otid = new long?[n]; var npid = new long?[n]; var opid = new long?[n];
             var wait = new string?[n]; var oldState = new string?[n];
-            for (int i = 0; i < n; i++) { var r = rows[i]; es[i] = r.EventSequence; qpc[i] = r.TimeStampQpc; cpu[i] = r.Cpu; ntid[i] = r.NewTid; otid[i] = r.OldTid; npid[i] = r.NewPid; opid[i] = r.OldPid; wait[i] = r.WaitReason; oldState[i] = r.OldThreadState; }
+            var waitMode = new string?[n]; var newPrio = new int?[n]; var oldPrio = new int?[n];
+            for (int i = 0; i < n; i++) { var r = rows[i]; es[i] = r.EventSequence; qpc[i] = r.TimeStampQpc; cpu[i] = r.Cpu; ntid[i] = r.NewTid; otid[i] = r.OldTid; npid[i] = r.NewPid; opid[i] = r.OldPid; wait[i] = r.WaitReason; oldState[i] = r.OldThreadState; waitMode[i] = r.WaitMode; newPrio[i] = r.NewPriority; oldPrio[i] = r.OldPriority; }
             await rg.WriteColumnAsync(new DataColumn(fEventSeq, es));
             await rg.WriteColumnAsync(new DataColumn(fQpc, qpc));
             await rg.WriteColumnAsync(new DataColumn(fCpu, cpu));
@@ -280,6 +284,9 @@ internal static class ParquetEmitter
             await rg.WriteColumnAsync(new DataColumn(fOldPid, opid));
             await rg.WriteColumnAsync(new DataColumn(fWait, wait));
             await rg.WriteColumnAsync(new DataColumn(fOldState, oldState));
+            await rg.WriteColumnAsync(new DataColumn(fWaitMode, waitMode));
+            await rg.WriteColumnAsync(new DataColumn(fNewPrio, newPrio));
+            await rg.WriteColumnAsync(new DataColumn(fOldPrio, oldPrio));
             var (sd, sr) = FlattenStacks(rows.Select(r => r.Stack));
             await rg.WriteColumnAsync(new DataColumn((DataField)fStack.Item, sd, sr));
         });

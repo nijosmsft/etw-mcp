@@ -31,6 +31,14 @@ internal sealed class CSwitchRow
     // "Standby", "Running", "Ready", ...). Required so downstream tooling can
     // distinguish a genuine Wait->Running park from a preemption. See #36.
     public string? OldThreadState;
+    // v5 (schema parity with schemas.py EVENT_SCHEMA_VERSION=5): the wait mode
+    // of the switched-out thread ("Kernel"/"User") and the scheduler
+    // priorities of the switched-in / switched-out threads. The precise CPU
+    // tool uses WaitMode to separate genuine Waiting off-CPU intervals from
+    // other off-CPU states and reports the priorities.
+    public string? WaitMode;
+    public int? NewPriority;
+    public int? OldPriority;
     public List<ulong>? Stack;
 }
 

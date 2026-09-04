@@ -55,6 +55,14 @@ LOGGER = logging.getLogger(__name__)
 _SIDECAR_STEM_TO_ATTR: dict[str, tuple[str, str]] = {
     "sampled_profile":   ("dumper_df",           "SampledProfile"),
     "cswitch_events":    ("cswitch_events_df",   "CSwitch"),
+    # ReadyThread is co-requested with CSwitch and is a dumper stem in
+    # trace_mgmt._DUMPER_EVENT_CLASSES, so it MUST be reclassified to
+    # ``dumper-parquet`` (materialize_on_load=False) in the final manifest —
+    # otherwise the native cache loader's _required_dumper_stems_for_mode
+    # check rejects the promoted cache ("readythread missing"). Binding here
+    # (instead of _SIDECAR_AUX_STEMS) sets trace.readythread_df +
+    # raw_csv["ReadyThread"] identically to the old aux path.
+    "readythread":       ("readythread_df",      "ReadyThread"),
     "tcpip_recv":        ("tcpip_recv_df",       "TcpIp/Recv"),
     "tcpip_send":        ("tcpip_send_df",       "TcpIp/Send"),
     "tcpip_retransmit":  ("tcpip_retransmit_df", "TcpIp/Retransmit"),
@@ -114,12 +122,6 @@ _SIDECAR_AUX_STEMS: dict[str, str] = {
     "image":      "Image/DCStart",
     "diskio":     "DiskIo/Read",
     "dpc_isr":    "PerfInfo/DPC",
-    # ReadyThread events feed both the cpu_timeline and the lock-contention
-    # aggregators. The sidecar emits an empty parquet today (the test
-    # fixture had no ReadyThread events) but the schema is correct; map
-    # it under the canonical native event-class name so any consumer that
-    # looks in raw_csv finds the (possibly empty) DataFrame.
-    "readythread": "ReadyThread",
 }
 
 
@@ -588,11 +590,6 @@ def _build_trace_from_staging(
             warnings.append(f"failed to read {stem}.parquet: {exc}")
             continue
         trace.raw_csv[canonical] = df
-        # Bind the readythread sidecar to its dedicated trace attribute so
-        # get_thread_cpu_precise (and other scheduler tools) can read it
-        # directly, mirroring how cswitch_events lands in cswitch_events_df.
-        if stem == "readythread":
-            trace.readythread_df = df
 
     # Phase B per-opcode parquets. These take precedence over the
     # combined-buffer parquets above: when present they carry the same
