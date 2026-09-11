@@ -15,17 +15,34 @@ Works with any Windows performance trace: networking (tcpip.sys, NDIS, NIC drive
 
 ### Quick Install
 
-The snippet below pins v0.6.0 — grab the latest wheel URL from <https://github.com/nijosmsft/etw-mcp/releases/latest> if you need a newer build. Install [uv](https://docs.astral.sh/uv/) (`winget install astral-sh.uv`) and the Windows Performance Toolkit (`winget install --id Microsoft.WindowsADK --override "/features OptionId.WindowsPerformanceToolkit /quiet"`), then drop the config below into your MCP client. The top-level key is `mcpServers` for Claude / Copilot CLI / Claude Desktop / Cursor and `servers` for VS Code — per-client config paths are spelled out in [Setup](#setup) below. The first `load_trace` call auto-downloads the matching .NET sidecar (~40 MB) into `%LOCALAPPDATA%\etw-mcp\sidecar\v0.6.0\` and pulls 200-500 MB of PDBs to `C:\symbols`; set `ETW_MCP_NO_AUTO_DOWNLOAD=1` to skip the sidecar fetch.
+This example pins v0.9.3. Install [uv](https://docs.astral.sh/uv/) and the Windows Performance Toolkit, then create a persistent, versioned environment once:
+
+```powershell
+winget install astral-sh.uv
+winget install --id Microsoft.WindowsADK --override "/features OptionId.WindowsPerformanceToolkit /quiet"
+
+$install = Join-Path $env:USERPROFILE 'MCP\etw-mcp-0.9.3'
+New-Item -ItemType Directory -Force -Path (Split-Path $install) | Out-Null
+uv venv --python 3.11 $install
+
+# Optional: use a private, corporate, or approved package mirror for dependencies.
+# $env:UV_INDEX_URL = 'https://your-package-index.example/simple'
+uv pip install --python "$install\Scripts\python.exe" 'https://github.com/nijosmsft/etw-mcp/releases/download/v0.9.3/etw_mcp-0.9.3-py3-none-any.whl'
+```
+
+When `UV_INDEX_URL` is unset, uv uses its default public package index. Setting it before `uv pip install` changes dependency resolution only; the etw-mcp wheel still comes from the explicit GitHub URL. Omit or unset it to use uv's default index. After installation, do not add `UV_INDEX_URL` to the MCP runtime config unless your environment independently requires it.
+
+A persistent environment is recommended because MCP clients impose initialization deadlines. `uv run --no-project --with <wheel> ...` is useful only for an ad hoc smoke test and is not recommended for MCP configuration; it may recreate or materialize the dependency environment at every server launch even when downloads are cached.
+
+Configure the client to launch the installed Python directly. JSON does not expand `%USERPROFILE%`; replace `YOURNAME` (or the entire command) with the actual absolute path. The top-level key is `mcpServers` for Claude Code, Claude Desktop, GitHub Copilot CLI, and Cursor, while VS Code uses `servers`; see [Setup](#setup) for paths. The symbol environment example is optional.
 
 ```json
 {
   "mcpServers": {
     "etw-trace-analyzer": {
       "type": "stdio",
-      "command": "uv",
-      "args": ["run", "--no-project", "--with",
-               "https://github.com/nijosmsft/etw-mcp/releases/download/v0.9.3/etw_mcp-0.9.3-py3-none-any.whl",
-               "python", "-m", "etw_analyzer.server"],
+      "command": "C:\\Users\\YOURNAME\\MCP\\etw-mcp-0.9.3\\Scripts\\python.exe",
+      "args": ["-m", "etw_analyzer.server"],
       "env": {
         "_NT_SYMBOL_PATH": "srv*C:\\symbols*https://msdl.microsoft.com/download/symbols"
       }
@@ -33,6 +50,8 @@ The snippet below pins v0.6.0 — grab the latest wheel URL from <https://github
   }
 }
 ```
+
+The first `load_trace` call separately auto-downloads the matching .NET sidecar (~40 MB) into `%LOCALAPPDATA%\etw-mcp\sidecar\v0.9.3\` and may pull 200-500 MB of PDBs to `C:\symbols`. This sidecar bootstrap is separate from Python dependency installation. Set `ETW_MCP_NO_AUTO_DOWNLOAD=1` to skip the sidecar fetch.
 
 ## Features
 
@@ -65,16 +84,42 @@ winget install --id Microsoft.WindowsADK --override "/features OptionId.WindowsP
                                          # NOTE: do NOT use Microsoft.WindowsSDK — it is not a valid winget package ID.
                                          # The --override flag installs just the ~150 MB WPT feature instead of the full ~5 GB ADK.
 
-# 2. Verify the latest release wheel starts (Ctrl+C to stop)
-uv run --no-project --with https://github.com/nijosmsft/etw-mcp/releases/download/v0.9.3/etw_mcp-0.9.3-py3-none-any.whl python -m etw_analyzer.server
+# 2. Create a persistent environment for v0.9.3
+$install = Join-Path $env:USERPROFILE 'MCP\etw-mcp-0.9.3'
+New-Item -ItemType Directory -Force -Path (Split-Path $install) | Out-Null
+uv venv --python 3.11 $install
+
+# 3. Optional: select a private, corporate, or approved dependency mirror
+# $env:UV_INDEX_URL = 'https://your-package-index.example/simple'
+
+# 4. Install the pinned release once
+uv pip install --python "$install\Scripts\python.exe" 'https://github.com/nijosmsft/etw-mcp/releases/download/v0.9.3/etw_mcp-0.9.3-py3-none-any.whl'
+
+# 5. Optional smoke test (Ctrl+C to stop)
+& "$install\Scripts\python.exe" -m etw_analyzer.server
 ```
 
-- **uv** automatically downloads Python, creates a virtual environment, and installs all dependencies on first run. No separate Python install needed.
-- **Release wheel** — use the `.whl` asset URL from the latest [GitHub release](https://github.com/nijosmsft/etw-mcp/releases). The examples use `<release-tag>` and `<wheel-file>` placeholders because the URL is only valid after a release is published. Maintainers can publish that asset with the manual **Manual release** GitHub Actions workflow.
-- **.NET sidecar (default; auto-bootstrapped)** — `etw-extract.exe` is a self-contained .NET binary (~40 MB, no .NET install required) that decodes ETL files faster than the in-process path and frees the Python process from holding the full event buffer. The wheel **auto-fetches the matching version** from the GitHub release on first use and caches it at `%LOCALAPPDATA%\etw-mcp\sidecar\v<wheel-version>\`. Set `ETW_MCP_NO_AUTO_DOWNLOAD=1` to disable the fetch (the server then falls back to the native consumer) or set `ETW_MCP_DOTNET_SIDECAR` to pin a manually-built binary. See [`dotnet/README.md`](dotnet/README.md) for build instructions and [`src/etw_analyzer/native/SIDECAR.md`](src/etw_analyzer/native/SIDECAR.md) for the supervisor plumbing.
+- **uv** downloads Python when needed and creates the requested virtual environment. No separate Python installation is required.
+- **Persistent environment** — MCP clients impose initialization deadlines. Installing dependencies once avoids per-launch environment materialization; point the client directly at `$install\Scripts\python.exe`.
+- **Custom dependency index** — when `UV_INDEX_URL` is unset, uv uses its default public package index. Environments that require a private, corporate, or approved mirror can set `$env:UV_INDEX_URL = 'https://your-package-index.example/simple'` before `uv pip install`. This affects dependency resolution only, not the explicit GitHub wheel URL. Omit or unset it for uv's default index, and do not put it in the completed install's MCP runtime config unless independently required.
+- **Release wheel** — v0.9.3 is pinned above. For another version, use the `.whl` asset URL from its [GitHub release](https://github.com/nijosmsft/etw-mcp/releases) and a separate versioned environment.
+- **.NET sidecar (default; auto-bootstrapped)** — `etw-extract.exe` is a self-contained .NET binary (~40 MB, no .NET install required) that decodes ETL files faster than the in-process path and frees the Python process from holding the full event buffer. On the first trace load, the wheel **auto-fetches the matching version** from the GitHub release and caches v0.9.3 at `%LOCALAPPDATA%\etw-mcp\sidecar\v0.9.3\`. This is separate from Python dependency installation. Set `ETW_MCP_NO_AUTO_DOWNLOAD=1` to disable the fetch (the server then falls back to the native consumer) or set `ETW_MCP_DOTNET_SIDECAR` to pin a manually-built binary. See [`dotnet/README.md`](dotnet/README.md) for build instructions and [`src/etw_analyzer/native/SIDECAR.md`](src/etw_analyzer/native/SIDECAR.md) for the supervisor plumbing.
 - **Native ETW consumer (fallback when sidecar is unavailable)** — the server decodes ETL files in-process via `OpenTraceW`/`tdh.dll`. This path is enough to start the MCP server and run the core native analysis tools on recent Windows builds and is the automatic fallback when auto-bootstrap is blocked.
 - **Kernel symbols need an MSFZ-capable dbghelp** — published Windows OS PDBs for kernel modules can be MSFZ-compressed. The inbox `C:\Windows\System32\dbghelp.dll` on 10.0.26100-era systems cannot read those PDBs; install Debugging Tools for Windows / WinDbg (known-good `dbghelp.dll` 10.0.29507+) and place `dbghelp.dll` + `symsrv.dll` in `C:\Debuggers`, or set `ETW_MCP_DBGHELP=<full path to dbghelp.dll>` and optionally `ETW_MCP_SYMSRV=<full path to symsrv.dll>`.
 - **xperf.exe / Windows Performance Toolkit** — installed as part of the Windows SDK. Recommended for complete results because it enables fallback extraction, richer WPA-derived stack views, xperf-only tools such as pool analysis, and older Windows builds where the native bindings can't load. Expected location: `C:\Program Files (x86)\Windows Kits\10\Windows Performance Toolkit\xperf.exe`
+
+### Upgrading
+
+Create a side-by-side environment for the new release rather than mutating an environment used by a running MCP server:
+
+```powershell
+$newInstall = Join-Path $env:USERPROFILE 'MCP\etw-mcp-NEW_VERSION'
+New-Item -ItemType Directory -Force -Path (Split-Path $newInstall) | Out-Null
+uv venv --python 3.11 $newInstall
+uv pip install --python "$newInstall\Scripts\python.exe" 'NEW_RELEASE_WHEEL_URL'
+```
+
+Update the MCP config's `command` to the new environment's `python.exe`, then restart the client. After no MCP config references v0.9.3, optionally remove only its old directory: `Remove-Item -LiteralPath (Join-Path $env:USERPROFILE 'MCP\etw-mcp-0.9.3') -Recurse -Force`.
 
 ## Setup
 
@@ -89,8 +134,8 @@ Add to your `.mcp.json` (project root or `~/.claude/.mcp.json`):
   "mcpServers": {
     "etw-trace-analyzer": {
       "type": "stdio",
-      "command": "uv",
-      "args": ["run", "--no-project", "--with", "https://github.com/nijosmsft/etw-mcp/releases/download/v0.9.3/etw_mcp-0.9.3-py3-none-any.whl", "python", "-m", "etw_analyzer.server"],
+      "command": "C:\\Users\\YOURNAME\\MCP\\etw-mcp-0.9.3\\Scripts\\python.exe",
+      "args": ["-m", "etw_analyzer.server"],
       "env": {
         "_NT_SYMBOL_PATH": "srv*C:\\symbols*https://msdl.microsoft.com/download/symbols"
       }
@@ -110,8 +155,8 @@ Add to `.vscode/mcp.json` (workspace) or `%APPDATA%\Code\User\mcp.json` (user-sc
   "servers": {
     "etw-trace-analyzer": {
       "type": "stdio",
-      "command": "uv",
-      "args": ["run", "--no-project", "--with", "https://github.com/nijosmsft/etw-mcp/releases/download/v0.9.3/etw_mcp-0.9.3-py3-none-any.whl", "python", "-m", "etw_analyzer.server"],
+      "command": "C:\\Users\\YOURNAME\\MCP\\etw-mcp-0.9.3\\Scripts\\python.exe",
+      "args": ["-m", "etw_analyzer.server"],
       "env": {
         "_NT_SYMBOL_PATH": "srv*C:\\symbols*https://msdl.microsoft.com/download/symbols"
       }
@@ -129,8 +174,8 @@ Add to `%APPDATA%\Claude\claude_desktop_config.json` (top-level key: `mcpServers
   "mcpServers": {
     "etw-trace-analyzer": {
       "type": "stdio",
-      "command": "uv",
-      "args": ["run", "--no-project", "--with", "https://github.com/nijosmsft/etw-mcp/releases/download/v0.9.3/etw_mcp-0.9.3-py3-none-any.whl", "python", "-m", "etw_analyzer.server"],
+      "command": "C:\\Users\\YOURNAME\\MCP\\etw-mcp-0.9.3\\Scripts\\python.exe",
+      "args": ["-m", "etw_analyzer.server"],
       "env": {
         "_NT_SYMBOL_PATH": "srv*C:\\symbols*https://msdl.microsoft.com/download/symbols"
       }
@@ -148,8 +193,8 @@ Add to `%USERPROFILE%\.copilot\mcp-config.json` (top-level key: `mcpServers`):
   "mcpServers": {
     "etw-trace-analyzer": {
       "type": "stdio",
-      "command": "uv",
-      "args": ["run", "--no-project", "--with", "https://github.com/nijosmsft/etw-mcp/releases/download/v0.9.3/etw_mcp-0.9.3-py3-none-any.whl", "python", "-m", "etw_analyzer.server"],
+      "command": "C:\\Users\\YOURNAME\\MCP\\etw-mcp-0.9.3\\Scripts\\python.exe",
+      "args": ["-m", "etw_analyzer.server"],
       "env": {
         "_NT_SYMBOL_PATH": "srv*C:\\symbols*https://msdl.microsoft.com/download/symbols"
       }
@@ -162,7 +207,7 @@ Add to `%USERPROFILE%\.copilot\mcp-config.json` (top-level key: `mcpServers`):
 
 Add to `.cursor/mcp.json` (project root) or `%USERPROFILE%\.cursor\mcp.json` (user-scoped). Top-level key: `mcpServers`. The JSON body is identical to the Claude Code example above.
 
-Replace the release URL in every example with the wheel asset from the release you want to run.
+In every JSON example, replace `YOURNAME` or the full `command` with the absolute path to the persistent environment's `python.exe`.
 
 ## Usage
 
@@ -414,10 +459,10 @@ The wheel auto-bootstraps the matching binary on first use, so most users don't 
 
 ```powershell
 # Option A — download the prebuilt asset
-New-Item -ItemType Directory -Force -Path "$env:LOCALAPPDATA\etw-mcp\sidecar\v0.6.0" | Out-Null
+New-Item -ItemType Directory -Force -Path "$env:LOCALAPPDATA\etw-mcp\sidecar\v0.9.3" | Out-Null
 Invoke-WebRequest `
   -Uri "https://github.com/nijosmsft/etw-mcp/releases/download/v0.9.3/etw-extract.exe" `
-  -OutFile "$env:LOCALAPPDATA\etw-mcp\sidecar\v0.6.0\etw-extract.exe"
+  -OutFile "$env:LOCALAPPDATA\etw-mcp\sidecar\v0.9.3\etw-extract.exe"
 
 # Option B — build from source (no .NET runtime required for the resulting binary; only for the build)
 cd <repo>\dotnet
