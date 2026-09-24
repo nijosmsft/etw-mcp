@@ -446,7 +446,7 @@ def _resolve_address_pairs(
                 label_to_pair[label] = pair
         else:
             pair = ("unknown", "")
-        if sources.get(addr) == "mismatched":
+        if sources.get(addr) in {"mismatched", "unknown"}:
             pair = (pair[0], "")
         if (not pair[0] or pair[0] == "unknown") and image_index is not None:
             module = image_index.module_for(addr)

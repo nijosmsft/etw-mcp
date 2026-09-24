@@ -121,7 +121,10 @@ def _resolve_deferred_instruction_pointers(
         module, function = _split_resolved_label(label)
         if module:
             module_map[addr] = module
-        if function and sources.get(addr) != "mismatched":
+        if function and sources.get(addr) not in {
+            "mismatched",
+            "unknown",
+        }:
             function_map[addr] = function
 
     if module_map:

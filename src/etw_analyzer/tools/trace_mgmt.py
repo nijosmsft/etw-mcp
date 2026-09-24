@@ -3973,6 +3973,58 @@ def _resolve_symbols_impl(
                 "falling back to the sample-based `check_symbols` report."
             )
             lines.append("")
+            if requested_modules:
+                registered_names: set[str] = set()
+                symbolizer_modules = getattr(symbolizer, "_modules", {}) or {}
+                for entry in symbolizer_modules.values():
+                    file_name = entry.get("FileName") or ""
+                    if file_name:
+                        registered_names.add(
+                            Path(str(file_name)).name.lower()
+                        )
+                for key in (
+                    "image",
+                    "Image/Load",
+                    "Image/DCStart",
+                    "Image/DCEnd",
+                ):
+                    image_df = trace.raw_csv.get(key)
+                    if (
+                        image_df is None
+                        or image_df.empty
+                        or "FileName" not in image_df.columns
+                    ):
+                        continue
+                    registered_names.update(
+                        Path(str(value)).name.lower()
+                        for value in image_df["FileName"].dropna()
+                    )
+
+                compatibility_rows = []
+                for requested in requested_modules:
+                    normalized = Path(requested).name.lower()
+                    registered = normalized in registered_names
+                    compatibility_rows.append({
+                        "Module": requested,
+                        "State": "UNVERIFIED" if registered else "UNRESOLVED",
+                        "Detail": (
+                            "Symbolizer cannot report loaded state"
+                            if registered
+                            else "Requested module is not registered in image rows"
+                        ),
+                    })
+                lines.append(
+                    format_table(
+                        pd.DataFrame(compatibility_rows),
+                        max_rows=50,
+                    )
+                )
+                lines.append("")
+                lines.append(
+                    "Requested-module resolution is incomplete because this "
+                    "symbolizer cannot prove that the modules are loaded."
+                )
+                lines.append("")
             try:
                 lines.append(check_symbols(trace_id, extra_symbol_paths))
             except Exception as e:

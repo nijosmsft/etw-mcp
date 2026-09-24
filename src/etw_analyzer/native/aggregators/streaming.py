@@ -198,7 +198,7 @@ class _AddressResolver:
             label = labels.get(addr, "")
             module, function = _split_resolved(label) if label else ("unknown", "")
             source = sources.get(addr, "" if label else "unknown")
-            if source == "mismatched":
+            if source in {"mismatched", "unknown"}:
                 function = ""
             if not module or module == "unknown":
                 module = self.image_index.module_for(addr)
