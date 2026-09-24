@@ -203,6 +203,10 @@ def aggregate_cpu_sampling(trace: "TraceData") -> Optional[pd.DataFrame]:
         symbol_source = pd.Series(["unknown"] * len(df), index=df.index)
     elif ip_to_source:
         symbol_source = df["InstructionPointer"].map(ip_to_source).fillna("unknown")
+        functions = functions.mask(
+            symbol_source.astype(str).str.lower() == "mismatched",
+            "",
+        )
     else:
         symbol_source = pd.Series([""] * len(df))
 

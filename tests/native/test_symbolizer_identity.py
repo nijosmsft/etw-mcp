@@ -137,6 +137,26 @@ _FAKE_FOUND_PDB = r"C:\symbols\ntkrnlmp.pdb\AFB1E3B137548BA73B92C060D6D5605F1\nt
 _SSRVOPT_GUIDPTR = 0x00000008
 
 
+def _mock_matching_pdb_identity(monkeypatch) -> None:
+    from etw_analyzer.native import symbolizer as symbolizer_mod
+    from etw_analyzer.native.pdb_identity import PdbIdentity
+
+    monkeypatch.setattr(
+        symbolizer_mod,
+        "classify_pdb_format",
+        lambda _path: "msf7",
+    )
+    monkeypatch.setattr(
+        symbolizer_mod,
+        "read_pdb_identity",
+        lambda _path: PdbIdentity(
+            guid=_NTOSKRNL_GUID.replace("-", ""),
+            age=_NTOSKRNL_AGE,
+            info_age=_NTOSKRNL_AGE,
+        ),
+    )
+
+
 def _ctypes_val(obj) -> int:
     """Return the Python int from a ctypes simple-type instance or plain int."""
     return obj.value if hasattr(obj, "value") else int(obj)
@@ -374,6 +394,7 @@ def test_k2_add_module_loads_from_found_pdb_path(monkeypatch):
 
     find_calls: list[dict[str, Any]] = []
     load_calls: list[dict[str, Any]] = []
+    _mock_matching_pdb_identity(monkeypatch)
 
     with Symbolizer() as sym:
         monkeypatch.setattr(
@@ -402,10 +423,8 @@ def test_k2_add_module_loads_from_found_pdb_path(monkeypatch):
     )
 
 
-def test_k2_add_module_fallback_when_guid_not_found(monkeypatch):
-    """K2: when SymFindFileInPathW returns not-found (returns 0), add_module
-    must fall back to SymLoadModuleExW with the original image path.
-    """
+def test_k2_add_module_does_not_load_wrong_image_when_guid_not_found(monkeypatch):
+    """A strict trace identity miss must not load an arbitrary local image."""
     from etw_analyzer.native.symbolizer import Symbolizer
 
     find_calls: list[dict[str, Any]] = []
@@ -431,13 +450,8 @@ def test_k2_add_module_fallback_when_guid_not_found(monkeypatch):
 
     # SymFindFileInPathW was attempted.
     assert len(find_calls) == 1
-    # Fell back to legacy load with the (normalized) image path, not the
-    # PDB path that was never found.
-    assert len(load_calls) == 1
-    loaded_path = load_calls[0]["image_name"]
-    assert "ntkrnlmp.pdb" not in (loaded_path or ""), (
-        f"Expected image path fallback, not PDB path; got {loaded_path!r}"
-    )
+    assert load_calls == []
+    assert sym._modules[_FAKE_BASE]["load_state"] == "not_found"
 
 
 def test_k2_add_module_no_guid_uses_legacy_path(monkeypatch):
@@ -483,6 +497,7 @@ def test_k2_identity_source_recorded_on_rsds_success(monkeypatch):
     """
     from etw_analyzer.native.symbolizer import Symbolizer
 
+    _mock_matching_pdb_identity(monkeypatch)
     with Symbolizer() as sym:
         monkeypatch.setattr(
             sym._dbghelp, "SymFindFileInPathW",
@@ -492,7 +507,15 @@ def test_k2_identity_source_recorded_on_rsds_success(monkeypatch):
             sym._dbghelp, "SymLoadModuleExW",
             _make_load_fake([]),
         )
-        monkeypatch.setattr(sym._dbghelp, "SymGetModuleInfoW64", lambda *a: 0)
+        monkeypatch.setattr(
+            sym,
+            "_loaded_module_identity",
+            lambda _base: (
+                sym._dbghelp.SymPdb,
+                _NTOSKRNL_GUID,
+                _NTOSKRNL_AGE,
+            ),
+        )
 
         sym.add_module(
             _FAKE_BASE, _FAKE_SIZE, _FAKE_IMAGE,
@@ -512,8 +535,8 @@ def test_k2_identity_source_recorded_on_rsds_success(monkeypatch):
         )
 
 
-def test_k2_identity_source_image_on_rsds_miss(monkeypatch):
-    """K2: when SymFindFileInPathW misses, identity_source must be 'image'."""
+def test_k2_identity_source_stays_deferred_on_rsds_miss(monkeypatch):
+    """An exact-identity miss remains unresolved instead of loading an image."""
     from etw_analyzer.native.symbolizer import Symbolizer
 
     with Symbolizer() as sym:
@@ -536,7 +559,8 @@ def test_k2_identity_source_image_on_rsds_miss(monkeypatch):
 
         entry = sym._modules.get(_FAKE_BASE)
         assert entry is not None
-        assert entry.get("identity_source") == "image"
+        assert entry.get("identity_source") == "deferred"
+        assert entry.get("load_state") == "not_found"
 
 
 # ---------------------------------------------------------------------------

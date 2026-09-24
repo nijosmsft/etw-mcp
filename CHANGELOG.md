@@ -4,6 +4,23 @@ All notable changes to etw-mcp are documented here. Format follows [Keep a Chang
 
 ## [Unreleased]
 
+### Fixed
+
+- PDB validation now uses the DBI/CodeView age (the same identity SymChk
+  reports as `PdbDbiAge`) instead of the independently versioned PDB
+  information-stream age. Diagnostics, strict disk checks, and lazy DbgHelp
+  loading share one canonical GUID + DBI-age parser and explicitly reject
+  malformed or legacy non-PDB7 identities.
+- Native symbol resolution now applies appended symbol paths to the live
+  DbgHelp session, retries prior misses, forces requested modules to load, and
+  reports unresolved modules instead of implying 100% success. Wrong-build PDB
+  function names are suppressed while module attribution and valid export
+  fallback remain available.
+- Logical-processor metadata now prefers positive ETL header counts and uses
+  the highest observed CPU ID only as a fallback lower bound. Streaming and
+  materialized outputs keep trace metadata, timelines, and per-CPU views
+  consistent.
+
 ## [0.9.3] - 2026-09-04
 
 ### Fixed
@@ -104,8 +121,10 @@ All notable changes to etw-mcp are documented here. Format follows [Keep a Chang
   - **#3:** New `MISMATCHED_PDB` status for wrong-GUID PDBs (tcpip.sys, afd.sys).
     `diagnose_symbol_load` is now folder-name aware so ntoskrnl.exe MSFZ folder
     match stays trusted. The two tools never disagree for the same module/trace.
-  - **#3 (secondary):** `read_pdb_signature` now reads the PDB Info Stream
-    (stream 1), not stream 0, fixing the GUID misread on normal PDBs.
+  - **#3 (secondary):** `read_pdb_signature` reads the PDB GUID from the Info
+    Stream (stream 1), not stream 0. Current releases pair that GUID with the
+    authoritative DBI stream age rather than the independently versioned Info
+    Stream age.
   - **#8:** `resolve_symbols` prefers the native in-process symbolizer and
     handles any `xperf` access-violation (`0xC0000005`) gracefully instead of
     crashing.

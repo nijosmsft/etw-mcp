@@ -24,6 +24,7 @@ from etw_analyzer.native.aggregators.dpcisr import (
 from etw_analyzer.native.aggregators.profile_detail import _split_resolved
 from etw_analyzer.native.aggregators.sysconfig import build_sysconfig_text
 from etw_analyzer.native.aggregators.tracestats import build_tracestats_text
+from etw_analyzer.native.processor_count import select_processor_count
 
 if TYPE_CHECKING:
     from etw_analyzer.native.event_store import NativeEventStore
@@ -196,10 +197,13 @@ class _AddressResolver:
         for addr in missing:
             label = labels.get(addr, "")
             module, function = _split_resolved(label) if label else ("unknown", "")
+            source = sources.get(addr, "" if label else "unknown")
+            if source == "mismatched":
+                function = ""
             if not module or module == "unknown":
                 module = self.image_index.module_for(addr)
             self._pairs[addr] = (module or "unknown", function or "")
-            self._sources[addr] = sources.get(addr, "" if label else "unknown")
+            self._sources[addr] = source
 
     def pair_for(self, address: int | None) -> tuple[str, str]:
         if address is None:
@@ -952,15 +956,33 @@ def _apply_store_metadata(
     if existing is not None and not existing.empty:
         _apply_existing_metadata(trace, existing)
 
+    eventtrace = trace.raw_csv.get("EventTrace/Header")
+    header_cpu = (
+        _metadata_value(eventtrace, "NumberOfProcessors")
+        if eventtrace is not None
+        else None
+    )
+    metadata_cpu = (
+        _metadata_value(existing, "NumberOfProcessors")
+        if existing is not None
+        else None
+    )
+    selected_cpu_count = select_processor_count(
+        authoritative_counts=[header_cpu],
+        fallback_counts=[metadata_cpu, trace.cpu_count],
+        observed_cpu_ids=(
+            [observed_max_cpu] if observed_max_cpu is not None else []
+        ),
+    )
+    if selected_cpu_count is not None:
+        trace.cpu_count = selected_cpu_count
+
     if trace.timestamp_frequency is None and store.timebase.perf_freq:
         trace.timestamp_frequency = float(store.timebase.perf_freq)
     if trace.duration_seconds is None:
         duration = _store_duration_seconds(store)
         if duration is not None and duration > 0:
             trace.duration_seconds = duration
-    if trace.cpu_count is None and observed_max_cpu is not None and observed_max_cpu >= 0:
-        trace.cpu_count = int(observed_max_cpu) + 1
-
     if existing is None or existing.empty:
         row: dict[str, Any] = {}
         if trace.cpu_count:
@@ -981,7 +1003,7 @@ def _apply_store_metadata(
         # Preserve the original metadata row, but fill common blanks so
         # cache reloads expose the values discovered during streaming.
         df = existing.copy()
-        if trace.cpu_count and "NumberOfProcessors" not in df.columns:
+        if trace.cpu_count:
             df["NumberOfProcessors"] = int(trace.cpu_count)
         if trace.duration_seconds and "DurationSeconds" not in df.columns:
             df["DurationSeconds"] = float(trace.duration_seconds)

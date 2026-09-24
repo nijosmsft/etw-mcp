@@ -32,6 +32,8 @@ from typing import TYPE_CHECKING, Optional
 
 import pandas as pd
 
+from etw_analyzer.native.processor_count import select_processor_count
+
 if TYPE_CHECKING:
     from etw_analyzer.trace_state import TraceData
 
@@ -172,36 +174,34 @@ def _timeline_metadata(
         if timestamp_origin is None:
             timestamp_origin = t_min
 
-    cpu_count = getattr(trace, "cpu_count", None)
-    if not cpu_count or cpu_count <= 0:
-        metadata_cpu_count = _extract_raw_csv_value(
-            trace,
-            "trace_metadata",
-            "NumberOfProcessors",
-        )
-        if metadata_cpu_count is not None:
-            cpu_count = int(metadata_cpu_count)
-    if (not cpu_count or cpu_count <= 0) and logfile_metadata:
-        cpu_counts = [
-            int(getattr(item, "number_of_processors", 0) or 0)
-            for item in logfile_metadata
-            if int(getattr(item, "number_of_processors", 0) or 0) > 0
-        ]
-        if cpu_counts:
-            cpu_count = max(cpu_counts)
-    if not cpu_count or cpu_count <= 0:
-        header_cpu_count = _extract_raw_csv_value(
-            trace,
-            "EventTrace/Header",
-            "NumberOfProcessors",
-        )
-        if header_cpu_count is not None:
-            cpu_count = int(header_cpu_count)
-    if not cpu_count or cpu_count <= 0:
-        cpu_vals = pd.to_numeric(cpus, errors="coerce").dropna()
-        if cpu_vals.empty:
-            return None
-        cpu_count = int(cpu_vals.max()) + 1
+    logfile_cpu_counts = [
+        getattr(item, "number_of_processors", None)
+        for item in logfile_metadata
+    ]
+    header_cpu_count = _extract_raw_csv_value(
+        trace,
+        "EventTrace/Header",
+        "NumberOfProcessors",
+    )
+    metadata_cpu_count = _extract_raw_csv_value(
+        trace,
+        "trace_metadata",
+        "NumberOfProcessors",
+    )
+    cpu_vals = pd.to_numeric(cpus, errors="coerce").dropna()
+    cpu_count = select_processor_count(
+        authoritative_counts=[
+            header_cpu_count,
+            *logfile_cpu_counts,
+        ],
+        fallback_counts=[
+            metadata_cpu_count,
+            getattr(trace, "cpu_count", None),
+        ],
+        observed_cpu_ids=cpu_vals.tolist(),
+    )
+    if cpu_count is None:
+        return None
 
     return _TimelineMetadata(
         duration_s=float(duration_s),

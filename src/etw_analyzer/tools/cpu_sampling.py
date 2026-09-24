@@ -12,6 +12,7 @@ from etw_analyzer.tools._symbol_annotation import (
 )
 
 import re
+from pathlib import Path
 
 import pandas as pd
 
@@ -120,7 +121,7 @@ def _resolve_deferred_instruction_pointers(
         module, function = _split_resolved_label(label)
         if module:
             module_map[addr] = module
-        if function:
+        if function and sources.get(addr) != "mismatched":
             function_map[addr] = function
 
     if module_map:
@@ -179,6 +180,60 @@ def _load_raw_samples(trace: TraceData) -> pd.DataFrame | None:
     if df is None or df.empty or "InstructionPointer" not in df.columns:
         return None
     return df
+
+
+def _attribute_modules_from_ranges(
+    trace: TraceData,
+    df: pd.DataFrame,
+) -> pd.DataFrame:
+    """Add module names from registered image ranges without loading PDBs."""
+
+    if "InstructionPointer" not in df.columns:
+        return df
+    symbolizer = getattr(trace, "symbolizer", None)
+    if symbolizer is None:
+        return df
+    resolver = getattr(symbolizer, "module_for_address", None)
+    if resolver is None:
+        private_resolver = getattr(
+            symbolizer, "_find_module_for_address", None
+        )
+        if private_resolver is None:
+            return df
+
+        def resolver(address):
+            entry = private_resolver(address)
+            if isinstance(entry, dict):
+                file_name = entry.get("FileName") or ""
+                return Path(str(file_name)).name if file_name else "unknown"
+            if entry:
+                return Path(str(entry)).name
+            return "unknown"
+
+    out = df.copy()
+    unique_ips = [
+        int(value)
+        for value in out["InstructionPointer"].dropna().unique()
+        if int(value)
+    ]
+    module_map = {address: resolver(address) for address in unique_ips}
+    ip_values = out["InstructionPointer"].map(
+        lambda value: int(value) if pd.notna(value) else 0
+    )
+    attributed = ip_values.map(module_map).fillna("unknown").astype(str)
+    if "Module" in out.columns:
+        existing = out["Module"].fillna("").astype(str)
+        out["Module"] = attributed.where(
+            attributed.str.lower() != "unknown",
+            existing,
+        )
+    else:
+        out["Module"] = attributed
+    if "Function" not in out.columns:
+        out["Function"] = ""
+    if "SymbolSource" not in out.columns:
+        out["SymbolSource"] = "unknown"
+    return out
 
 
 def _resolved_samples(trace: TraceData) -> pd.DataFrame | None:
@@ -506,6 +561,13 @@ def get_hot_functions(
     """
     trace = require_trace(trace_id)
 
+    if modules and modules.strip().lower() == "all":
+        target_modules = None
+    elif modules:
+        target_modules = [m.strip() for m in modules.split(",") if m.strip()]
+    else:
+        target_modules = _DEFAULT_HOT_MODULES
+
     if cpu_filter:
         df = _get_per_cpu_sampling_df(trace, cpu_filter, start_time, end_time)
         if df.empty:
@@ -528,12 +590,41 @@ def get_hot_functions(
         # symbolizer / raw samples exist (e.g. xperf mode) or when functions
         # were already resolved at load time.
         if _function_col_all_empty(df, function_col):
-            resolved = _resolved_samples(trace)
-            if resolved is not None:
-                df = resolved
-                weight_col, module_col, function_col = "Weight", "Module", "Function"
-                cpu_col = _find_col(df, ["CPU", "Cpu"]) or "CPU"
-                time_col = _find_col(df, ["TimeStamp", "Time"]) or "TimeStamp"
+            if target_modules is not None:
+                raw = _load_raw_samples(trace)
+                attributed = (
+                    _attribute_modules_from_ranges(trace, raw)
+                    if raw is not None
+                    else None
+                )
+                has_attribution = (
+                    attributed is not None
+                    and "Module" in attributed.columns
+                    and attributed["Module"].astype(str).str.strip().str.lower()
+                    .replace({"": "unknown", "nan": "unknown"})
+                    .ne("unknown")
+                    .any()
+                )
+                if has_attribution:
+                    df = attributed
+                    weight_col, module_col, function_col = (
+                        "Weight", "Module", "Function",
+                    )
+                    cpu_col = _find_col(df, ["CPU", "Cpu"]) or "CPU"
+                    time_col = _find_col(
+                        df, ["TimeStamp", "TimeStampQpc", "Time"]
+                    ) or "TimeStamp"
+            else:
+                resolved = _resolved_samples(trace)
+                if resolved is not None:
+                    df = resolved
+                    weight_col, module_col, function_col = (
+                        "Weight", "Module", "Function",
+                    )
+                    cpu_col = _find_col(df, ["CPU", "Cpu"]) or "CPU"
+                    time_col = _find_col(
+                        df, ["TimeStamp", "TimeStampQpc", "Time"]
+                    ) or "TimeStamp"
 
         # Apply time/CPU filters
         df = apply_filters(
@@ -544,14 +635,6 @@ def get_hot_functions(
 
     if df.empty:
         return "*No samples match the specified filters.*"
-
-    # Resolve module filter list
-    if modules and modules.strip().lower() == "all":
-        target_modules = None  # No filtering
-    elif modules:
-        target_modules = [m.strip() for m in modules.split(",") if m.strip()]
-    else:
-        target_modules = _DEFAULT_HOT_MODULES
 
     # Filter to target modules
     if target_modules and module_col in df.columns:
