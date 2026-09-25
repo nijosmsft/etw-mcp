@@ -41,6 +41,13 @@ from ctypes import wintypes
 from pathlib import Path
 from typing import Iterable, Optional
 
+from etw_analyzer.native.pdb_identity import (
+    PdbIdentityError,
+    UnsupportedPdbFormatError,
+    classify_pdb_format,
+    read_pdb_identity,
+)
+
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +86,12 @@ def resolve_symbol_path(symbol_path: Optional[str]) -> str:
     if env:
         return env
     return _DEFAULT_SYMBOL_PATH
+
+
+def _symbol_path_entries(symbol_path: str) -> list[str]:
+    """Return ordered, non-empty entries from a Windows symbol path."""
+
+    return [entry.strip() for entry in symbol_path.split(";") if entry.strip()]
 
 
 def is_available() -> bool:
@@ -307,6 +320,8 @@ class Symbolizer:
             # The function name is from the WRONG build and must not be
             # counted as a trustworthy "From PDB" hit (#3).
             source = "mismatched"
+            rva = address - int(module_entry["ImageBase"])
+            label = f"{module_label}+0x{rva:x}"
         else:
             source = "pdb"
         return (label, source)
@@ -396,9 +411,9 @@ class Symbolizer:
         trace cannot block on one remote PDB lookup per image. The first
         symbol query for an address in a module calls this method while
         holding ``self._lock``. It performs the same exact-GUID RSDS lookup
-        that the eager M3 path used, then falls back to the legacy local-image
-        load when identity is absent or lookup misses. A module is attempted
-        at most once per Symbolizer instance.
+        that the eager M3 path used. Local-image/export fallback is allowed
+        only when the trace carried no strict RSDS identity. A module is
+        attempted at most once per symbol path.
         """
 
         module = self._modules.get(image_base)
@@ -406,6 +421,8 @@ class Symbolizer:
             return
 
         module["pdb_load_attempted"] = True
+        module["load_error"] = None
+        module["load_state"] = "loading"
         self._ensure_init()
         d = self._dbghelp
 
@@ -420,21 +437,85 @@ class Symbolizer:
                 from .bindings.types import guid_from_string
 
                 guid = guid_from_string(str(pdb_guid))
-                found_buf = ctypes.create_unicode_buffer(1024)
-                ok = d.SymFindFileInPathW(
-                    self._handle,
-                    None,           # use search path from SymInitializeW
-                    str(pdb_name),
-                    ctypes.cast(ctypes.pointer(guid), ctypes.c_void_p),
-                    wintypes.DWORD(int(pdb_age or 0)),
-                    wintypes.DWORD(0),
-                    wintypes.DWORD(d.SSRVOPT_GUIDPTR),
-                    found_buf,
-                    None,
-                    None,
-                )
-                if ok and found_buf.value:
-                    found_pdb_path = found_buf.value
+                found_pdb_path = None
+                candidate_identity_verified = False
+                candidate_identity = None
+                candidate_format = "unknown"
+                mismatches: list[str] = []
+                invalid_candidates: list[str] = []
+                search_errors: list[str] = []
+                last_error = 0
+
+                # Query each symbol-path entry independently. DbgHelp can return
+                # a stale basename match from an earlier cache even when a later
+                # entry contains the exact GUID+Age PDB. Verify every result and
+                # keep searching until an exact identity is found.
+                for search_path in _symbol_path_entries(self._symbol_path):
+                    found_buf = ctypes.create_unicode_buffer(1024)
+                    ctypes.set_last_error(0)
+                    try:
+                        ok = d.SymFindFileInPathW(
+                            self._handle,
+                            search_path,
+                            str(pdb_name),
+                            ctypes.cast(ctypes.pointer(guid), ctypes.c_void_p),
+                            wintypes.DWORD(int(pdb_age or 0)),
+                            wintypes.DWORD(0),
+                            wintypes.DWORD(d.SSRVOPT_GUIDPTR),
+                            found_buf,
+                            None,
+                            None,
+                        )
+                    except OSError as exc:
+                        search_errors.append(f"{search_path}: {exc}")
+                        continue
+                    last_error = ctypes.get_last_error()
+                    if not ok or not found_buf.value:
+                        continue
+
+                    candidate_path = Path(found_buf.value)
+                    candidate_format = classify_pdb_format(candidate_path)
+                    try:
+                        identity = read_pdb_identity(candidate_path)
+                    except UnsupportedPdbFormatError as exc:
+                        if candidate_format == "msfz":
+                            found_pdb_path = str(candidate_path)
+                            candidate_identity = None
+                            break
+                        invalid_candidates.append(
+                            f"{candidate_path}: {exc}"
+                        )
+                        continue
+                    except PdbIdentityError as exc:
+                        invalid_candidates.append(
+                            f"{candidate_path}: {exc}"
+                        )
+                        continue
+                    else:
+                        identity_matches = (
+                            _guids_equal(
+                                str(pdb_guid),
+                                identity.guid,
+                            )
+                            and pdb_age is not None
+                            and int(pdb_age) == identity.age
+                        )
+                        if not identity_matches:
+                            module["candidate_pdb_path"] = str(candidate_path)
+                            mismatches.append(
+                                f"{candidate_path}: GUID={identity.guid}, "
+                                f"DBI age={identity.age}"
+                            )
+                            continue
+                        found_pdb_path = str(candidate_path)
+                        candidate_identity = identity
+                        candidate_identity_verified = True
+                        module["candidate_info_age"] = identity.info_age
+                        module["candidate_dbi_age"] = identity.age
+                        break
+
+                if found_pdb_path:
+                    module["candidate_pdb_path"] = found_pdb_path
                     logger.debug(
                         "SymFindFileInPathW found %s -> %s",
                         pdb_name, found_pdb_path,
@@ -451,44 +532,174 @@ class Symbolizer:
                     )
                     if loaded:
                         module["DbgHelpPath"] = found_pdb_path
-                        module["identity_source"] = "rsds"
-                        module["pdb_loaded"] = True
                     else:
                         err = ctypes.get_last_error()
+                        module["load_state"] = "not_loaded"
+                        module["load_error"] = (
+                            f"SymLoadModuleExW failed for exact PDB "
+                            f"(GetLastError={err})"
+                        )
                         if err != 0:
                             logger.debug(
                                 "SymLoadModuleExW(rsds) failed for %s @ 0x%x: err=%d",
                                 found_pdb_path, image_base, err,
                             )
 
-                    mi = self._IMAGEHLP_MODULEW64()
-                    mi.SizeOfStruct = ctypes.sizeof(self._IMAGEHLP_MODULEW64)
-                    if d.SymGetModuleInfoW64(
-                        self._handle,
-                        ctypes.c_ulonglong(image_base),
-                        ctypes.byref(mi),
-                    ):
-                        if mi.SymType == d.SymExport:
-                            logger.warning(
-                                "RSDS load did not yield PDB symbols for %s "
-                                "@ 0x%x (SymType=SymExport after rsds load); "
-                                "GUID=%s age=%s",
-                                pdb_name, image_base, pdb_guid, pdb_age,
+                    info = self._loaded_module_identity(image_base)
+                    if info is not None and info[0] == d.SymDeferred:
+                        # SYMOPT_DEFERRED_LOADS postpones PDB validation until
+                        # the first address lookup. Trigger one probe, then
+                        # re-read the module identity before trusting it.
+                        probe_rva = min(
+                            0x1000,
+                            max(0, image_size - 1),
+                        )
+                        _ = self._resolve_one(image_base + probe_rva)
+                        module["pdb_match"] = None
+                        info = self._loaded_module_identity(image_base)
+                    if info is not None:
+                        sym_type, loaded_guid, loaded_age = info
+                        guid_ok = (
+                            loaded_guid is not None
+                            and _guids_equal(str(pdb_guid), loaded_guid)
+                        )
+                        age_ok = (
+                            pdb_age is not None
+                            and int(pdb_age) == int(loaded_age)
+                        )
+                        dbghelp_identity_verified = guid_ok and age_ok
+                        exact_msfz_lookup = (
+                            candidate_format == "msfz"
+                            and sym_type == d.SymPdb
+                        )
+                        if (
+                            sym_type == d.SymPdb
+                            and (
+                                candidate_identity_verified
+                                or dbghelp_identity_verified
+                                or exact_msfz_lookup
                             )
+                        ):
+                            module["identity_source"] = "rsds"
+                            module["pdb_loaded"] = True
+                            module["pdb_match"] = True
+                            module["load_state"] = "pdb"
+                            module["loaded_pdb_guid"] = (
+                                loaded_guid
+                                or (
+                                    candidate_identity.guid
+                                    if candidate_identity is not None
+                                    else str(pdb_guid)
+                                )
+                            )
+                            module["loaded_pdb_age"] = (
+                                int(loaded_age)
+                                if int(loaded_age) > 0
+                                else (
+                                    candidate_identity.age
+                                    if candidate_identity is not None
+                                    else int(pdb_age)
+                                )
+                            )
+                            return
+
+                        module["loaded_pdb_guid"] = loaded_guid
+                        module["loaded_pdb_age"] = int(loaded_age)
+                        module["load_state"] = (
+                            "rejected_export"
+                            if sym_type == d.SymExport
+                            else "mismatched"
+                        )
+                        module["load_error"] = (
+                            "DbgHelp did not load the exact trace PDB "
+                            f"(SymType={sym_type}, loaded GUID={loaded_guid}, "
+                            f"loaded age={loaded_age})"
+                        )
+                        module["pdb_match"] = False
+                        if loaded:
+                            try:
+                                d.SymUnloadModule64(
+                                    self._handle,
+                                    ctypes.c_ulonglong(image_base),
+                                )
+                            except OSError:
+                                pass
+                        logger.warning(
+                            "Rejected non-matching symbol load for %s @ 0x%x: "
+                            "trace GUID=%s age=%s, loaded GUID=%s age=%s, "
+                            "SymType=%s",
+                            pdb_name,
+                            image_base,
+                            pdb_guid,
+                            pdb_age,
+                            loaded_guid,
+                            loaded_age,
+                            sym_type,
+                        )
+                    elif loaded:
+                        module["load_state"] = "not_loaded"
+                        module["load_error"] = (
+                            "SymLoadModuleExW returned success but "
+                            "SymGetModuleInfoW64 found no loaded module"
+                        )
+                        try:
+                            d.SymUnloadModule64(
+                                self._handle,
+                                ctypes.c_ulonglong(image_base),
+                            )
+                        except OSError:
+                            pass
                     return
 
-                err = ctypes.get_last_error()
+                if mismatches:
+                    module["load_state"] = "mismatched"
+                    module["load_error"] = (
+                        "Candidate PDBs did not match trace RSDS identity: "
+                        + "; ".join(mismatches)
+                    )
+                elif invalid_candidates:
+                    module["load_state"] = "invalid"
+                    module["load_error"] = (
+                        "Candidate PDB identities are invalid: "
+                        + "; ".join(invalid_candidates)
+                    )
+                else:
+                    module["load_state"] = "not_found"
+                    module["load_error"] = (
+                        f"No exact PDB found for GUID={pdb_guid} age={pdb_age} "
+                        f"(GetLastError={last_error})"
+                    )
+                    if search_errors:
+                        module["load_error"] += (
+                            "; inaccessible symbol path entries: "
+                            + "; ".join(search_errors)
+                        )
                 logger.debug(
-                    "SymFindFileInPathW miss for %s GUID=%s age=%s err=%d; "
-                    "falling back to local image",
-                    pdb_name, pdb_guid, pdb_age, err,
+                    "SymFindFileInPathW miss for %s GUID=%s age=%s err=%d",
+                    pdb_name, pdb_guid, pdb_age, last_error,
                 )
             except Exception as exc:
+                module["load_state"] = "error"
+                module["load_error"] = (
+                    f"Exact PDB lookup failed: {type(exc).__name__}: {exc}"
+                )
                 logger.debug(
-                    "RSDS identity load error for GUID=%s pdb=%s: %s; "
-                    "falling back to local image",
+                    "RSDS identity load error for GUID=%s pdb=%s: %s",
                     pdb_guid, pdb_name, exc,
                 )
+
+        if pdb_guid:
+            # A captured RSDS identity is authoritative. Loading an arbitrary
+            # analyst-machine image after an exact lookup miss can return
+            # wrong-build PDB names or wrong-build exports. Keep module-level
+            # attribution, but leave the function unresolved.
+            if not module.get("load_error"):
+                module["load_state"] = "not_found"
+                module["load_error"] = (
+                    "Trace carries a strict PDB identity but no exact PDB "
+                    "could be loaded"
+                )
+            return
 
         loaded = d.SymLoadModuleExW(
             self._handle,
@@ -503,8 +714,19 @@ class Symbolizer:
         if loaded:
             module["identity_source"] = "image"
             module["pdb_loaded"] = True
+            info = self._loaded_module_identity(image_base)
+            if info is not None and info[0] == d.SymExport:
+                module["load_state"] = "export"
+            elif info is not None and info[0] == d.SymPdb:
+                module["load_state"] = "pdb_unverified"
+            else:
+                module["load_state"] = "image"
         else:
             err = ctypes.get_last_error()
+            module["load_state"] = "not_loaded"
+            module["load_error"] = (
+                f"SymLoadModuleExW failed for image (GetLastError={err})"
+            )
             if err != 0:
                 logger.debug(
                     "SymLoadModuleExW failed for %s @ 0x%x: err=%d",
@@ -526,9 +748,9 @@ class Symbolizer:
 
         The method records the module range and any RSDS PDB identity from
         the trace but does not call ``SymFindFileInPathW`` or
-        ``SymLoadModuleExW``. Exact-GUID lookup and legacy local-image
-        fallback happen lazily in ``_ensure_pdb_loaded`` on first resolve
-        for an address inside this module.
+        ``SymLoadModuleExW``. Exact-GUID lookup (or identity-less legacy
+        image/export fallback) happens lazily in ``_ensure_pdb_loaded`` on
+        first resolve for an address inside this module.
 
         Idempotent: re-registering the same base updates the recorded size,
         path, and any newly discovered identity, but preserves the lazy-load
@@ -553,18 +775,152 @@ class Symbolizer:
                 "identity_source": "deferred",
                 "pdb_load_attempted": False,
                 "pdb_loaded": False,
+                "pdb_match": None,
+                "load_state": "deferred",
+                "load_error": None,
             }
             if existing is not None:
-                entry["DbgHelpPath"] = existing.get("DbgHelpPath", path_for_dbghelp)
-                entry["identity_source"] = existing.get("identity_source", "deferred")
-                entry["pdb_load_attempted"] = existing.get("pdb_load_attempted", False)
-                entry["pdb_loaded"] = existing.get("pdb_loaded", False)
-                for key in ("PdbGuid", "PdbAge", "PdbName", "TimeDateStamp"):
-                    if entry.get(key) is None:
-                        entry[key] = existing.get(key)
+                existing_guid = existing.get("PdbGuid")
+                entry_guid = entry.get("PdbGuid")
+                same_guid = (
+                    (not existing_guid and not entry_guid)
+                    or _guids_equal(existing_guid, entry_guid)
+                )
+                same_module = (
+                    str(existing.get("FileName") or "").lower()
+                    == str(file_path or "").lower()
+                    and same_guid
+                    and existing.get("PdbAge") == entry.get("PdbAge")
+                )
+                if same_module:
+                    for key in (
+                        "DbgHelpPath",
+                        "identity_source",
+                        "pdb_load_attempted",
+                        "pdb_loaded",
+                        "pdb_match",
+                        "load_state",
+                        "load_error",
+                        "candidate_pdb_path",
+                        "loaded_pdb_guid",
+                        "loaded_pdb_age",
+                    ):
+                        if key in existing:
+                            entry[key] = existing[key]
+                    for key in ("PdbGuid", "PdbAge", "PdbName", "TimeDateStamp"):
+                        if entry.get(key) is None:
+                            entry[key] = existing.get(key)
+                elif self._initialized and existing.get("pdb_load_attempted"):
+                    try:
+                        self._dbghelp.SymUnloadModule64(
+                            self._handle,
+                            ctypes.c_ulonglong(image_base),
+                        )
+                    except OSError:
+                        pass
+                    self._cache.clear()
+                    self._source_cache.clear()
 
             self._modules[image_base] = entry
             self._rebuild_index()
+
+    def module_for_address(self, address: int) -> str:
+        """Return registered module attribution without loading symbols."""
+
+        with self._lock:
+            module = self._find_module_for_address(int(address))
+            return _module_label(module) if module is not None else "unknown"
+
+    def set_symbol_path(
+        self,
+        symbol_path: str,
+        *,
+        retry_failed: bool = True,
+    ) -> bool:
+        """Update DbgHelp's path and reset failed state.
+
+        Returns ``True`` when cached resolution state was invalidated.
+        """
+
+        if not symbol_path:
+            return False
+        with self._lock:
+            path_changed = symbol_path != self._symbol_path
+            invalidated = path_changed
+            self._symbol_path = symbol_path
+            if self._initialized and path_changed:
+                ok = self._dbghelp.SymSetSearchPathW(
+                    self._handle, self._symbol_path
+                )
+                if not ok:
+                    raise SymbolizerError(
+                        "SymSetSearchPathW failed: "
+                        f"GetLastError={ctypes.get_last_error()}"
+                    )
+            if retry_failed:
+                for base, module in self._modules.items():
+                    if module.get("load_state") == "pdb":
+                        continue
+                    if self._initialized and module.get("pdb_load_attempted"):
+                        invalidated = True
+                        try:
+                            self._dbghelp.SymUnloadModule64(
+                                self._handle,
+                                ctypes.c_ulonglong(base),
+                            )
+                        except OSError:
+                            pass
+                    module["pdb_load_attempted"] = False
+                    module["pdb_loaded"] = False
+                    module["pdb_match"] = None
+                    module["identity_source"] = "deferred"
+                    module["load_state"] = "deferred"
+                    module["load_error"] = None
+                self._cache.clear()
+                self._source_cache.clear()
+            return invalidated
+
+    def ensure_modules_loaded(
+        self,
+        module_names: Iterable[str] | None = None,
+    ) -> list[dict]:
+        """Force lazy loading and return honest per-module load states."""
+
+        wanted = {
+            Path(str(name)).name.lower()
+            for name in (module_names or [])
+            if str(name).strip()
+        }
+        with self._lock:
+            bases = [
+                base
+                for base, module in self._modules.items()
+                if not wanted or _module_label(module).lower() in wanted
+            ]
+            for base in bases:
+                self._ensure_pdb_loaded(base)
+            return [
+                self._module_status(self._modules[base])
+                for base in bases
+            ]
+
+    def _module_status(self, module: dict) -> dict:
+        return {
+            "module": _module_label(module),
+            "base": int(module.get("ImageBase", 0) or 0),
+            "state": str(module.get("load_state") or "deferred"),
+            "pdb_loaded": bool(module.get("pdb_loaded")),
+            "trace_guid": module.get("PdbGuid"),
+            "trace_age": module.get("PdbAge"),
+            "pdb_name": module.get("PdbName"),
+            "loaded_guid": module.get("loaded_pdb_guid"),
+            "loaded_age": module.get("loaded_pdb_age"),
+            "path": (
+                module.get("candidate_pdb_path")
+                or module.get("DbgHelpPath")
+            ),
+            "error": module.get("load_error"),
+        }
 
     def resolve(self, address: int) -> str:
         """Resolve a single address.
@@ -705,6 +1061,11 @@ class Symbolizer:
             self._initialized = False
 
     # -- diagnostics ---------------------------------------------------
+    def is_available(self) -> bool:
+        """Whether this instance can service DbgHelp requests."""
+
+        return not self._closed
+
     def module_count(self) -> int:
         """Number of modules currently registered."""
 

@@ -78,11 +78,11 @@ def test_cached_native_metadata_is_authoritative():
     assert trace.timestamp_frequency == 10_000_000.0
 
 
-def test_native_without_header_does_not_infer_from_sparse_events():
+def test_native_without_header_uses_observed_cpu_lower_bound():
     observed = pd.DataFrame({"CPU": [0, 5], "TimeStamp": [100, 200]})
     trace = _trace({"SampledProfile": observed})
 
     _populate_metadata(trace)
 
-    assert trace.cpu_count is None
+    assert trace.cpu_count == 6
     assert trace.duration_seconds is None

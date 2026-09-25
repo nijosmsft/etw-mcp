@@ -398,11 +398,23 @@ def _resolve_address_pairs(
         return {}
 
     labels: dict[int, str] = {}
+    sources: dict[int, str] = {}
     symbolizer = getattr(trace, "symbolizer", None)
     if symbolizer is not None and not bool(getattr(trace, "_defer_symbolization", False)):
         to_symbolize = unique[:max_symbol_addresses]
         try:
-            labels = symbolizer.bulk_resolve(to_symbolize)
+            if hasattr(symbolizer, "bulk_resolve_with_source"):
+                resolved = symbolizer.bulk_resolve_with_source(to_symbolize)
+                labels = {
+                    address: value[0]
+                    for address, value in resolved.items()
+                }
+                sources = {
+                    address: value[1]
+                    for address, value in resolved.items()
+                }
+            else:
+                labels = symbolizer.bulk_resolve(to_symbolize)
         except Exception as exc:
             # The symbolizer raised while resolving stack frame addresses
             # (e.g. a dbghelp fault). Don't silently produce an all-unknown
@@ -434,6 +446,8 @@ def _resolve_address_pairs(
                 label_to_pair[label] = pair
         else:
             pair = ("unknown", "")
+        if sources.get(addr) in {"mismatched", "unknown"}:
+            pair = (pair[0], "")
         if (not pair[0] or pair[0] == "unknown") and image_index is not None:
             module = image_index.module_for(addr)
             if module and module != "unknown":

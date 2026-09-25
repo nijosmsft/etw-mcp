@@ -368,6 +368,11 @@ SymUnloadModule64.argtypes = [wintypes.HANDLE, ctypes.c_ulonglong]
 SymUnloadModule64.restype = wintypes.BOOL
 
 
+SymSetSearchPathW = _dbghelp.SymSetSearchPathW
+SymSetSearchPathW.argtypes = [wintypes.HANDLE, wintypes.LPCWSTR]
+SymSetSearchPathW.restype = wintypes.BOOL
+
+
 # ``SymFromAddrW(hProcess, Address, Displacement, Symbol)`` → BOOL
 #
 # ``Symbol`` points at an over-allocated SYMBOL_INFOW buffer whose
@@ -491,6 +496,7 @@ __all__ = [
     "SymGetOptions",
     "SymLoadModuleExW",
     "SymUnloadModule64",
+    "SymSetSearchPathW",
     "SymFromAddrW",
     "SymGetModuleInfoW64",
     "SymFindFileInPathW",

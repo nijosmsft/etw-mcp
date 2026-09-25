@@ -68,6 +68,17 @@ class _FakeSymbolizer:
         return out
 
 
+class _MismatchedSymbolizer(_FakeSymbolizer):
+    def bulk_resolve_with_source(self, addrs):
+        return {
+            int(address): (
+                f"tcpip.sys!ImplausibleWrongBuildName+0x10",
+                "mismatched",
+            )
+            for address in addrs
+        }
+
+
 def _raw_samples() -> pd.DataFrame:
     # 5 samples in UdpSend range, 3 in UdpRecv range, 2 outside (unknown).
     ips = [_BASE + 0x100] * 5 + [_BASE + 0x9000] * 3 + [0x1234] * 2
@@ -147,6 +158,22 @@ def test_resolver_creates_module_column_for_native_schema(tmp_path: Path):
     assert (out["Module"] == "tcpip.sys").sum() == 8  # 5 + 3 resolved
     assert "UdpSend" in set(out["Function"])
     assert "UdpRecv" in set(out["Function"])
+
+
+def test_mismatched_symbols_keep_module_but_hide_function(tmp_path: Path):
+    trace = _make_trace(tmp_path, with_symbolizer=False, raw_on_disk=False)
+    trace.symbolizer = _MismatchedSymbolizer()
+
+    out = cs._resolve_deferred_instruction_pointers(
+        trace,
+        _raw_samples_native_schema(),
+        module_col="Module",
+        function_col="Function",
+    )
+
+    assert set(out["Module"]) == {"tcpip.sys"}
+    assert not out["Function"].astype(str).str.strip().any()
+    assert set(out["SymbolSource"]) == {"mismatched"}
 
 
 def test_get_hot_functions_module_filter_applies_native_schema(tmp_path: Path):

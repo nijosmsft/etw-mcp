@@ -4,7 +4,7 @@ Covers the GitHub issues fixed together in this PR:
 
 - #3  check_symbols must NOT count a wrong-GUID PDB as From-PDB/OK; it gets a
       distinct ``MISMATCHED_PDB`` status. ``read_pdb_signature`` must read the
-      PDB Info Stream (stream 1), not stream 0 (which yields a garbage GUID).
+      GUID from PDB Info Stream (stream 1) and the age from DBI stream 3.
 - #8  resolve_symbols must prefer the native in-process symbolizer and fail
       gracefully when the external xperf symcache builder crashes (0xC0000005).
 - #15 / #19  check_symbols must NOT report MISSING/0% for dotnet pre-symbolized
@@ -58,6 +58,35 @@ def _register_trace_with_cpu_df(
         trace.symbolizer = symbolizer
     register_trace(trace)
     return trace
+
+
+def test_candidate_scan_skips_inaccessible_symbol_path_entry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    inaccessible = tmp_path / "inaccessible"
+    exact_dir = tmp_path / "exact"
+    exact_dir.mkdir()
+    exact_pdb = exact_dir / "x.pdb"
+    exact_pdb.write_bytes(b"fake pdb")
+    original_exists = Path.exists
+
+    def _exists(path: Path) -> bool:
+        if path == inaccessible:
+            raise OSError(1326, "The user name or password is incorrect")
+        return original_exists(path)
+
+    monkeypatch.setattr(Path, "exists", _exists)
+
+    candidates = list(
+        symbol_diagnostics._iter_candidates(
+            f"{inaccessible};{exact_dir}",
+            "x.exe",
+            "x.pdb",
+        )
+    )
+
+    assert candidates == [(exact_pdb, None)]
 
 
 # ---------------------------------------------------------------------------
@@ -343,31 +372,47 @@ def _build_synthetic_pdb(
     *,
     guid_bytes: bytes,
     age: int,
+    info_age: int | None = None,
     stream0_garbage: bytes,
 ) -> None:
     """Write a minimal but valid MSF 7.0 PDB whose Info Stream (stream 1)
-    carries ``guid_bytes`` + ``age`` and whose stream 0 carries unrelated
-    garbage (so a stream-0 reader would return the wrong GUID)."""
+    carries ``guid_bytes`` and whose DBI Stream (stream 3) carries the
+    authoritative CodeView age."""
     page_size = 512
     magic = b"Microsoft C/C++ MSF 7.00\r\n\x1aDS\x00\x00\x00"
     assert len(magic) == 32
 
     # Stream contents.
     stream0 = stream0_garbage.ljust(64, b"\x00")
-    stream1 = struct.pack("<III", 20000404, 0x1234, age) + guid_bytes  # 28 bytes
+    stream1 = (
+        struct.pack(
+            "<III",
+            20000404,
+            0x1234,
+            age if info_age is None else info_age,
+        )
+        + guid_bytes
+    )
+    stream2 = b""
+    stream3 = struct.pack("<iII", -1, 19990903, age)
 
-    # Block layout: 0=superblock, 1=dir-root, 2=dir, 3=stream0, 4=stream1.
+    # Block layout: 0=superblock, 1=dir-root, 2=dir, 3=stream0,
+    # 4=stream1, 5=stream3. Stream 2 is empty.
     dir_root_block = 1
     dir_block = 2
     stream0_block = 3
     stream1_block = 4
-    num_blocks = 5
+    stream3_block = 5
+    num_blocks = 6
 
     # Directory: num_streams, sizes[], then concatenated block-index arrays.
-    directory = struct.pack("<I", 2)                      # num_streams
-    directory += struct.pack("<II", len(stream0), len(stream1))
+    directory = struct.pack("<I", 4)
+    directory += struct.pack(
+        "<IIII", len(stream0), len(stream1), len(stream2), len(stream3)
+    )
     directory += struct.pack("<I", stream0_block)         # stream 0 blocks
     directory += struct.pack("<I", stream1_block)         # stream 1 blocks
+    directory += struct.pack("<I", stream3_block)         # stream 3 blocks
     dir_size = len(directory)
 
     # Dir-root page holds the array of directory page indices.
@@ -391,6 +436,7 @@ def _build_synthetic_pdb(
     _put(dir_block, directory)
     _put(stream0_block, stream0)
     _put(stream1_block, stream1)
+    _put(stream3_block, stream3)
 
     path.write_bytes(bytes(buf))
 
@@ -423,6 +469,23 @@ def test_read_pdb_signature_reads_info_stream_not_stream0(tmp_path: Path):
     guid_str, got_age = result
     assert guid_str == expected_guid
     assert got_age == age
+
+
+def test_read_pdb_signature_uses_dbi_age_not_info_age(tmp_path: Path):
+    guid_bytes = bytes.fromhex("443322116655887799AABBCCDDEEFF00")
+    pdb = tmp_path / "tcpip.pdb"
+    _build_synthetic_pdb(
+        pdb,
+        guid_bytes=guid_bytes,
+        age=1,
+        info_age=2,
+        stream0_garbage=b"old directory",
+    )
+
+    assert symbol_diagnostics.read_pdb_signature(pdb) == (
+        "112233445566778899AABBCCDDEEFF00",
+        1,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -526,6 +589,28 @@ class _AvailableSymbolizer:
         return {int(a): "" for a in addrs}
 
 
+class _StatusSymbolizer(_AvailableSymbolizer):
+    def __init__(self):
+        self.updated_path = None
+        self.requested = None
+
+    def set_symbol_path(self, path, *, retry_failed=True):
+        self.updated_path = path
+        assert retry_failed is True
+        return True
+
+    def ensure_modules_loaded(self, modules):
+        self.requested = list(modules or [])
+        return [{
+            "module": "tcpip.sys",
+            "state": "not_found",
+            "pdb_loaded": False,
+            "trace_age": 1,
+            "loaded_age": None,
+            "error": "No exact PDB found",
+        }]
+
+
 def test_resolve_symbols_prefers_native_when_symbolizer_available(tmp_path: Path):
     """When a native symbolizer is attached, resolve_symbols must use it and
     skip the external xperf symcache path entirely (#8)."""
@@ -549,6 +634,46 @@ def test_resolve_symbols_prefers_native_when_symbolizer_available(tmp_path: Path
     assert "xperf not required" in out.lower()
     # The symbol-status report (check_symbols) should be embedded.
     assert "good.dll" in out
+
+
+def test_resolve_symbols_updates_path_and_reports_unresolved(tmp_path: Path):
+    df = pd.DataFrame({
+        "Process Name": ["app.exe"],
+        "PID": [100],
+        "Weight": [1],
+        "% Weight": [100.0],
+        "Module": ["tcpip.sys"],
+        "Function": [""],
+        "SymbolSource": ["unknown"],
+    })
+    symbolizer = _StatusSymbolizer()
+    trace = _register_trace_with_cpu_df(
+        tmp_path,
+        df,
+        trace_id="trace_native_status",
+        symbolizer=symbolizer,
+    )
+    trace.symbol_path = r"C:\base-symbols"
+    trace._resolved_samples_df = pd.DataFrame({"Function": ["stale"]})
+    trace.raw_csv["stacks"] = pd.DataFrame({"Function": ["stale"]})
+    trace.raw_csv["stacks_callers"] = pd.DataFrame({
+        "Caller_Function": ["stale"],
+    })
+
+    out = trace_mgmt.resolve_symbols(
+        trace.trace_id,
+        modules="tcpip.sys",
+        extra_symbol_paths=[r"C:\build-symbols"],
+    )
+
+    assert symbolizer.updated_path == r"C:\base-symbols;C:\build-symbols"
+    assert symbolizer.requested == ["tcpip.sys"]
+    assert "UNRESOLVED" in out
+    assert "1 unresolved" in out
+    assert "100%" not in out
+    assert not hasattr(trace, "_resolved_samples_df")
+    assert "stacks" not in trace.raw_csv
+    assert "stacks_callers" not in trace.raw_csv
 
 
 # ---------------------------------------------------------------------------

@@ -118,6 +118,8 @@ def _trace_pdb_disk_verdict(trace, module_name: str, sym_path: str) -> str:
     - ``"mismatch"`` -- the trace identity is known and at least one candidate
       PDB exists for this name, but NONE match GUID+Age (names came from a
       different build, or no matching build is reachable).
+    - ``"invalid"``  -- a candidate exists but is not a decodable PDB 7.0
+      identity; strict matching cannot trust it.
     - ``"unknown"``  -- cannot decide (no trace identity, no symbol path, or
       no candidate PDBs of this name found at all).
     """
@@ -131,7 +133,10 @@ def _trace_pdb_disk_verdict(trace, module_name: str, sym_path: str) -> str:
         _guid_to_nodashes,
         classify_pdb_container,
         parse_symbol_path,
-        read_pdb_signature,
+    )
+    from etw_analyzer.native.pdb_identity import (
+        PdbIdentityError,
+        read_pdb_identity,
     )
 
     trace_guid_norm = _guid_to_nodashes(identity.get("pdb_guid"))
@@ -146,20 +151,33 @@ def _trace_pdb_disk_verdict(trace, module_name: str, sym_path: str) -> str:
         want_keys.add(f"{trace_guid_norm}{int(trace_age):X}".upper())
 
     saw_candidate = False
-    try:
-        for _kind, dir_path in parse_symbol_path(sym_path):
+    saw_identity_error = False
+    for _kind, dir_path in parse_symbol_path(sym_path):
+        try:
             if not dir_path.exists():
                 continue
 
             # Flat layout: <dir>/<pdb_name> -- decode the signature directly.
             flat = dir_path / pdb_name
-            if flat.is_file() and classify_pdb_container(flat) == "msf7":
-                sig = read_pdb_signature(flat)
-                if sig is not None:
-                    saw_candidate = True
-                    age_ok = (trace_age is None) or (sig[1] == trace_age)
-                    if _guid_to_nodashes(sig[0]) == trace_guid_norm and age_ok:
-                        return "match"
+            if flat.is_file():
+                saw_candidate = True
+                if classify_pdb_container(flat) == "msf7":
+                    try:
+                        identity = read_pdb_identity(flat)
+                    except PdbIdentityError:
+                        saw_identity_error = True
+                    else:
+                        age_ok = (
+                            trace_age is None
+                            or identity.age == trace_age
+                        )
+                        if (
+                            _guid_to_nodashes(identity.guid) == trace_guid_norm
+                            and age_ok
+                        ):
+                            return "match"
+                else:
+                    saw_identity_error = True
 
             # Symstore layout: <dir>/<pdb_name>/<GUID+hexAge>/<pdb_name>.
             sym_root = dir_path / pdb_name
@@ -179,8 +197,10 @@ def _trace_pdb_disk_verdict(trace, module_name: str, sym_path: str) -> str:
                     # still a (weaker) match only when the trace age is unknown.
                     if trace_age is None and folder[:32] == trace_guid_norm:
                         return "match"
-    except Exception:
-        return "unknown"
+        except OSError:
+            continue
+    if saw_identity_error:
+        return "invalid"
     return "mismatch" if saw_candidate else "unknown"
 
 
@@ -244,6 +264,29 @@ def _resolve_sym_path(
     if not entries:
         return None
     return ";".join(entries)
+
+
+def _invalidate_symbol_resolution_caches(trace: TraceData) -> None:
+    """Drop derived symbol frames after DbgHelp state/path changes."""
+
+    for attr in (
+        "_resolved_samples_df",
+        "_export_only_modules_cache",
+    ):
+        try:
+            delattr(trace, attr)
+        except AttributeError:
+            pass
+    for attr in (
+        "_native_stack_aggregate_attempted",
+        "_stacks_raw_attempted",
+    ):
+        try:
+            setattr(trace, attr, False)
+        except Exception:
+            pass
+    trace.raw_csv.pop("stacks", None)
+    trace.raw_csv.pop("stacks_callers", None)
 
 
 @mcp.tool()
@@ -2898,18 +2941,21 @@ def _apply_native_metadata(trace: TraceData) -> None:
 
 def _populate_metadata(trace: TraceData) -> None:
     """Extract metadata from loaded DataFrames."""
+    from etw_analyzer.native.processor_count import select_processor_count
+
     _apply_native_metadata(trace)
     allow_inferred_metadata = trace.mode != "native"
+    observed_cpu_ids: list[int] = []
 
     for name, df in trace.raw_csv.items():
         trace.event_counts[name] = len(df)
 
-        # xperf data lacks a dedicated metadata row, so keep the historical
-        # best-effort inference there. Native traces use TRACE_LOGFILE_HEADER.
-        if allow_inferred_metadata and trace.cpu_count is None and "CPU" in df.columns:
+        if "CPU" in df.columns:
             try:
-                trace.cpu_count = int(df["CPU"].max()) + 1
-            except (ValueError, TypeError):
+                values = pd.to_numeric(df["CPU"], errors="coerce").dropna()
+                if not values.empty:
+                    observed_cpu_ids.append(int(values.max()))
+            except (ValueError, TypeError, OverflowError):
                 pass
 
         if allow_inferred_metadata and trace.duration_seconds is None:
@@ -2922,6 +2968,46 @@ def _populate_metadata(trace: TraceData) -> None:
                             break
                     except Exception:
                         pass
+
+    logfile_counts = [
+        getattr(item, "number_of_processors", None)
+        for item in (
+            getattr(getattr(trace, "_native_extract_stats", None), "logfile_metadata", None)
+            or []
+        )
+    ]
+    eventtrace = trace.raw_csv.get("EventTrace/Header")
+    eventtrace_count = (
+        _numeric_metadata_column(eventtrace, "NumberOfProcessors").max()
+        if eventtrace is not None
+        and not eventtrace.empty
+        and not _numeric_metadata_column(
+            eventtrace, "NumberOfProcessors"
+        ).empty
+        else None
+    )
+    trace_metadata = trace.raw_csv.get("trace_metadata")
+    metadata_values = (
+        _numeric_metadata_column(trace_metadata, "NumberOfProcessors")
+        if trace_metadata is not None and not trace_metadata.empty
+        else pd.Series(dtype="float64")
+    )
+    metadata_count = (
+        metadata_values[metadata_values > 0].max()
+        if not metadata_values[metadata_values > 0].empty
+        else None
+    )
+    selected_cpu_count = select_processor_count(
+        authoritative_counts=[eventtrace_count, *logfile_counts],
+        fallback_counts=[metadata_count, trace.cpu_count],
+        observed_cpu_ids=observed_cpu_ids,
+    )
+    if selected_cpu_count is not None:
+        trace.cpu_count = selected_cpu_count
+        if trace_metadata is not None and not trace_metadata.empty:
+            trace.raw_csv["trace_metadata"] = trace_metadata.assign(
+                NumberOfProcessors=selected_cpu_count
+            )
 
     if trace.event_store is not None:
         for name, dataset in trace.event_store.manifest.datasets.items():
@@ -3257,6 +3343,17 @@ def check_symbols(
         trace.symbol_path or os.environ.get("_NT_SYMBOL_PATH", ""),
         extra_symbol_paths,
     ) or ""
+    symbolizer = getattr(trace, "symbolizer", None)
+    if symbolizer is not None and sym_path and hasattr(symbolizer, "set_symbol_path"):
+        try:
+            invalidated = symbolizer.set_symbol_path(
+                sym_path, retry_failed=True
+            )
+            if invalidated:
+                _invalidate_symbol_resolution_caches(trace)
+        except Exception as exc:
+            lines.append(f"- **Symbolizer path update failed:** {exc}")
+            lines.append("")
     lines.append("**Symbol Path (`_NT_SYMBOL_PATH`):**")
     if not sym_path:
         lines.append("- **NOT SET** — xperf cannot resolve function names without symbols")
@@ -3382,11 +3479,13 @@ def check_symbols(
                 # SymbolSource='pdb' that has no exact-match PDB on disk is a
                 # wrong-build attribution (#3): reclassify its weight as
                 # mismatched so check_symbols agrees with diagnose_symbol_load.
+                identity_error = False
                 if pdb_weight > 0:
                     verdict = _trace_pdb_disk_verdict(trace, mod_str, sym_path)
-                    if verdict == "mismatch":
+                    if verdict in {"mismatch", "invalid"}:
                         mismatch_weight += pdb_weight
                         pdb_weight = 0.0
+                        identity_error = verdict == "invalid"
 
                 denom = (
                     pdb_weight + mismatch_weight + export_weight
@@ -3435,6 +3534,7 @@ def check_symbols(
                     "pct_export": pct_export,
                     "Weight": mod_weight,
                     "Status": status_icon,
+                    "identity_error": identity_error,
                 })
             else:
                 # Legacy 2-bucket fallback.
@@ -3514,6 +3614,19 @@ def check_symbols(
         result_df = result_df.sort_values("Weight", ascending=False).reset_index(drop=True)
         lines.append(format_table(result_df, max_rows=25))
         lines.append("")
+
+        invalid_identity_modules = [
+            s["Module"] for s in mod_stats if s.get("identity_error")
+        ]
+        if invalid_identity_modules:
+            lines.append(
+                "**Strict PDB identity errors:** candidate PDBs for "
+                + ", ".join(f"`{name}`" for name in invalid_identity_modules[:10])
+                + " could not be decoded as PDB 7.0 GUID + DBI age. "
+                "Legacy, malformed, and flat MSFZ candidates are not accepted "
+                "as permissive matches; run `diagnose_symbol_load` for details."
+            )
+            lines.append("")
 
         # 3. Summary and recommendations
         total_weight = result_df["Weight"].sum()
@@ -3770,19 +3883,152 @@ def _resolve_symbols_impl(
             "**Using native in-process dbghelp symbolizer (xperf not required).**"
         )
         lines.append("")
-        lines.append(
-            "A native symbolizer is attached to this trace, so PDBs are "
-            "resolved in-process via `dbghelp.dll`. The external "
-            "`xperf -a symcache` builder is skipped to avoid its known crash "
-            "(0xC0000005) on some traces (issue #8). Symbol status below is "
-            "reported by `check_symbols`; addresses are resolved on demand "
-            "by the analysis tools."
+        requested_modules = (
+            [name.strip() for name in modules.split(",") if name.strip()]
+            if modules
+            else []
         )
-        lines.append("")
-        try:
-            lines.append(check_symbols(trace_id, extra_symbol_paths))
-        except Exception as e:
-            lines.append(f"check_symbols failed: {e}")
+        if hasattr(symbolizer, "set_symbol_path") and sym_path:
+            try:
+                invalidated = symbolizer.set_symbol_path(
+                    sym_path, retry_failed=True
+                )
+                if invalidated:
+                    _invalidate_symbol_resolution_caches(trace)
+            except Exception as exc:
+                lines.append(f"**Failed to update symbol path:** {exc}")
+                lines.append("")
+
+        if hasattr(symbolizer, "ensure_modules_loaded"):
+            try:
+                statuses = symbolizer.ensure_modules_loaded(
+                    requested_modules or None
+                )
+            except Exception as exc:
+                lines.append(f"**Native symbol loading failed:** {exc}")
+                return "\n".join(lines)
+
+            if requested_modules:
+                found_names = {
+                    str(status.get("module", "")).lower()
+                    for status in statuses
+                }
+                for requested in requested_modules:
+                    if Path(requested).name.lower() not in found_names:
+                        statuses.append({
+                            "module": requested,
+                            "state": "not_registered",
+                            "pdb_loaded": False,
+                            "error": "No image row registered for this module",
+                        })
+
+            status_rows = []
+            for status in statuses:
+                state = str(status.get("state") or "unknown")
+                if state == "pdb":
+                    verdict = "PDB_LOADED"
+                elif state == "export":
+                    verdict = "EXPORT_ONLY"
+                elif state == "mismatched":
+                    verdict = "MISMATCHED_PDB"
+                else:
+                    verdict = "UNRESOLVED"
+                status_rows.append({
+                    "Module": status.get("module", "unknown"),
+                    "State": verdict,
+                    "Trace Age": status.get("trace_age", ""),
+                    "Loaded Age": status.get("loaded_age", ""),
+                    "Detail": status.get("error") or status.get("path") or "",
+                })
+
+            if status_rows:
+                status_df = pd.DataFrame(status_rows)
+                lines.append(format_table(status_df, max_rows=50))
+                lines.append("")
+                unresolved = status_df[
+                    ~status_df["State"].isin(["PDB_LOADED", "EXPORT_ONLY"])
+                ]
+                pdb_loaded = int((status_df["State"] == "PDB_LOADED").sum())
+                export_only = int((status_df["State"] == "EXPORT_ONLY").sum())
+                lines.append(
+                    f"**Result:** {pdb_loaded} module(s) loaded with exact "
+                    f"PDBs; {export_only} export-only; "
+                    f"{len(unresolved)} unresolved."
+                )
+                if not unresolved.empty:
+                    lines.append(
+                        "Resolution is incomplete. Function names remain "
+                        "unavailable for unresolved/mismatched modules; run "
+                        "`diagnose_symbol_load` for the module-specific reason."
+                    )
+            else:
+                lines.append(
+                    "**Result:** no registered modules matched the request; "
+                    "0 modules resolved."
+                )
+        else:
+            # Compatibility path for older/mocked symbolizers.
+            lines.append(
+                "This symbolizer does not expose module load status; "
+                "falling back to the sample-based `check_symbols` report."
+            )
+            lines.append("")
+            if requested_modules:
+                registered_names: set[str] = set()
+                symbolizer_modules = getattr(symbolizer, "_modules", {}) or {}
+                for entry in symbolizer_modules.values():
+                    file_name = entry.get("FileName") or ""
+                    if file_name:
+                        registered_names.add(
+                            Path(str(file_name)).name.lower()
+                        )
+                for key in (
+                    "image",
+                    "Image/Load",
+                    "Image/DCStart",
+                    "Image/DCEnd",
+                ):
+                    image_df = trace.raw_csv.get(key)
+                    if (
+                        image_df is None
+                        or image_df.empty
+                        or "FileName" not in image_df.columns
+                    ):
+                        continue
+                    registered_names.update(
+                        Path(str(value)).name.lower()
+                        for value in image_df["FileName"].dropna()
+                    )
+
+                compatibility_rows = []
+                for requested in requested_modules:
+                    normalized = Path(requested).name.lower()
+                    registered = normalized in registered_names
+                    compatibility_rows.append({
+                        "Module": requested,
+                        "State": "UNVERIFIED" if registered else "UNRESOLVED",
+                        "Detail": (
+                            "Symbolizer cannot report loaded state"
+                            if registered
+                            else "Requested module is not registered in image rows"
+                        ),
+                    })
+                lines.append(
+                    format_table(
+                        pd.DataFrame(compatibility_rows),
+                        max_rows=50,
+                    )
+                )
+                lines.append("")
+                lines.append(
+                    "Requested-module resolution is incomplete because this "
+                    "symbolizer cannot prove that the modules are loaded."
+                )
+                lines.append("")
+            try:
+                lines.append(check_symbols(trace_id, extra_symbol_paths))
+            except Exception as e:
+                lines.append(f"check_symbols failed: {e}")
         return "\n".join(lines)
 
     xperf = find_xperf()

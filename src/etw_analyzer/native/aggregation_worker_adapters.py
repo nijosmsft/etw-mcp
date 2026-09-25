@@ -38,6 +38,7 @@ import pandas as pd
 
 from etw_analyzer.native import cache as native_cache
 from etw_analyzer.trace_state import TraceData
+from etw_analyzer.native.processor_count import select_processor_count
 
 
 # Sidecar parquets emit ``TimeStampQpc`` (per ``schemas.EVENT_SCHEMAS``);
@@ -182,7 +183,11 @@ def build_trace_metadata_dataframe(
     extra = _extract_eventtrace_header_extras(eventtrace_header_df)
     return pd.DataFrame([
         {
-            "NumberOfProcessors": int(metadata.cpu_count or 0),
+            "NumberOfProcessors": (
+                int(metadata.cpu_count)
+                if metadata.cpu_count is not None
+                else None
+            ),
             "StartTime": int(extra.get("StartTime", 0)),
             "EndTime": int(extra.get("EndTime", 0)),
             "DurationSeconds": (
@@ -271,9 +276,7 @@ def _max_cpu_plus_one(trace: TraceData) -> int | None:
             candidates.append(int(value.max()))
         except (ValueError, TypeError):
             continue
-    if not candidates:
-        return None
-    return max(candidates) + 1
+    return select_processor_count(observed_cpu_ids=candidates)
 
 
 def _qpc_range(trace: TraceData) -> tuple[int | None, int | None]:
@@ -760,10 +763,9 @@ def eventtrace_header_to_metadata(
         perf_freq = float(row.get("PerfFreq", 0) or 0)
     except (TypeError, ValueError):
         perf_freq = 0.0
-    try:
-        cpu_count = int(row.get("NumberOfProcessors", 0) or 0)
-    except (TypeError, ValueError):
-        cpu_count = 0
+    cpu_count = select_processor_count(
+        authoritative_counts=[row.get("NumberOfProcessors")]
+    )
     try:
         start_100ns = int(row.get("StartTime100Ns", 0) or 0)
     except (TypeError, ValueError):
@@ -783,7 +785,7 @@ def eventtrace_header_to_metadata(
         return None
 
     return DotnetMetadata(
-        cpu_count=cpu_count or None,
+        cpu_count=cpu_count,
         duration_seconds=duration,
         timestamp_frequency=perf_freq or None,
     )

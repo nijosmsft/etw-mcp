@@ -50,8 +50,17 @@ import pandas as pd
 
 from etw_analyzer.app import mcp
 from etw_analyzer.formatting.markdown import format_table
+from etw_analyzer.native.pdb_identity import (
+    PdbIdentityError,
+    classify_pdb_format,
+    read_pdb_identity,
+)
 from etw_analyzer.trace_state import require_trace
-from etw_analyzer.tools.trace_mgmt import _resolve_sym_path, _find_trace_pdb_identity
+from etw_analyzer.tools.trace_mgmt import (
+    _find_trace_pdb_identity,
+    _invalidate_symbol_resolution_caches,
+    _resolve_sym_path,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -201,135 +210,25 @@ def read_pe_rsds(exe_path: Path) -> Optional[RsdsRecord]:
     return None
 
 
-_PDB_MSF7_MAGIC = b"Microsoft C/C++ MSF 7.00"
-_PDB_MSFZ_MAGIC = b"Microsoft MSFZ Container"
-
-
 def classify_pdb_container(pdb_path: Path) -> str:
-    """Classify a PDB container as ``msf7``, ``msfz``, or ``unknown``."""
-    try:
-        with pdb_path.open("rb") as f:
-            head = f.read(64)
-    except OSError:
-        return "unknown"
-    if head.startswith(_PDB_MSF7_MAGIC):
-        return "msf7"
-    if head.startswith(_PDB_MSFZ_MAGIC):
-        return "msfz"
-    return "unknown"
+    """Compatibility alias for the canonical PDB format classifier."""
+
+    return classify_pdb_format(pdb_path)
 
 
 def read_pdb_signature(pdb_path: Path) -> Optional[tuple[str, int]]:
-    """Read the PDB 7.0 info-stream signature: (GUID hex string, age).
+    """Read the canonical PDB GUID + DBI age.
 
-    Returns ``None`` if the file isn't a valid PDB or the layout
-    differs from the expected MSF/stream form. This is a lightweight
-    parser - it walks the MSF page directory just far enough to locate
-    the PDB Info Stream, which is where the GUID+Age live.
-
-    PDB layout (per Microsoft's microsoft-pdb repo / the LLVM MSF docs):
-    - Bytes 0..32  : "Microsoft C/C++ MSF 7.00\\r\\n\\x1a\\x44\\x53\\x00\\x00\\x00"
-    - DWORD        : page size (usually 4096)
-    - DWORD        : free page map page
-    - DWORD        : pages in file
-    - DWORD        : directory size in bytes
-    - DWORD        : reserved
-    - DWORD        : block index of the stream-directory page array
-
-    The stream directory holds, in order:
-    - DWORD        : number of streams
-    - DWORD[N]     : byte size of each stream
-    - DWORD[...]   : the block indices for each stream, concatenated
-
-    The GUID+Age live in the **PDB Info Stream**, which is **stream 1**
-    (stream 0 is the previous/old MSF directory and contains unrelated
-    bytes -- reading it yields a malformed GUID, see #3 secondary). The
-    info stream begins with:
-    - DWORD        : version (20000404 etc)
-    - DWORD        : signature (timestamp)
-    - DWORD        : age
-    - 16 bytes     : GUID
+    Kept as a compatibility wrapper for callers/tests that predate
+    :func:`read_pdb_identity`. Invalid, compressed, and legacy containers
+    return ``None``; user-facing diagnostics call the strict helper directly
+    so those errors are surfaced instead of silently accepted.
     """
-    _PDB_INFO_STREAM = 1
+
     try:
-        with pdb_path.open("rb") as f:
-            head = f.read(56)
-            if len(head) < 56 or not head.startswith(_PDB_MSF7_MAGIC):
-                return None
-            page_size = struct.unpack_from("<I", head, 32)[0]
-            dir_size = struct.unpack_from("<I", head, 44)[0]
-            if page_size == 0 or dir_size == 0:
-                return None
-            # The first directory-pages-pointer page index lives right
-            # after the reserved DWORD (offset 52).
-            dir_root_page_idx = struct.unpack_from("<I", head, 52)[0]
-
-            # Read the directory: dir_size bytes spread across pages
-            # whose indices are stored at dir_root_page (each is a
-            # 32-bit page index).
-            f.seek(dir_root_page_idx * page_size)
-            dir_root = f.read(page_size)
-            pages_in_dir = (dir_size + page_size - 1) // page_size
-            dir_page_indices = struct.unpack_from(
-                f"<{pages_in_dir}I", dir_root, 0
-            )
-
-            dir_buf = bytearray()
-            for pidx in dir_page_indices:
-                f.seek(pidx * page_size)
-                dir_buf.extend(f.read(page_size))
-            dir_buf = bytes(dir_buf[:dir_size])
-
-            # Directory layout: NumStreams, then NumStreams x StreamSize,
-            # then NumStreams x (array of page indices for that stream).
-            num_streams = struct.unpack_from("<I", dir_buf, 0)[0]
-            if num_streams <= _PDB_INFO_STREAM:
-                return None
-            stream_sizes = struct.unpack_from(
-                f"<{num_streams}I", dir_buf, 4
-            )
-
-            def _block_count(size: int) -> int:
-                # 0xFFFFFFFF marks a nil (deleted) stream -> zero blocks.
-                if size == 0xFFFFFFFF or size == 0:
-                    return 0
-                return (size + page_size - 1) // page_size
-
-            # The block-index arrays for streams 0..N-1 are concatenated
-            # after the size table. Walk past the earlier streams' blocks
-            # to reach the PDB Info Stream's block array.
-            page_idx_off = 4 + num_streams * 4
-            for s in range(_PDB_INFO_STREAM):
-                page_idx_off += _block_count(stream_sizes[s]) * 4
-
-            info_size = stream_sizes[_PDB_INFO_STREAM]
-            if info_size == 0xFFFFFFFF or info_size == 0:
-                return None
-            info_pages_count = _block_count(info_size)
-            info_page_indices = struct.unpack_from(
-                f"<{info_pages_count}I", dir_buf, page_idx_off
-            )
-
-            buf = bytearray()
-            for pidx in info_page_indices:
-                f.seek(pidx * page_size)
-                buf.extend(f.read(page_size))
-            buf = bytes(buf[:info_size])
-
-            if len(buf) < 28:
-                return None
-            _ver, _sig, age = struct.unpack_from("<III", buf, 0)
-            guid_bytes = buf[12:28]
-            d1 = int.from_bytes(guid_bytes[0:4], "little")
-            d2 = int.from_bytes(guid_bytes[4:6], "little")
-            d3 = int.from_bytes(guid_bytes[6:8], "little")
-            d4 = guid_bytes[8:16]
-            guid_str = (
-                f"{d1:08X}{d2:04X}{d3:04X}"
-                + "".join(f"{b:02X}" for b in d4)
-            )
-            return (guid_str, age)
-    except (OSError, struct.error):
+        identity = read_pdb_identity(pdb_path)
+        return (identity.guid, identity.age)
+    except PdbIdentityError:
         return None
 
 
@@ -432,16 +331,16 @@ def _iter_candidates(
     ``file.ptr`` redirect; it is ``None`` for direct (literal) matches.
     """
     for _kind, dir_path in parse_symbol_path(sym_path):
-        if not dir_path.exists():
-            continue
-        # Flat layout
-        flat = dir_path / pdb_name
-        if flat.is_file():
-            yield (flat, None)
-        # Symstore layout: <dir>/<pdb_name>/<GUID+Age>/<pdb_name>
-        sym_root = dir_path / pdb_name
-        if sym_root.is_dir():
-            try:
+        try:
+            if not dir_path.exists():
+                continue
+            # Flat layout
+            flat = dir_path / pdb_name
+            if flat.is_file():
+                yield (flat, None)
+            # Symstore layout: <dir>/<pdb_name>/<GUID+Age>/<pdb_name>
+            sym_root = dir_path / pdb_name
+            if sym_root.is_dir():
                 for sub in sorted(sym_root.iterdir()):
                     if not sub.is_dir():
                         continue
@@ -458,8 +357,8 @@ def _iter_candidates(
                                 target,
                                 f"via file.ptr redirect: {ptr} -> {target}",
                             )
-            except OSError:
-                continue
+        except OSError:
+            continue
 
 
 _SYMSTORE_FOLDER_RE = re.compile(r"^[0-9A-Fa-f]{33,}$")
@@ -657,6 +556,22 @@ def diagnose_symbol_load(
         lines.append("Symbol path: **(unset)** - no candidate PDBs can be found")
     lines.append("")
 
+    symbolizer = getattr(trace, "symbolizer", None)
+    load_status_error = None
+    forced_statuses: list[dict] = []
+    if symbolizer is not None:
+        try:
+            if sym_path and hasattr(symbolizer, "set_symbol_path"):
+                invalidated = symbolizer.set_symbol_path(
+                    sym_path, retry_failed=True
+                )
+                if invalidated:
+                    _invalidate_symbol_resolution_caches(trace)
+            if hasattr(symbolizer, "ensure_modules_loaded"):
+                forced_statuses = symbolizer.ensure_modules_loaded([module])
+        except Exception as exc:
+            load_status_error = f"{type(exc).__name__}: {exc}"
+
     # -----------------------------------------------------------------------
     # Source 1: trace identity (authoritative -- from ETL RSDS rundown).
     # -----------------------------------------------------------------------
@@ -778,7 +693,18 @@ def diagnose_symbol_load(
     candidate_infos: list[dict] = []
     for cand, redirect_desc, searched_pdb_name in all_candidate_entries:
         container = classify_pdb_container(cand)
-        sig = read_pdb_signature(cand) if container == "msf7" else None
+        identity = None
+        identity_error = None
+        if container == "msf7":
+            try:
+                identity = read_pdb_identity(cand)
+            except PdbIdentityError as exc:
+                identity_error = str(exc)
+        elif container == "legacy":
+            identity_error = (
+                "legacy pre-PDB7 container has no strict RSDS GUID identity"
+            )
+        sig = (identity.guid, identity.age) if identity is not None else None
         folder_identity = _symstore_folder_identity(cand) if sig is None else None
         candidate_infos.append({
             "path": cand,
@@ -786,6 +712,8 @@ def diagnose_symbol_load(
             "searched_pdb_name": searched_pdb_name,
             "container": container,
             "signature": sig,
+            "identity": identity,
+            "identity_error": identity_error,
             "folder_identity": folder_identity,
         })
     has_msfz_candidate = any(info["container"] == "msfz" for info in candidate_infos)
@@ -833,6 +761,12 @@ def diagnose_symbol_load(
                 elif container == "msfz":
                     match_label = "NO (MSFZ-compressed)"
                     guid_label = "MSFZ-compressed PDB (GUID requires MSFZ-capable dbghelp)"
+                elif container == "legacy":
+                    match_label = "ERROR (legacy PDB)"
+                    guid_label = "legacy pre-PDB7 PDB"
+                elif info["identity_error"]:
+                    match_label = "ERROR (invalid PDB)"
+                    guid_label = "(identity decode failed)"
                 else:
                     match_label = "NO (unreadable)"
                     guid_label = "(unreadable)"
@@ -859,6 +793,13 @@ def diagnose_symbol_load(
                 "Age": age_label,
                 "Match": match_label,
             }
+            identity = info.get("identity")
+            if identity is not None and identity.info_age != identity.age:
+                row["Info Age"] = (
+                    f"{identity.info_age} (ignored; DBI age is authoritative)"
+                )
+            elif info["identity_error"]:
+                row["Identity error"] = info["identity_error"]
             if len(pdb_names_to_search) > 1:
                 row["Searched as"] = searched_pdb_name
             if has_redirects:
@@ -880,6 +821,12 @@ def diagnose_symbol_load(
     # -----------------------------------------------------------------------
     dbghelp_path, dbghelp_version, msfz_capable = _loaded_dbghelp_info()
     loaded = _query_loaded_module(trace, module)
+    forced_status = forced_statuses[0] if forced_statuses else None
+    if loaded is not None and forced_status is not None:
+        if not loaded.get("pdb_guid") and forced_status.get("loaded_guid"):
+            loaded["pdb_guid"] = forced_status["loaded_guid"]
+        if not loaded.get("pdb_age") and forced_status.get("loaded_age"):
+            loaded["pdb_age"] = forced_status["loaded_age"]
     lines.append("**Loaded state (from dbghelp):**")
     lines.append(
         "- Symbolizer dbghelp: "
@@ -889,6 +836,15 @@ def diagnose_symbol_load(
     )
     if loaded is None:
         lines.append("- dbghelp has no module loaded for this image.")
+        if load_status_error:
+            lines.append(f"- Load attempt error: `{load_status_error}`")
+        elif forced_statuses:
+            status = forced_statuses[0]
+            lines.append(
+                f"- Symbolizer state: `{status.get('state', 'unknown')}`"
+            )
+            if status.get("error"):
+                lines.append(f"- Reason: {status['error']}")
     else:
         lines.append(f"- Loaded PDB:   `{loaded['loaded_pdb']}`")
         lines.append(f"- SymType:      `{loaded['sym_type']}`")
