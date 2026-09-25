@@ -60,6 +60,35 @@ def _register_trace_with_cpu_df(
     return trace
 
 
+def test_candidate_scan_skips_inaccessible_symbol_path_entry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    inaccessible = tmp_path / "inaccessible"
+    exact_dir = tmp_path / "exact"
+    exact_dir.mkdir()
+    exact_pdb = exact_dir / "x.pdb"
+    exact_pdb.write_bytes(b"fake pdb")
+    original_exists = Path.exists
+
+    def _exists(path: Path) -> bool:
+        if path == inaccessible:
+            raise OSError(1326, "The user name or password is incorrect")
+        return original_exists(path)
+
+    monkeypatch.setattr(Path, "exists", _exists)
+
+    candidates = list(
+        symbol_diagnostics._iter_candidates(
+            f"{inaccessible};{exact_dir}",
+            "x.exe",
+            "x.pdb",
+        )
+    )
+
+    assert candidates == [(exact_pdb, None)]
+
+
 # ---------------------------------------------------------------------------
 # #3 — wrong-GUID PDB must be MISMATCHED_PDB, never OK
 # ---------------------------------------------------------------------------

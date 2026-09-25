@@ -331,16 +331,16 @@ def _iter_candidates(
     ``file.ptr`` redirect; it is ``None`` for direct (literal) matches.
     """
     for _kind, dir_path in parse_symbol_path(sym_path):
-        if not dir_path.exists():
-            continue
-        # Flat layout
-        flat = dir_path / pdb_name
-        if flat.is_file():
-            yield (flat, None)
-        # Symstore layout: <dir>/<pdb_name>/<GUID+Age>/<pdb_name>
-        sym_root = dir_path / pdb_name
-        if sym_root.is_dir():
-            try:
+        try:
+            if not dir_path.exists():
+                continue
+            # Flat layout
+            flat = dir_path / pdb_name
+            if flat.is_file():
+                yield (flat, None)
+            # Symstore layout: <dir>/<pdb_name>/<GUID+Age>/<pdb_name>
+            sym_root = dir_path / pdb_name
+            if sym_root.is_dir():
                 for sub in sorted(sym_root.iterdir()):
                     if not sub.is_dir():
                         continue
@@ -357,8 +357,8 @@ def _iter_candidates(
                                 target,
                                 f"via file.ptr redirect: {ptr} -> {target}",
                             )
-            except OSError:
-                continue
+        except OSError:
+            continue
 
 
 _SYMSTORE_FOLDER_RE = re.compile(r"^[0-9A-Fa-f]{33,}$")

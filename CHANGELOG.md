@@ -4,6 +4,8 @@ All notable changes to etw-mcp are documented here. Format follows [Keep a Chang
 
 ## [Unreleased]
 
+## [0.9.4] - 2026-09-25
+
 ### Fixed
 
 - PDB validation now uses the DBI/CodeView age (the same identity SymChk
@@ -16,6 +18,10 @@ All notable changes to etw-mcp are documented here. Format follows [Keep a Chang
   reports unresolved modules instead of implying 100% success. Wrong-build PDB
   function names are suppressed while module attribution and valid export
   fallback remain available.
+- Exact PDB lookup now evaluates symbol-path entries independently, skips
+  inaccessible stores, rejects stale GUID or DBI-age candidates, and continues
+  until it finds an exact trace identity. Symbol diagnostics and disk
+  reconciliation likewise tolerate inaccessible UNC paths instead of aborting.
 - Logical-processor metadata now prefers positive ETL header counts and uses
   the highest observed CPU ID only as a fallback lower bound. Streaming and
   materialized outputs keep trace metadata, timelines, and per-CPU views

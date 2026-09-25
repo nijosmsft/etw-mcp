@@ -423,6 +423,64 @@ def test_k2_add_module_loads_from_found_pdb_path(monkeypatch):
     )
 
 
+def test_k2_skips_wrong_candidate_and_loads_later_exact_match(monkeypatch):
+    """A wrong PDB in an earlier symbol-path entry must not mask an exact one."""
+    from etw_analyzer.native import symbolizer as symbolizer_mod
+    from etw_analyzer.native.pdb_identity import PdbIdentity
+    from etw_analyzer.native.symbolizer import Symbolizer
+
+    wrong_path = r"C:\stale\ntkrnlmp.pdb"
+    exact_path = r"C:\exact\ntkrnlmp.pdb"
+    find_calls: list[str] = []
+    load_calls: list[dict[str, Any]] = []
+
+    def _find(
+        handle, search_path, file_name, id_ptr, two, three, flags,
+        found_file, callback, context,
+    ):
+        find_calls.append(search_path)
+        found_file.value = wrong_path if search_path == r"C:\stale" else exact_path
+        return 1
+
+    def _identity(path: Path) -> PdbIdentity:
+        if str(path) == wrong_path:
+            return PdbIdentity(
+                guid="00000000000000000000000000000000",
+                age=_NTOSKRNL_AGE,
+                info_age=_NTOSKRNL_AGE,
+            )
+        return PdbIdentity(
+            guid=_NTOSKRNL_GUID.replace("-", ""),
+            age=_NTOSKRNL_AGE,
+            info_age=_NTOSKRNL_AGE + 1,
+        )
+
+    monkeypatch.setattr(symbolizer_mod, "classify_pdb_format", lambda _path: "msf7")
+    monkeypatch.setattr(symbolizer_mod, "read_pdb_identity", _identity)
+
+    with Symbolizer(symbol_path=r"C:\stale;C:\exact") as sym:
+        monkeypatch.setattr(sym._dbghelp, "SymFindFileInPathW", _find)
+        monkeypatch.setattr(
+            sym._dbghelp,
+            "SymLoadModuleExW",
+            _make_load_fake(load_calls),
+        )
+        monkeypatch.setattr(sym._dbghelp, "SymGetModuleInfoW64", lambda *a: 0)
+
+        sym.add_module(
+            _FAKE_BASE, _FAKE_SIZE, _FAKE_IMAGE,
+            pdb_guid=_NTOSKRNL_GUID,
+            pdb_age=_NTOSKRNL_AGE,
+            pdb_name=_NTOSKRNL_PDB,
+        )
+        _force_lazy_load(sym)
+
+    assert find_calls == [r"C:\stale", r"C:\exact"]
+    assert [call["image_name"] for call in load_calls] == [exact_path]
+    assert sym._modules[_FAKE_BASE]["candidate_pdb_path"] == exact_path
+    assert sym._modules[_FAKE_BASE]["candidate_dbi_age"] == _NTOSKRNL_AGE
+
+
 def test_k2_add_module_does_not_load_wrong_image_when_guid_not_found(monkeypatch):
     """A strict trace identity miss must not load an arbitrary local image."""
     from etw_analyzer.native.symbolizer import Symbolizer
@@ -449,7 +507,7 @@ def test_k2_add_module_does_not_load_wrong_image_when_guid_not_found(monkeypatch
         _force_lazy_load(sym)
 
     # SymFindFileInPathW was attempted.
-    assert len(find_calls) == 1
+    assert find_calls
     assert load_calls == []
     assert sym._modules[_FAKE_BASE]["load_state"] == "not_found"
 

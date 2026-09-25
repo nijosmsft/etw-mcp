@@ -152,8 +152,8 @@ def _trace_pdb_disk_verdict(trace, module_name: str, sym_path: str) -> str:
 
     saw_candidate = False
     saw_identity_error = False
-    try:
-        for _kind, dir_path in parse_symbol_path(sym_path):
+    for _kind, dir_path in parse_symbol_path(sym_path):
+        try:
             if not dir_path.exists():
                 continue
 
@@ -197,8 +197,8 @@ def _trace_pdb_disk_verdict(trace, module_name: str, sym_path: str) -> str:
                     # still a (weaker) match only when the trace age is unknown.
                     if trace_age is None and folder[:32] == trace_guid_norm:
                         return "match"
-    except Exception:
-        return "unknown"
+        except OSError:
+            continue
     if saw_identity_error:
         return "invalid"
     return "mismatch" if saw_candidate else "unknown"

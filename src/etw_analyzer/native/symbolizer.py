@@ -88,6 +88,12 @@ def resolve_symbol_path(symbol_path: Optional[str]) -> str:
     return _DEFAULT_SYMBOL_PATH
 
 
+def _symbol_path_entries(symbol_path: str) -> list[str]:
+    """Return ordered, non-empty entries from a Windows symbol path."""
+
+    return [entry.strip() for entry in symbol_path.split(";") if entry.strip()]
+
+
 def is_available() -> bool:
     """Return ``True`` when ``dbghelp.dll`` can be loaded on this host."""
 
@@ -431,64 +437,85 @@ class Symbolizer:
                 from .bindings.types import guid_from_string
 
                 guid = guid_from_string(str(pdb_guid))
-                found_buf = ctypes.create_unicode_buffer(1024)
-                ok = d.SymFindFileInPathW(
-                    self._handle,
-                    None,           # use search path from SymInitializeW
-                    str(pdb_name),
-                    ctypes.cast(ctypes.pointer(guid), ctypes.c_void_p),
-                    wintypes.DWORD(int(pdb_age or 0)),
-                    wintypes.DWORD(0),
-                    wintypes.DWORD(d.SSRVOPT_GUIDPTR),
-                    found_buf,
-                    None,
-                    None,
-                )
-                if ok and found_buf.value:
-                    found_pdb_path = found_buf.value
-                    module["candidate_pdb_path"] = found_pdb_path
-                    candidate_identity_verified = False
-                    candidate_identity = None
-                    candidate_format = classify_pdb_format(
-                        Path(found_pdb_path)
-                    )
+                found_pdb_path = None
+                candidate_identity_verified = False
+                candidate_identity = None
+                candidate_format = "unknown"
+                mismatches: list[str] = []
+                invalid_candidates: list[str] = []
+                search_errors: list[str] = []
+                last_error = 0
+
+                # Query each symbol-path entry independently. DbgHelp can return
+                # a stale basename match from an earlier cache even when a later
+                # entry contains the exact GUID+Age PDB. Verify every result and
+                # keep searching until an exact identity is found.
+                for search_path in _symbol_path_entries(self._symbol_path):
+                    found_buf = ctypes.create_unicode_buffer(1024)
+                    ctypes.set_last_error(0)
                     try:
-                        candidate_identity = read_pdb_identity(
-                            Path(found_pdb_path)
+                        ok = d.SymFindFileInPathW(
+                            self._handle,
+                            search_path,
+                            str(pdb_name),
+                            ctypes.cast(ctypes.pointer(guid), ctypes.c_void_p),
+                            wintypes.DWORD(int(pdb_age or 0)),
+                            wintypes.DWORD(0),
+                            wintypes.DWORD(d.SSRVOPT_GUIDPTR),
+                            found_buf,
+                            None,
+                            None,
                         )
+                    except OSError as exc:
+                        search_errors.append(f"{search_path}: {exc}")
+                        continue
+                    last_error = ctypes.get_last_error()
+                    if not ok or not found_buf.value:
+                        continue
+
+                    candidate_path = Path(found_buf.value)
+                    candidate_format = classify_pdb_format(candidate_path)
+                    try:
+                        identity = read_pdb_identity(candidate_path)
                     except UnsupportedPdbFormatError as exc:
-                        if candidate_format != "msfz":
-                            module["load_state"] = "unsupported"
-                            module["load_error"] = str(exc)
-                            return
-                    except PdbIdentityError as exc:
-                        module["load_state"] = "invalid"
-                        module["load_error"] = (
-                            f"Candidate PDB identity is invalid: {exc}"
+                        if candidate_format == "msfz":
+                            found_pdb_path = str(candidate_path)
+                            candidate_identity = None
+                            break
+                        invalid_candidates.append(
+                            f"{candidate_path}: {exc}"
                         )
-                        return
+                        continue
+                    except PdbIdentityError as exc:
+                        invalid_candidates.append(
+                            f"{candidate_path}: {exc}"
+                        )
+                        continue
                     else:
-                        candidate_identity_verified = (
+                        identity_matches = (
                             _guids_equal(
                                 str(pdb_guid),
-                                candidate_identity.guid,
+                                identity.guid,
                             )
                             and pdb_age is not None
-                            and int(pdb_age) == candidate_identity.age
+                            and int(pdb_age) == identity.age
                         )
-                        module["candidate_info_age"] = (
-                            candidate_identity.info_age
-                        )
-                        module["candidate_dbi_age"] = candidate_identity.age
-                        if not candidate_identity_verified:
-                            module["load_state"] = "mismatched"
-                            module["load_error"] = (
-                                "Candidate PDB does not match trace RSDS "
-                                f"identity: candidate GUID="
-                                f"{candidate_identity.guid}, DBI age="
-                                f"{candidate_identity.age}"
+                        if not identity_matches:
+                            module["candidate_pdb_path"] = str(candidate_path)
+                            mismatches.append(
+                                f"{candidate_path}: GUID={identity.guid}, "
+                                f"DBI age={identity.age}"
                             )
-                            return
+                            continue
+                        found_pdb_path = str(candidate_path)
+                        candidate_identity = identity
+                        candidate_identity_verified = True
+                        module["candidate_info_age"] = identity.info_age
+                        module["candidate_dbi_age"] = identity.age
+                        break
+
+                if found_pdb_path:
+                    module["candidate_pdb_path"] = found_pdb_path
                     logger.debug(
                         "SymFindFileInPathW found %s -> %s",
                         pdb_name, found_pdb_path,
@@ -624,15 +651,32 @@ class Symbolizer:
                             pass
                     return
 
-                err = ctypes.get_last_error()
-                module["load_state"] = "not_found"
-                module["load_error"] = (
-                    f"No exact PDB found for GUID={pdb_guid} age={pdb_age} "
-                    f"(GetLastError={err})"
-                )
+                if mismatches:
+                    module["load_state"] = "mismatched"
+                    module["load_error"] = (
+                        "Candidate PDBs did not match trace RSDS identity: "
+                        + "; ".join(mismatches)
+                    )
+                elif invalid_candidates:
+                    module["load_state"] = "invalid"
+                    module["load_error"] = (
+                        "Candidate PDB identities are invalid: "
+                        + "; ".join(invalid_candidates)
+                    )
+                else:
+                    module["load_state"] = "not_found"
+                    module["load_error"] = (
+                        f"No exact PDB found for GUID={pdb_guid} age={pdb_age} "
+                        f"(GetLastError={last_error})"
+                    )
+                    if search_errors:
+                        module["load_error"] += (
+                            "; inaccessible symbol path entries: "
+                            + "; ".join(search_errors)
+                        )
                 logger.debug(
                     "SymFindFileInPathW miss for %s GUID=%s age=%s err=%d",
-                    pdb_name, pdb_guid, pdb_age, err,
+                    pdb_name, pdb_guid, pdb_age, last_error,
                 )
             except Exception as exc:
                 module["load_state"] = "error"
