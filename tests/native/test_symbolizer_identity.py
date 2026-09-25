@@ -481,12 +481,125 @@ def test_k2_skips_wrong_candidate_and_loads_later_exact_match(monkeypatch):
     assert sym._modules[_FAKE_BASE]["candidate_dbi_age"] == _NTOSKRNL_AGE
 
 
+def test_k2_loads_exact_flat_candidate_when_dbghelp_lookup_misses(monkeypatch):
+    """A verified flat PDB must load even when SymFindFileInPathW misses it."""
+    from etw_analyzer.native import symbolizer as symbolizer_mod
+    from etw_analyzer.native.pdb_identity import PdbIdentity
+    from etw_analyzer.native.symbolizer import Symbolizer
+
+    flat_path = Path(r"\\server\symbols\ntkrnlmp.pdb")
+    load_calls: list[dict[str, Any]] = []
+
+    monkeypatch.setattr(
+        symbolizer_mod,
+        "candidate_pdb_paths",
+        lambda *_args: [flat_path],
+    )
+    monkeypatch.setattr(symbolizer_mod, "classify_pdb_format", lambda _path: "msf7")
+    monkeypatch.setattr(
+        symbolizer_mod,
+        "read_pdb_identity",
+        lambda _path: PdbIdentity(
+            guid=_NTOSKRNL_GUID.replace("-", ""),
+            age=_NTOSKRNL_AGE,
+            info_age=_NTOSKRNL_AGE + 1,
+        ),
+    )
+
+    with Symbolizer(symbol_path=r"\\server\symbols") as sym:
+        monkeypatch.setattr(
+            sym._dbghelp,
+            "SymFindFileInPathW",
+            _make_find_fake(found_path=None, calls=[]),
+        )
+        monkeypatch.setattr(
+            sym._dbghelp,
+            "SymLoadModuleExW",
+            _make_load_fake(load_calls),
+        )
+        monkeypatch.setattr(sym._dbghelp, "SymGetModuleInfoW64", lambda *a: 0)
+
+        sym.add_module(
+            _FAKE_BASE, _FAKE_SIZE, _FAKE_IMAGE,
+            pdb_guid=_NTOSKRNL_GUID,
+            pdb_age=_NTOSKRNL_AGE,
+            pdb_name=_NTOSKRNL_PDB,
+        )
+        _force_lazy_load(sym)
+
+    assert [call["image_name"] for call in load_calls] == [str(flat_path)]
+    assert sym._modules[_FAKE_BASE]["candidate_pdb_path"] == str(flat_path)
+    assert sym._modules[_FAKE_BASE]["candidate_dbi_age"] == _NTOSKRNL_AGE
+
+
+def test_k2_loads_exact_msfz_symstore_candidate_on_lookup_miss(monkeypatch):
+    """An exact symstore folder permits an MSFZ candidate DbgHelp can load."""
+    from etw_analyzer.native import symbolizer as symbolizer_mod
+    from etw_analyzer.native.pdb_identity import UnsupportedPdbFormatError
+    from etw_analyzer.native.symbolizer import Symbolizer
+
+    msfz_path = Path(
+        r"C:\symbols\ntkrnlmp.pdb"
+        r"\AFB1E3B137548BA73B92C060D6D5605F1\ntkrnlmp.pdb"
+    )
+    load_calls: list[dict[str, Any]] = []
+
+    monkeypatch.setattr(
+        symbolizer_mod,
+        "candidate_pdb_paths",
+        lambda *_args: [msfz_path],
+    )
+    monkeypatch.setattr(symbolizer_mod, "classify_pdb_format", lambda _path: "msfz")
+    monkeypatch.setattr(
+        symbolizer_mod,
+        "read_pdb_identity",
+        lambda _path: (_ for _ in ()).throw(
+            UnsupportedPdbFormatError("MSFZ requires DbgHelp")
+        ),
+    )
+    monkeypatch.setattr(
+        symbolizer_mod,
+        "symstore_folder_identity",
+        lambda _path: (_NTOSKRNL_GUID.replace("-", ""), _NTOSKRNL_AGE),
+    )
+
+    with Symbolizer(symbol_path=r"C:\symbols") as sym:
+        monkeypatch.setattr(
+            sym._dbghelp,
+            "SymFindFileInPathW",
+            _make_find_fake(found_path=None, calls=[]),
+        )
+        monkeypatch.setattr(
+            sym._dbghelp,
+            "SymLoadModuleExW",
+            _make_load_fake(load_calls),
+        )
+        monkeypatch.setattr(sym._dbghelp, "SymGetModuleInfoW64", lambda *a: 0)
+
+        sym.add_module(
+            _FAKE_BASE, _FAKE_SIZE, _FAKE_IMAGE,
+            pdb_guid=_NTOSKRNL_GUID,
+            pdb_age=_NTOSKRNL_AGE,
+            pdb_name=_NTOSKRNL_PDB,
+        )
+        _force_lazy_load(sym)
+
+    assert [call["image_name"] for call in load_calls] == [str(msfz_path)]
+    assert sym._modules[_FAKE_BASE]["candidate_pdb_path"] == str(msfz_path)
+
+
 def test_k2_add_module_does_not_load_wrong_image_when_guid_not_found(monkeypatch):
     """A strict trace identity miss must not load an arbitrary local image."""
     from etw_analyzer.native.symbolizer import Symbolizer
+    from etw_analyzer.native import symbolizer as symbolizer_mod
 
     find_calls: list[dict[str, Any]] = []
     load_calls: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        symbolizer_mod,
+        "candidate_pdb_paths",
+        lambda *_args: [],
+    )
 
     with Symbolizer() as sym:
         monkeypatch.setattr(
@@ -596,6 +709,13 @@ def test_k2_identity_source_recorded_on_rsds_success(monkeypatch):
 def test_k2_identity_source_stays_deferred_on_rsds_miss(monkeypatch):
     """An exact-identity miss remains unresolved instead of loading an image."""
     from etw_analyzer.native.symbolizer import Symbolizer
+    from etw_analyzer.native import symbolizer as symbolizer_mod
+
+    monkeypatch.setattr(
+        symbolizer_mod,
+        "candidate_pdb_paths",
+        lambda *_args: [],
+    )
 
     with Symbolizer() as sym:
         monkeypatch.setattr(
