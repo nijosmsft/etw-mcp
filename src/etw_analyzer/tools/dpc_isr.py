@@ -20,14 +20,11 @@ logger = logging.getLogger(__name__)
 
 
 _NO_DPC_DATA_MESSAGE = (
-    "No DPC/ISR data available in this trace. It was likely collected with a "
-    "CPU-sampling-only profile (e.g. `wpr -start CPU`) that does not record "
-    "DPC/ISR events.\n\n"
-    "To capture DPC/ISR data, use a profile that includes the DPC/ISR kernel "
-    "flag:\n"
-    "  wpr -start GeneralProfile    (includes DPC/ISR + context switches)\n"
-    "  wpr -start CPU -start DPC    (CPU sampling + DPC events)\n\n"
-    "Or use a custom .wprp profile with the DPC/ISR kernel flag enabled."
+    "No dedicated DPC/ISR duration events are available in this trace. "
+    "CPU-sampling stacks cannot reconstruct DPC counts or durations.\n\n"
+    "Re-collect with etw-mcp's `cpu_dpc_isr` profile (or another bundled "
+    "profile that includes DPC and Interrupt events) before making DPC/ISR "
+    "duration claims."
 )
 
 
@@ -254,7 +251,7 @@ def get_dpc_per_cpu(
     if cpu_df is not None and "Module" in cpu_df.columns:
         return _dpc_from_sampling(cpu_df, module_filter, max_rows)
 
-    return "*No per-CPU DPC data available.*"
+    return f"*{_NO_DPC_DATA_MESSAGE}*"
 
 
 def _structured_per_cpu_dpc(
@@ -422,7 +419,14 @@ def _dpc_from_sampling(cpu_df: pd.DataFrame, module_filter: str | None, max_rows
     result = result.sort_values("Weight", ascending=False).head(max_rows)
     result["% Weight"] = (result["Weight"] / result["Weight"].sum() * 100).apply(format_pct)
 
-    return f"**DPC Approximation from CPU Sampling** (no dedicated DPC data)\n\n{format_table(result)}"
+    return (
+        "**DPC-like Module Samples** (sampling fallback; not DPC duration)\n\n"
+        "Dedicated DPC/Interrupt events were not captured. These rows show "
+        "CPU sample weight in DPC-associated modules; they do not measure DPC "
+        "counts or durations. Re-collect with the `cpu_dpc_isr` profile for "
+        "duration analysis.\n\n"
+        f"{format_table(result)}"
+    )
 
 
 def _global_health(df: pd.DataFrame) -> list[str]:

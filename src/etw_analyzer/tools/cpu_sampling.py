@@ -337,24 +337,75 @@ def _denominator_weight(
     raise ValueError("denominator must be one of: trace, active_cpus, active_busy, custom")
 
 
-def _get_per_cpu_sampling_df(
+def _trace_metadata_value(trace: TraceData, column: str) -> float | None:
+    """Return one positive numeric trace metadata value."""
+
+    df = trace.raw_csv.get("trace_metadata")
+    if df is None or df.empty or column not in df.columns:
+        return None
+    values = pd.to_numeric(df[column], errors="coerce").dropna()
+    values = values[values > 0]
+    return float(values.iloc[0]) if not values.empty else None
+
+
+def _sample_relative_seconds(
     trace: TraceData,
-    cpu_filter: str,
+    timestamps: pd.Series,
+) -> pd.Series:
+    """Convert raw sample timestamps to seconds from trace start."""
+
+    values = pd.to_numeric(timestamps, errors="coerce")
+    valid = values.dropna()
+    if valid.empty:
+        raise ValueError(
+            "Time-window filtering requires numeric SampledProfile timestamps."
+        )
+
+    duration = getattr(trace, "duration_seconds", None)
+    if not duration or duration <= 0:
+        duration = _trace_metadata_value(trace, "DurationSeconds")
+
+    # Native extraction and xperf dumper rows use relative microseconds.
+    if duration and duration > 0:
+        duration_us = float(duration) * 1_000_000.0
+        tolerance = max(1_000_000.0, duration_us * 0.05)
+        if float(valid.min()) >= -tolerance and float(valid.max()) <= duration_us + tolerance:
+            return values / 1_000_000.0
+
+    frequency = getattr(trace, "timestamp_frequency", None)
+    if not frequency or frequency <= 0:
+        frequency = _trace_metadata_value(trace, "PerfFreq")
+    if not frequency or frequency <= 0:
+        frequency = 1_000_000.0
+
+    # Sidecar caches may retain raw QPC ticks. Event-store reads normally
+    # expose relative TimeStamp already; for raw QPC, the first sample is the
+    # best available origin when the header QPC origin is not materialized.
+    origin = None
+    header = trace.raw_csv.get("EventTrace/Header")
+    if header is not None and not header.empty and "TimeStamp" in header.columns:
+        header_values = pd.to_numeric(header["TimeStamp"], errors="coerce").dropna()
+        if not header_values.empty:
+            origin = float(header_values.iloc[0])
+    if origin is None:
+        origin = float(valid.min())
+    return (values - origin) / float(frequency)
+
+
+def _get_filtered_sampling_df(
+    trace: TraceData,
+    cpu_filter: str | None = None,
     start_time: float | None = None,
     end_time: float | None = None,
 ) -> pd.DataFrame:
-    """Get per-CPU sampling data from cached dumper output.
+    """Get filtered, symbolized rows from raw SampledProfile data.
 
     The background dumper extraction starts automatically after load_trace.
-    This function waits for it to complete (if still running), then filters
-    in-memory. If background extraction hasn't started, falls back to
-    synchronous extraction.
+    Filtering happens before symbol resolution so only surviving unique
+    instruction pointers pay the DbgHelp cost.
     """
-    # Wait for background extraction (started by load_trace)
-    # If already done or parquet was loaded, this returns immediately.
     dumper_df = trace.wait_for_dumper()
 
-    # Fallback: if background extraction didn't run (e.g. old trace state)
     if dumper_df is None:
         with trace.lock:
             dumper_df = trace.dumper_df
@@ -376,20 +427,67 @@ def _get_per_cpu_sampling_df(
                     dumper_df.to_parquet(trace.export_dir / "sampled_profile.parquet", index=False)
 
     if dumper_df is None or dumper_df.empty:
-        return pd.DataFrame()
+        dumper_df = _load_raw_samples(trace)
+    if dumper_df is None or dumper_df.empty:
+        raise ValueError(
+            "CPU/time filtering requires raw timestamped SampledProfile "
+            "events; this trace only has aggregate CPU data."
+        )
 
-    # Filter in-memory by CPU and time range
-    df = dumper_df
+    df = dumper_df.copy()
     cpu_list = parse_cpu_filter(cpu_filter)
     if cpu_list:
+        if "CPU" not in df.columns:
+            raise ValueError(
+                "CPU filtering requires a CPU column in raw SampledProfile data."
+            )
         df = df[df["CPU"].isin(cpu_list)]
 
-    if start_time is not None:
-        df = df[df["TimeStamp"] >= start_time * 1_000_000]
-    if end_time is not None:
-        df = df[df["TimeStamp"] <= end_time * 1_000_000]
+    if start_time is not None or end_time is not None:
+        time_col = _find_col(df, ["TimeStamp", "TimeStampQpc", "Time"])
+        if time_col is None:
+            raise ValueError(
+                "Time-window filtering requires timestamped raw "
+                "SampledProfile events; no timestamp column is available."
+            )
+        relative_seconds = _sample_relative_seconds(trace, df[time_col])
+        if start_time is not None:
+            df = df[relative_seconds >= float(start_time)]
+            relative_seconds = relative_seconds.loc[df.index]
+        if end_time is not None:
+            df = df[relative_seconds <= float(end_time)]
 
-    return df.copy()
+    if "PID" not in df.columns and "ProcessId" in df.columns:
+        df["PID"] = df["ProcessId"]
+    process_col = _find_col(df, ["Process Name", "ProcessName", "ImageName"])
+    if process_col is not None and process_col != "Process Name":
+        df["Process Name"] = df[process_col]
+    elif "Process Name" not in df.columns:
+        df["Process Name"] = "unknown"
+
+    df = _attribute_modules_from_ranges(trace, df)
+    return _resolve_deferred_instruction_pointers(
+        trace,
+        df,
+        module_col="Module",
+        function_col="Function",
+    )
+
+
+def _get_per_cpu_sampling_df(
+    trace: TraceData,
+    cpu_filter: str,
+    start_time: float | None = None,
+    end_time: float | None = None,
+) -> pd.DataFrame:
+    """Backward-compatible wrapper for filtered raw sampling data."""
+
+    return _get_filtered_sampling_df(
+        trace,
+        cpu_filter=cpu_filter,
+        start_time=start_time,
+        end_time=end_time,
+    )
 
 
 @mcp.tool()
@@ -428,16 +526,29 @@ def get_cpu_samples(
     """
     trace = require_trace(trace_id)
 
-    # When cpu_filter is specified, use per-CPU extraction from raw dumper events
-    if cpu_filter:
-        df = _get_per_cpu_sampling_df(trace, cpu_filter, start_time, end_time)
+    raw_filter_requested = (
+        bool(cpu_filter)
+        or start_time is not None
+        or end_time is not None
+    )
+    if raw_filter_requested:
+        try:
+            df = _get_filtered_sampling_df(
+                trace,
+                cpu_filter=cpu_filter,
+                start_time=start_time,
+                end_time=end_time,
+            )
+        except ValueError as exc:
+            return f"*{exc}*"
         if df.empty:
-            return f"*No SampledProfile events found for CPUs {cpu_filter}. Ensure trace has CPU sampling data.*"
+            return "*No SampledProfile events match the requested CPU/time filters.*"
 
-        # Standard column names from our parser
-        weight_col, module_col, process_col, function_col = "Weight", "Module", "Process Name", "Function"
+        weight_col = _find_col(df, ["Weight", "Count", "Sample Count", "Samples"]) or "Weight"
+        module_col = _find_col(df, ["Module", "Image", "Module Name"]) or "Module"
+        process_col = _find_col(df, ["Process Name", "Process", "Process Name (PID)"]) or "Process Name"
+        function_col = _find_col(df, ["Function", "Function Name", "Symbol"]) or "Function"
 
-        # Apply remaining filters (CPU already filtered during extraction)
         df = apply_filters(
             df,
             module_filter=module_filter, module_col=module_col,
@@ -571,10 +682,23 @@ def get_hot_functions(
     else:
         target_modules = _DEFAULT_HOT_MODULES
 
-    if cpu_filter:
-        df = _get_per_cpu_sampling_df(trace, cpu_filter, start_time, end_time)
+    raw_filter_requested = (
+        bool(cpu_filter)
+        or start_time is not None
+        or end_time is not None
+    )
+    if raw_filter_requested:
+        try:
+            df = _get_filtered_sampling_df(
+                trace,
+                cpu_filter=cpu_filter,
+                start_time=start_time,
+                end_time=end_time,
+            )
+        except ValueError as exc:
+            return f"*{exc}*"
         if df.empty:
-            return f"*No SampledProfile events found for CPUs {cpu_filter}.*"
+            return "*No SampledProfile events match the requested CPU/time filters.*"
         weight_col, module_col, function_col = "Weight", "Module", "Function"
     else:
         try:
@@ -668,6 +792,10 @@ def get_hot_functions(
     denominator_weight, pct_label = _denominator_weight(
         trace, float(total_all), denominator, cpu_filter, denominator_lps, denominator_seconds
     )
+    denominator_label = denominator
+    if raw_filter_requested and (denominator or "trace").lower() == "trace":
+        pct_label = "% filtered"
+        denominator_label = "filtered samples"
     result[pct_label] = (result[weight_col] / denominator_weight * 100).apply(format_pct)
 
     # Run CPUMAP-specific analysis only when XDP modules are present
@@ -695,7 +823,7 @@ def get_hot_functions(
     filters_desc = _describe_filters(cpu_filter, None, None, start_time, end_time)
     if filters_desc:
         header += f"\n{filters_desc}"
-    header += f"\nDenominator ({denominator}): {denominator_weight:,.0f}"
+    header += f"\nDenominator ({denominator_label}): {denominator_weight:,.0f}"
 
     output = f"{header}\n\n{format_table(result, max_rows=max_rows)}"
 

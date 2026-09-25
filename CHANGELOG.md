@@ -4,6 +4,20 @@ All notable changes to etw-mcp are documented here. Format follows [Keep a Chang
 
 ## [Unreleased]
 
+### Fixed
+
+- CPU sample time windows now filter timestamped raw SampledProfile rows before
+  aggregation instead of displaying a window label over trace-wide weights.
+  CPU- and time-filtered queries resolve only the surviving unique instruction
+  pointers, preserving trustworthy function names and `SymbolSource`.
+- DPC tools now state when a trace lacks dedicated DPC/Interrupt duration
+  events, distinguish sampling-based module weight from measured DPC time, and
+  recommend the bundled `cpu_dpc_isr` profile for duration analysis.
+- Native symbol loading now falls back to enumerating flat local and UNC PDB
+  directories when DbgHelp's GUID lookup does not return an exact candidate.
+  Candidates are still accepted only after strict GUID + DBI-age validation;
+  exact MSFZ symstore entries remain supported through their folder identity.
+
 ## [0.9.4] - 2026-09-25
 
 ### Fixed
