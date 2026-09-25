@@ -27,7 +27,7 @@ uv venv --python 3.11 $install
 
 # Optional: use a private, corporate, or approved package mirror for dependencies.
 # $env:UV_INDEX_URL = 'https://your-package-index.example/simple'
-uv pip install --python "$install\Scripts\python.exe" 'https://github.com/nijosmsft/etw-mcp/releases/download/v0.9.3/etw_mcp-0.9.3-py3-none-any.whl'
+uv pip install --python "$install\Scripts\python.exe" 'https://github.com/nijosmsft/etw-mcp/releases/download/v0.9.4/etw_mcp-0.9.4-py3-none-any.whl'
 ```
 
 When `UV_INDEX_URL` is unset, uv uses its default public package index. Setting it before `uv pip install` changes dependency resolution only; the etw-mcp wheel still comes from the explicit GitHub URL. Omit or unset it to use uv's default index. After installation, do not add `UV_INDEX_URL` to the MCP runtime config unless your environment independently requires it.
@@ -93,7 +93,7 @@ uv venv --python 3.11 $install
 # $env:UV_INDEX_URL = 'https://your-package-index.example/simple'
 
 # 4. Install the pinned release once
-uv pip install --python "$install\Scripts\python.exe" 'https://github.com/nijosmsft/etw-mcp/releases/download/v0.9.3/etw_mcp-0.9.3-py3-none-any.whl'
+uv pip install --python "$install\Scripts\python.exe" 'https://github.com/nijosmsft/etw-mcp/releases/download/v0.9.4/etw_mcp-0.9.4-py3-none-any.whl'
 
 # 5. Optional smoke test (Ctrl+C to stop)
 & "$install\Scripts\python.exe" -m etw_analyzer.server
@@ -461,7 +461,7 @@ The wheel auto-bootstraps the matching binary on first use, so most users don't 
 # Option A — download the prebuilt asset
 New-Item -ItemType Directory -Force -Path "$env:LOCALAPPDATA\etw-mcp\sidecar\v0.9.3" | Out-Null
 Invoke-WebRequest `
-  -Uri "https://github.com/nijosmsft/etw-mcp/releases/download/v0.9.3/etw-extract.exe" `
+  -Uri "https://github.com/nijosmsft/etw-mcp/releases/download/v0.9.4/etw-extract.exe" `
   -OutFile "$env:LOCALAPPDATA\etw-mcp\sidecar\v0.9.3\etw-extract.exe"
 
 # Option B — build from source (no .NET runtime required for the resulting binary; only for the build)
