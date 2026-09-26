@@ -15,6 +15,11 @@ All notable changes to etw-mcp are documented here. Format follows [Keep a Chang
   both ETLs and returns their progress immediately instead of synchronously
   exporting two traces through xperf. It waits for each load job to finish
   before using partially registered trace state.
+- Stack-chain queries now reuse immutable aggregate DataFrames and compact
+  per-trace edge indexes instead of copying the complete caller table for every
+  visited node. Branching walks are capped at 200 rows by default (1000
+  maximum), report truncation explicitly, and limit concurrent stack queries
+  per trace so parallel requests cannot exhaust server memory.
 - CPU sample time windows now filter timestamped raw SampledProfile rows before
   aggregation instead of displaying a window label over trace-wide weights.
   CPU- and time-filtered queries resolve only the surviving unique instruction

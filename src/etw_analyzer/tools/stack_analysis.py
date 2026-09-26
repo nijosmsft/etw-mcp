@@ -5,6 +5,9 @@ from __future__ import annotations
 import csv
 import io
 import re
+import threading
+from collections import deque
+from contextlib import contextmanager
 
 from etw_analyzer.app import mcp
 from etw_analyzer.trace_state import TraceData, require_trace
@@ -19,19 +22,24 @@ from etw_analyzer.formatting.markdown import format_table, format_pct
 import pandas as pd
 
 
+_DEFAULT_STACK_WALK_ROWS = 200
+_MAX_STACK_WALK_ROWS = 1000
+_STACK_QUERY_CONCURRENCY = 2
+
+
 def _get_stacks_df(trace: TraceData) -> pd.DataFrame | None:
     """Get the butterfly stack DataFrame if available."""
     for key in ["stacks", "stack_butterfly"]:
         if key in trace.raw_csv:
             df = trace.raw_csv[key]
             if not df.empty and "Module" in df.columns and not _stacks_are_unresolved(df):
-                return df.copy()
+                return df
     _ensure_lazy_stack_aggregates(trace, include_callers=False)
     for key in ["stacks", "stack_butterfly"]:
         if key in trace.raw_csv:
             df = trace.raw_csv[key]
             if not df.empty and "Module" in df.columns:
-                return df.copy()
+                return df
     return None
 
 
@@ -43,7 +51,96 @@ def _get_callers_df(trace: TraceData) -> pd.DataFrame | None:
         df = trace.raw_csv.get("stacks_callers")
     if df is None or df.empty:
         return None
-    return df.copy()
+    return df
+
+
+@contextmanager
+def _stack_query_slot(trace: TraceData):
+    """Bound concurrent stack analysis so parallel MCP calls cannot exhaust RAM."""
+
+    with trace.lock:
+        gate = getattr(trace, "_stack_query_gate", None)
+        if gate is None:
+            gate = threading.BoundedSemaphore(_STACK_QUERY_CONCURRENCY)
+            trace._stack_query_gate = gate
+    acquired = gate.acquire(timeout=0.1)
+    try:
+        yield acquired
+    finally:
+        if acquired:
+            gate.release()
+
+
+def _stack_query_busy_message() -> str:
+    return (
+        "*This trace already has the maximum number of stack queries running. "
+        "Retry after one completes; parallel branching walks are limited to "
+        f"{_STACK_QUERY_CONCURRENCY} to protect the MCP server from memory exhaustion.*"
+    )
+
+
+def _validate_stack_walk_rows(max_rows: int) -> int:
+    value = int(max_rows)
+    if value < 1 or value > _MAX_STACK_WALK_ROWS:
+        raise ValueError(
+            f"max_rows must be between 1 and {_MAX_STACK_WALK_ROWS}."
+        )
+    return value
+
+
+def _stack_edge_index(
+    trace: TraceData,
+    callers_df: pd.DataFrame,
+) -> dict[tuple[str, str, str], list[int]]:
+    """Build a compact exact-node edge index once per callers DataFrame."""
+
+    source_id = id(callers_df)
+    with trace.lock:
+        cached = getattr(trace, "_stack_edge_index_cache", None)
+        if cached is not None and cached[0] == source_id:
+            return cached[1]
+
+        index: dict[tuple[str, str, str], list[int]] = {}
+        columns = callers_df[
+            ["Direction", "Target_Module", "Target_Function"]
+        ]
+        for row_index, (direction, module, function) in enumerate(
+            columns.itertuples(index=False, name=None)
+        ):
+            key = (
+                str(direction).lower(),
+                str(module).lower(),
+                str(function).lower(),
+            )
+            index.setdefault(key, []).append(row_index)
+        trace._stack_edge_index_cache = (source_id, index)
+        return index
+
+
+def _stack_inclusive_index(
+    trace: TraceData,
+    stacks_df: pd.DataFrame,
+) -> dict[tuple[str, str], int]:
+    """Build exact-node inclusive weights once per stacks DataFrame."""
+
+    source_id = id(stacks_df)
+    with trace.lock:
+        cached = getattr(trace, "_stack_inclusive_index_cache", None)
+        if cached is not None and cached[0] == source_id:
+            return cached[1]
+
+        index: dict[tuple[str, str], int] = {}
+        columns = stacks_df[["Module", "Function", "Inclusive"]]
+        for module, function, inclusive in columns.itertuples(
+            index=False,
+            name=None,
+        ):
+            key = (str(module).lower(), str(function).lower())
+            value = int(inclusive or 0)
+            if value > index.get(key, 0):
+                index[key] = value
+        trace._stack_inclusive_index_cache = (source_id, index)
+        return index
 
 
 def _stacks_are_unresolved(df: pd.DataFrame | None) -> bool:
@@ -169,25 +266,31 @@ def _ensure_lazy_stack_aggregates(
     *,
     include_callers: bool,
 ) -> None:
-    if getattr(trace, "mode", None) == "native" and getattr(trace, "event_store", None) is not None:
-        try:
-            from etw_analyzer.native.aggregators.stack_butterfly import ensure_stack_aggregates
+    with trace.lock:
+        if (
+            getattr(trace, "mode", None) == "native"
+            and getattr(trace, "event_store", None) is not None
+        ):
+            try:
+                from etw_analyzer.native.aggregators.stack_butterfly import (
+                    ensure_stack_aggregates,
+                )
 
-            ensure_stack_aggregates(trace, include_callers=include_callers)
-        except Exception:
-            pass
+                ensure_stack_aggregates(trace, include_callers=include_callers)
+            except Exception:
+                pass
 
-    # Fallback for dotnet/native parquet caches: the on-disk sampled_profile
-    # carries the per-sample stacks but the cached ``stacks`` dataset was
-    # deferred. Build it once, on demand, from the raw frames.
-    if _stacks_are_unresolved(trace.raw_csv.get("stacks")) and not getattr(
-        trace, "_stacks_raw_attempted", False
-    ):
-        try:
+        # Fallback for dotnet/native parquet caches: the on-disk sampled_profile
+        # carries the per-sample stacks but the cached ``stacks`` dataset was
+        # deferred. Build it once, on demand from the raw frames.
+        if _stacks_are_unresolved(trace.raw_csv.get("stacks")) and not getattr(
+            trace, "_stacks_raw_attempted", False
+        ):
             trace._stacks_raw_attempted = True
-        except Exception:
-            pass
-        _build_stacks_from_sampled_parquet(trace, include_callers=include_callers)
+            _build_stacks_from_sampled_parquet(
+                trace,
+                include_callers=include_callers,
+            )
 
 
 def _stack_warning_text(trace: TraceData) -> str:
@@ -413,22 +516,20 @@ def _find_stack_node(
 def _node_inclusive(trace: TraceData, module: str, function: str) -> int:
     stacks_df = _get_stacks_df(trace)
     if stacks_df is not None and not stacks_df.empty:
-        mask = (
-            stacks_df["Module"].astype(str).str.lower().eq(module.lower())
-            & stacks_df["Function"].astype(str).str.lower().eq(function.lower())
+        value = _stack_inclusive_index(trace, stacks_df).get(
+            (module.lower(), function.lower())
         )
-        if mask.any():
-            return int(stacks_df.loc[mask, "Inclusive"].max())
+        if value is not None:
+            return value
 
     callers_df = _get_callers_df(trace)
     if callers_df is not None and not callers_df.empty:
-        mask = (
-            callers_df["Target_Module"].astype(str).str.lower().eq(module.lower())
-            & callers_df["Target_Function"].astype(str).str.lower().eq(function.lower())
-            & callers_df["Direction"].astype(str).eq("self")
+        indexes = _stack_edge_index(trace, callers_df).get(
+            ("self", module.lower(), function.lower()),
+            [],
         )
-        if mask.any():
-            return int(callers_df.loc[mask, "Weight"].max())
+        if indexes:
+            return int(callers_df.loc[indexes, "Weight"].max())
     return 0
 
 
@@ -442,12 +543,13 @@ def _edges_from_node(
     if callers_df is None or callers_df.empty:
         return pd.DataFrame()
     direction = "caller" if direction == "callers" else "callee"
-    mask = (
-        callers_df["Target_Module"].astype(str).str.lower().eq(module.lower())
-        & callers_df["Target_Function"].astype(str).str.lower().eq(function.lower())
-        & callers_df["Direction"].astype(str).eq(direction)
+    indexes = _stack_edge_index(trace, callers_df).get(
+        (direction, module.lower(), function.lower()),
+        [],
     )
-    return callers_df[mask].copy().sort_values("Weight", ascending=False)
+    if not indexes:
+        return callers_df.head(0)
+    return callers_df.iloc[indexes].sort_values("Weight", ascending=False)
 
 
 @mcp.tool()
@@ -806,7 +908,8 @@ def _walk_stack_rows(
     branch_threshold_pct: float,
     max_depth: int,
     stop_at_modules: list[str] | None,
-) -> list[dict[str, object]]:
+    max_rows: int = _DEFAULT_STACK_WALK_ROWS,
+) -> tuple[list[dict[str, object]], bool]:
     direction = direction.lower()
     if direction not in {"callers", "callees"}:
         raise ValueError("direction must be one of: callers, callees")
@@ -815,7 +918,7 @@ def _walk_stack_rows(
 
     root = _find_stack_node(trace, function_filter, module_filter)
     if root is None:
-        return []
+        return [], False
 
     stop_modules = {m.lower() for m in (stop_at_modules or [])}
     root_hits = _node_inclusive(trace, root[0], root[1])
@@ -830,12 +933,12 @@ def _walk_stack_rows(
         "Branch": "root",
     }]
 
-    queue: list[tuple[int, str, str, float, tuple[tuple[str, str], ...]]] = [
+    queue = deque([
         (0, root[0], root[1], float(root_hits), ((root[0].lower(), root[1].lower()),))
-    ]
+    ])
 
     while queue:
-        depth, module, function, chain_hits, path = queue.pop(0)
+        depth, module, function, chain_hits, path = queue.popleft()
         if depth >= max_depth:
             continue
         if depth > 0 and module.lower() in stop_modules:
@@ -848,6 +951,8 @@ def _walk_stack_rows(
         selected = _select_branch_edges(edges, branch_policy, branch_threshold_pct)
         relation_total = float(edges["Weight"].sum())
         for _, edge in selected.iterrows():
+            if len(rows) >= max_rows:
+                return rows, True
             next_module = str(edge["Caller_Module"])
             next_function = str(edge["Caller_Function"])
             next_key = (next_module.lower(), next_function.lower())
@@ -877,7 +982,7 @@ def _walk_stack_rows(
             })
             queue.append((depth + 1, next_module, next_function, next_chain_hits, path + (next_key,)))
 
-    return rows
+    return rows, False
 
 
 @mcp.tool()
@@ -890,6 +995,7 @@ def walk_stack(
     branch_threshold_pct: float = 5.0,
     max_depth: int = 64,
     stop_at_modules: list[str] | None = None,
+    max_rows: int = _DEFAULT_STACK_WALK_ROWS,
 ) -> str:
     """Recursively walk caller/callee edges from a function in WPA butterfly data.
 
@@ -902,15 +1008,20 @@ def walk_stack(
         branch_threshold_pct: Minimum sibling share for branch_policy='threshold'.
         max_depth: Maximum recursion depth.
         stop_at_modules: Optional module names/substrings where traversal should stop.
+        max_rows: Maximum frames returned. Default: 200; maximum: 1000.
     """
     trace = require_trace(trace_id)
-    if _get_callers_df(trace) is None:
-        return _no_callers_message(trace)
+    max_rows = _validate_stack_walk_rows(max_rows)
+    with _stack_query_slot(trace) as acquired:
+        if not acquired:
+            return _stack_query_busy_message()
+        if _get_callers_df(trace) is None:
+            return _no_callers_message(trace)
 
-    rows = _walk_stack_rows(
-        trace, function_filter, module_filter, direction, branch_policy,
-        branch_threshold_pct, max_depth, stop_at_modules,
-    )
+        rows, truncated = _walk_stack_rows(
+            trace, function_filter, module_filter, direction, branch_policy,
+            branch_threshold_pct, max_depth, stop_at_modules, max_rows,
+        )
     if not rows:
         return f"*No stack node found matching '{function_filter}'.*"
 
@@ -921,6 +1032,8 @@ def walk_stack(
     )
     if branch_policy == "threshold":
         header += f" >= {branch_threshold_pct:.1f}%"
+    if truncated:
+        header += f"\nOutput truncated at max_rows={max_rows}."
     return header + "\n\n" + format_table(
         df[["Depth", "Frame", "Frame Hits", "% Parent", "Chain Hits", "Branch"]],
         max_rows=len(df),
@@ -951,16 +1064,34 @@ def _best_edge_weight(
     if callers_df is None or callers_df.empty:
         return 0.0, 0.0
 
-    mask = (
-        _contains_literal(callers_df["Target_Function"], source_function)
-        & _contains_literal(callers_df["Caller_Function"], target_function)
-        & callers_df["Direction"].astype(str).eq("caller")
-    )
     if source_module:
-        mask &= _contains_module_filter(callers_df["Target_Module"], source_module)
+        matches = _edges_from_node(
+            trace,
+            source_module,
+            source_function,
+            "callers",
+        )
+        if matches.empty:
+            mask = (
+                _contains_literal(callers_df["Target_Function"], source_function)
+                & _contains_module_filter(
+                    callers_df["Target_Module"],
+                    source_module,
+                )
+                & callers_df["Direction"].astype(str).eq("caller")
+            )
+            matches = callers_df[mask]
+        mask = _contains_literal(matches["Caller_Function"], target_function)
+    else:
+        mask = (
+            _contains_literal(callers_df["Target_Function"], source_function)
+            & _contains_literal(callers_df["Caller_Function"], target_function)
+            & callers_df["Direction"].astype(str).eq("caller")
+        )
+        matches = callers_df
     if target_module:
-        mask &= _contains_module_filter(callers_df["Caller_Module"], target_module)
-    matches = callers_df[mask]
+        mask &= _contains_module_filter(matches["Caller_Module"], target_module)
+    matches = matches[mask]
     if matches.empty:
         return 0.0, 0.0
     row = matches.sort_values("Weight", ascending=False).iloc[0]
@@ -1014,21 +1145,27 @@ def count_stacks(
         end_time: Reserved for future raw-stack exports.
     """
     trace = require_trace(trace_id)
-    parsed_contains = [_split_stack_ref(ref) for ref in contains]
-    parsed_excludes = [_split_stack_ref(ref) for ref in (excludes or [])]
-    if not parsed_contains:
-        raise ValueError("contains must include at least one frame.")
+    with _stack_query_slot(trace) as acquired:
+        if not acquired:
+            return _stack_query_busy_message()
+        parsed_contains = [_split_stack_ref(ref) for ref in contains]
+        parsed_excludes = [_split_stack_ref(ref) for ref in (excludes or [])]
+        if not parsed_contains:
+            raise ValueError("contains must include at least one frame.")
 
-    if contains_in_order:
-        matching_samples = _estimate_ordered_contains(trace, parsed_contains)
-    else:
-        weights = [_frame_weight(trace, ref) for ref in parsed_contains]
-        matching_samples = float(min(weights)) if all(w > 0 for w in weights) else 0.0
+        if contains_in_order:
+            matching_samples = _estimate_ordered_contains(trace, parsed_contains)
+        else:
+            weights = [_frame_weight(trace, ref) for ref in parsed_contains]
+            matching_samples = float(min(weights)) if all(w > 0 for w in weights) else 0.0
 
-    excluded_samples = 0.0
-    for excluded in parsed_excludes:
-        excluded_samples += _estimate_ordered_contains(trace, parsed_contains + [excluded])
-    matching_samples = max(0.0, matching_samples - excluded_samples)
+        excluded_samples = 0.0
+        for excluded in parsed_excludes:
+            excluded_samples += _estimate_ordered_contains(
+                trace,
+                parsed_contains + [excluded],
+            )
+        matching_samples = max(0.0, matching_samples - excluded_samples)
 
     denominator_weight, pct_label = _denominator_weight(trace, "trace", cpu_filter)
     out = pd.DataFrame([{
@@ -1094,6 +1231,7 @@ def butterfly_chain(
     branch_threshold_pct: float = 5.0,
     denominator_lps: int | None = None,
     denominator_seconds: float | None = None,
+    max_rows: int = _DEFAULT_STACK_WALK_ROWS,
 ) -> str:
     """One-shot WPA-style butterfly chain export for a target function.
 
@@ -1109,43 +1247,65 @@ def butterfly_chain(
         branch_threshold_pct: Minimum sibling share for branch_policy='threshold'.
         denominator_lps: Logical processor count for denominator='custom'.
         denominator_seconds: Duration for denominator='custom'.
+        max_rows: Maximum frames returned across all directions. Default: 200;
+            maximum: 1000.
     """
     trace = require_trace(trace_id)
     if direction not in {"callers", "callees", "both"}:
         raise ValueError("direction must be one of: callers, callees, both")
     if output_format not in {"table", "csv", "wpa_csv"}:
         raise ValueError("output_format must be one of: table, csv, wpa_csv")
-    if _get_callers_df(trace) is None:
-        return _no_callers_message(trace)
+    max_rows = _validate_stack_walk_rows(max_rows)
+    with _stack_query_slot(trace) as acquired:
+        if not acquired:
+            return _stack_query_busy_message()
+        if _get_callers_df(trace) is None:
+            return _no_callers_message(trace)
 
-    directions = ["callers", "callees"] if direction == "both" else [direction]
-    all_sections: list[str] = []
-    for one_direction in directions:
-        rows = _walk_stack_rows(
-            trace, target_function, target_module, one_direction, branch_policy,
-            branch_threshold_pct, max_depth, None,
-        )
-        if not rows:
-            all_sections.append(f"*No stack node found matching '{target_function}'.*")
-            continue
-
-        denominator_weight, pct_label = _denominator_weight(
-            trace, denominator, None, denominator_lps, denominator_seconds
-        )
-        for row in rows:
-            row[pct_label] = _pct_of(float(row["Frame Hits"]), denominator_weight)
-
-        if output_format == "csv":
-            all_sections.append(_rows_to_csv(rows))
-        elif output_format == "wpa_csv":
-            all_sections.append(_rows_to_csv(rows, wpa_csv=True))
-        else:
-            df = pd.DataFrame(rows)
-            header = (
-                f"**Butterfly chain ({one_direction}) from `{rows[0]['Frame']}`**\n"
-                f"Branch policy: {branch_policy}; Denominator ({denominator}): {denominator_weight:,.0f}"
+        directions = ["callers", "callees"] if direction == "both" else [direction]
+        all_sections: list[str] = []
+        remaining_rows = max_rows
+        for one_direction in directions:
+            rows, truncated = _walk_stack_rows(
+                trace, target_function, target_module, one_direction, branch_policy,
+                branch_threshold_pct, max_depth, None, remaining_rows,
             )
-            cols = ["Depth", "Frame", "Frame Hits", pct_label, "% Parent", "Chain Hits", "Branch"]
-            all_sections.append(header + "\n\n" + format_table(df[cols], max_rows=len(df)))
+            if not rows:
+                all_sections.append(
+                    f"*No stack node found matching '{target_function}'.*"
+                )
+                continue
+            remaining_rows = max(0, remaining_rows - len(rows))
+
+            denominator_weight, pct_label = _denominator_weight(
+                trace, denominator, None, denominator_lps, denominator_seconds
+            )
+            for row in rows:
+                row[pct_label] = _pct_of(float(row["Frame Hits"]), denominator_weight)
+
+            truncation_note = (
+                f"\nOutput truncated at max_rows={max_rows}."
+                if truncated or remaining_rows == 0
+                else ""
+            )
+            if output_format == "csv":
+                all_sections.append(_rows_to_csv(rows) + truncation_note)
+            elif output_format == "wpa_csv":
+                all_sections.append(
+                    _rows_to_csv(rows, wpa_csv=True) + truncation_note
+                )
+            else:
+                df = pd.DataFrame(rows)
+                header = (
+                    f"**Butterfly chain ({one_direction}) from `{rows[0]['Frame']}`**\n"
+                    f"Branch policy: {branch_policy}; Denominator ({denominator}): {denominator_weight:,.0f}"
+                    f"{truncation_note}"
+                )
+                cols = ["Depth", "Frame", "Frame Hits", pct_label, "% Parent", "Chain Hits", "Branch"]
+                all_sections.append(
+                    header + "\n\n" + format_table(df[cols], max_rows=len(df))
+                )
+            if remaining_rows == 0:
+                break
 
     return "\n\n".join(all_sections)
