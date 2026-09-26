@@ -6,6 +6,15 @@ All notable changes to etw-mcp are documented here. Format follows [Keep a Chang
 
 ### Fixed
 
+- Asynchronous `load_trace` now performs cache validation and registration
+  inside the background job, so `wait_seconds` bounds the entire MCP request
+  rather than extraction alone. Inline waits are capped at 20 seconds by
+  default (`ETW_MCP_MAX_INLINE_LOAD_WAIT`) to leave transport-response margin
+  when callers request 30 seconds or more.
+- `compare_traces` now starts or reuses the standard asynchronous loader for
+  both ETLs and returns their progress immediately instead of synchronously
+  exporting two traces through xperf. It waits for each load job to finish
+  before using partially registered trace state.
 - CPU sample time windows now filter timestamped raw SampledProfile rows before
   aggregation instead of displaying a window label over trace-wide weights.
   CPU- and time-filtered queries resolve only the surviving unique instruction

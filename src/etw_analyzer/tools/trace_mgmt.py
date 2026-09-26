@@ -828,40 +828,6 @@ def _format_extracting_response(
     return _format_json_status(status)
 
 
-def _try_register_cache_hit(
-    path: Path,
-    export_dir: Path,
-    sym_path: str | None,
-    resolved_mode: str,
-    load_notices: list[str],
-) -> str | None:
-    cached = _load_from_cache(export_dir, path, mode=resolved_mode)
-    if cached is None:
-        return None
-    trace_id = make_trace_id(path)
-    _telemetry.emit_with(
-        _telemetry.EVENT_LOAD_CACHE_HIT,
-        mode=resolved_mode,
-        trace_id=trace_id,
-        export_dir=export_dir,
-        datasets=len(cached),
-    )
-    try:
-        load_jobs.marker_path(export_dir).unlink(missing_ok=True)
-        load_jobs.failed_marker_path(export_dir).unlink(missing_ok=True)
-    except Exception:
-        pass
-    return _register_cached_trace(
-        path,
-        export_dir,
-        sym_path,
-        resolved_mode,
-        cached,
-        load_notices,
-        from_cache=True,
-    )
-
-
 @mcp.tool()
 def load_trace(
     etl_path: str,
@@ -884,7 +850,9 @@ def load_trace(
         mode: ``"auto"`` (default), ``"dotnet"``, ``"native"``, or ``"xperf"``.
         extra_symbol_paths: Symbol path entries appended to the selected base.
         wait_seconds: Inline wait budget for async loads. Defaults to
-            ``ETW_MCP_LOAD_WAIT`` or 20 seconds.
+            ``ETW_MCP_LOAD_WAIT`` or 20 seconds, and is capped by
+            ``ETW_MCP_MAX_INLINE_LOAD_WAIT`` (default 20) so the response
+            returns before typical MCP request deadlines.
         async_load: When true, extraction runs in a background thread and this
             call waits only up to ``wait_seconds``. Ready/cache-hit responses
             keep the historical load summary shape; slow loads return a JSON
@@ -932,7 +900,7 @@ def load_trace(
     )
 
     try:
-        resolved_mode, guardrail_notice = _resolve_mode_for_load(mode, path)
+        resolved_mode, _guardrail_notice = _resolve_mode_for_load(mode, path)
     except ValueError as e:
         return str(e)
     except RuntimeError as e:
@@ -948,7 +916,7 @@ def load_trace(
 
     xperf = find_xperf()
     if xperf is None and resolved_mode not in ("native", "dotnet"):
-        prefix = f"{guardrail_notice}\n\n" if guardrail_notice else ""
+        prefix = f"{_guardrail_notice}\n\n" if _guardrail_notice else ""
         return prefix + (
             "xperf.exe not found. Install Windows Performance Toolkit "
             "(part of Windows SDK/ADK) or add it to PATH.\n\n"
@@ -962,16 +930,9 @@ def load_trace(
             "set ETW_MCP_MODE=dotnet)."
         )
 
-    sym_path = _resolve_sym_path(symbol_path, extra_symbol_paths)
-    load_notices: list[str] = [guardrail_notice] if guardrail_notice else []
     trace_id = make_trace_id(path)
     export_dir = path.parent / f".etw-export-{path.stem}"
     wait_budget = load_jobs.load_wait_seconds(wait_seconds)
-
-    if not force:
-        ready = _try_register_cache_hit(path, export_dir, sym_path, resolved_mode, load_notices)
-        if ready is not None:
-            return ready
 
     active = load_jobs.active_job(trace_id)
     if active is not None:
@@ -980,13 +941,21 @@ def load_trace(
         return _format_extracting_response(active.snapshot(), etl_path=path, reused=True)
 
     marker = load_jobs.read_extracting_marker(export_dir)
+    reclaim_stale_cache = False
     if marker is not None:
         if load_jobs.marker_is_fresh(marker):
             status = load_jobs.marker_to_status(marker)
             return _format_extracting_response(status, etl_path=path, reused=True)
-        load_jobs.reclaim_cache_dir(export_dir)
+        reclaim_stale_cache = True
 
     def _loader(progress_callback: Callable[[dict], None]) -> str:
+        if reclaim_stale_cache:
+            load_jobs.reclaim_cache_dir(export_dir)
+            progress_callback({
+                "type": "progress",
+                "phase": "reclaiming-stale-cache",
+                "pct": 1.0,
+            })
         return _load_trace_blocking(
             etl_path,
             symbol_path=symbol_path,
@@ -996,7 +965,11 @@ def load_trace(
             extra_symbol_paths=extra_symbol_paths,
             progress_callback=progress_callback,
             emit_start=False,
-            skip_initial_cache=True,
+            # Cache validation/registration can include parquet reads,
+            # symbolizer reconstruction, and native dumper hydration. Keep it
+            # inside the background job so wait_seconds bounds the whole MCP
+            # call rather than extraction alone.
+            skip_initial_cache=False,
         )
 
     job = load_jobs.start_job(
