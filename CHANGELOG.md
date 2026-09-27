@@ -4,6 +4,8 @@ All notable changes to etw-mcp are documented here. Format follows [Keep a Chang
 
 ## [Unreleased]
 
+## [0.9.5] - 2026-09-26
+
 ### Fixed
 
 - Asynchronous `load_trace` now performs cache validation and registration
