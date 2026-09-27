@@ -125,6 +125,22 @@ def _deferred_cpu_sampling() -> pd.DataFrame:
     })
 
 
+def _windowed_raw_samples(*, qpc: bool = False) -> pd.DataFrame:
+    base = 100_000_000 if qpc else 0
+    scale = 10_000_000 if qpc else 1_000_000
+    timestamp_col = "TimeStampQpc" if qpc else "TimeStamp"
+    return pd.DataFrame({
+        timestamp_col: [base + scale] * 5 + [base + 6 * scale] * 3,
+        "Process Name": ["app.exe"] * 8,
+        "PID": [10] * 8,
+        "CPU": [0] * 5 + [1] * 3,
+        "Module": [""] * 8,
+        "Function": [""] * 8,
+        "Weight": [1] * 8,
+        "InstructionPointer": [_BASE + 0x100] * 5 + [_BASE + 0x9000] * 3,
+    })
+
+
 def _make_trace(tmp_path: Path, *, with_symbolizer: bool, raw_on_disk: bool) -> trace_mgmt.TraceData:
     etl = tmp_path / "t.etl"
     etl.write_bytes(b"x")
@@ -250,6 +266,78 @@ def test_get_cpu_samples_function_group_resolves_deferred(tmp_path: Path):
     out = cs.get_cpu_samples("trace_func", group_by="function", max_rows=10)
     assert "UdpSend" in out
     assert "UdpRecv" in out
+
+
+def test_get_hot_functions_time_window_filters_weights_and_symbols(tmp_path: Path):
+    trace = _make_trace(tmp_path, with_symbolizer=True, raw_on_disk=False)
+    trace.duration_seconds = 10.0
+    trace.dumper_df = _windowed_raw_samples()
+
+    out = cs.get_hot_functions(
+        "trace_func",
+        modules="tcpip.sys",
+        start_time=5.0,
+        end_time=7.0,
+        max_rows=10,
+    )
+
+    assert "UdpRecv" in out
+    assert "UdpSend" not in out
+    assert "Denominator (filtered samples): 3" in out
+    assert "% filtered" in out
+
+
+def test_get_cpu_samples_cpu_filter_preserves_function_symbols(tmp_path: Path):
+    trace = _make_trace(tmp_path, with_symbolizer=True, raw_on_disk=False)
+    trace.duration_seconds = 10.0
+    trace.dumper_df = _windowed_raw_samples()
+
+    out = cs.get_cpu_samples(
+        "trace_func",
+        group_by="function",
+        cpu_filter="1",
+        max_rows=10,
+    )
+
+    assert "UdpRecv" in out
+    assert "UdpSend" not in out
+
+
+def test_time_window_requires_raw_timestamped_samples(tmp_path: Path):
+    trace = _make_trace(tmp_path, with_symbolizer=True, raw_on_disk=False)
+    trace.dumper_df = pd.DataFrame()
+
+    out = cs.get_hot_functions(
+        "trace_func",
+        modules="tcpip.sys",
+        start_time=1.0,
+        end_time=2.0,
+    )
+
+    assert "requires raw timestamped SampledProfile events" in out
+    assert "Filters:" not in out
+
+
+def test_time_window_converts_raw_qpc_using_header_origin(tmp_path: Path):
+    trace = _make_trace(tmp_path, with_symbolizer=True, raw_on_disk=False)
+    trace.mode = "dotnet"
+    trace.duration_seconds = 10.0
+    trace.timestamp_frequency = 10_000_000
+    trace.dumper_df = _windowed_raw_samples(qpc=True)
+    trace.raw_csv["EventTrace/Header"] = pd.DataFrame([
+        {"TimeStamp": 100_000_000}
+    ])
+
+    out = cs.get_hot_functions(
+        "trace_func",
+        modules="tcpip.sys",
+        start_time=5.0,
+        end_time=7.0,
+        max_rows=10,
+    )
+
+    assert "UdpRecv" in out
+    assert "UdpSend" not in out
 
 
 def test_get_hot_functions_falls_back_without_symbolizer(tmp_path: Path):

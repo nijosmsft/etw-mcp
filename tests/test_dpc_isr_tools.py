@@ -134,8 +134,31 @@ def test_get_dpc_summary_no_dpc_rows_keeps_collection_guidance():
         get_dpc_summary("trace_no_dpc")
 
     message = str(excinfo.value)
-    assert "No DPC/ISR data" in message
-    assert "GeneralProfile" in message
+    assert "No dedicated DPC/ISR duration events" in message
+    assert "cpu_dpc_isr" in message
+    assert "cannot reconstruct DPC counts or durations" in message
+
+
+def test_get_dpc_per_cpu_sampling_fallback_disclaims_duration():
+    trace = TraceData(
+        trace_id="trace_sampling_only",
+        etl_path=Path(r"C:\traces\sampling_only.etl"),
+        export_dir=Path(r"C:\traces\.etw-export-sampling_only"),
+        mode="native",
+        raw_csv={
+            "cpu_sampling": pd.DataFrame([
+                {"Module": "ndis.sys", "Weight": 10},
+                {"Module": "tcpip.sys", "Weight": 5},
+            ]),
+        },
+    )
+    register_trace(trace)
+
+    output = get_dpc_per_cpu("trace_sampling_only")
+
+    assert "sampling fallback; not DPC duration" in output
+    assert "do not measure DPC counts or durations" in output
+    assert "cpu_dpc_isr" in output
 
 
 def test_get_dpc_per_cpu_uses_metadata_duration_when_duration_seconds_none():

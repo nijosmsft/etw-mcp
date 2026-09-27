@@ -47,6 +47,10 @@ from etw_analyzer.native.pdb_identity import (
     classify_pdb_format,
     read_pdb_identity,
 )
+from etw_analyzer.native.symbol_paths import (
+    candidate_pdb_paths,
+    symstore_folder_identity,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -444,6 +448,7 @@ class Symbolizer:
                 mismatches: list[str] = []
                 invalid_candidates: list[str] = []
                 search_errors: list[str] = []
+                checked_candidates: set[str] = set()
                 last_error = 0
 
                 # Query each symbol-path entry independently. DbgHelp can return
@@ -474,6 +479,7 @@ class Symbolizer:
                         continue
 
                     candidate_path = Path(found_buf.value)
+                    checked_candidates.add(str(candidate_path).lower())
                     candidate_format = classify_pdb_format(candidate_path)
                     try:
                         identity = read_pdb_identity(candidate_path)
@@ -502,6 +508,61 @@ class Symbolizer:
                         )
                         if not identity_matches:
                             module["candidate_pdb_path"] = str(candidate_path)
+                            mismatches.append(
+                                f"{candidate_path}: GUID={identity.guid}, "
+                                f"DBI age={identity.age}"
+                            )
+                            continue
+                        found_pdb_path = str(candidate_path)
+                        candidate_identity = identity
+                        candidate_identity_verified = True
+                        module["candidate_info_age"] = identity.info_age
+                        module["candidate_dbi_age"] = identity.age
+                        break
+
+                if found_pdb_path is None:
+                    # SymFindFileInPathW does not reliably return exact PDBs
+                    # stored directly in a flat local/UNC directory. Enumerate
+                    # local candidates, verify identity ourselves, and load the
+                    # exact file explicitly.
+                    for candidate_path in candidate_pdb_paths(
+                        self._symbol_path,
+                        _module_label(module),
+                        str(pdb_name),
+                    ):
+                        candidate_key = str(candidate_path).lower()
+                        if candidate_key in checked_candidates:
+                            continue
+                        checked_candidates.add(candidate_key)
+                        candidate_format = classify_pdb_format(candidate_path)
+                        try:
+                            identity = read_pdb_identity(candidate_path)
+                        except UnsupportedPdbFormatError as exc:
+                            folder_identity = symstore_folder_identity(candidate_path)
+                            if (
+                                candidate_format == "msfz"
+                                and folder_identity is not None
+                                and _guids_equal(str(pdb_guid), folder_identity[0])
+                                and pdb_age is not None
+                                and int(pdb_age) == folder_identity[1]
+                            ):
+                                found_pdb_path = str(candidate_path)
+                                candidate_identity = None
+                                break
+                            invalid_candidates.append(
+                                f"{candidate_path}: {exc}"
+                            )
+                            continue
+                        except PdbIdentityError as exc:
+                            invalid_candidates.append(
+                                f"{candidate_path}: {exc}"
+                            )
+                            continue
+                        if not (
+                            _guids_equal(str(pdb_guid), identity.guid)
+                            and pdb_age is not None
+                            and int(pdb_age) == identity.age
+                        ):
                             mismatches.append(
                                 f"{candidate_path}: GUID={identity.guid}, "
                                 f"DBI age={identity.age}"

@@ -4,6 +4,36 @@ All notable changes to etw-mcp are documented here. Format follows [Keep a Chang
 
 ## [Unreleased]
 
+## [0.9.5] - 2026-09-26
+
+### Fixed
+
+- Asynchronous `load_trace` now performs cache validation and registration
+  inside the background job, so `wait_seconds` bounds the entire MCP request
+  rather than extraction alone. Inline waits are capped at 20 seconds by
+  default (`ETW_MCP_MAX_INLINE_LOAD_WAIT`) to leave transport-response margin
+  when callers request 30 seconds or more.
+- `compare_traces` now starts or reuses the standard asynchronous loader for
+  both ETLs and returns their progress immediately instead of synchronously
+  exporting two traces through xperf. It waits for each load job to finish
+  before using partially registered trace state.
+- Stack-chain queries now reuse immutable aggregate DataFrames and compact
+  per-trace edge indexes instead of copying the complete caller table for every
+  visited node. Branching walks are capped at 200 rows by default (1000
+  maximum), report truncation explicitly, and limit concurrent stack queries
+  per trace so parallel requests cannot exhaust server memory.
+- CPU sample time windows now filter timestamped raw SampledProfile rows before
+  aggregation instead of displaying a window label over trace-wide weights.
+  CPU- and time-filtered queries resolve only the surviving unique instruction
+  pointers, preserving trustworthy function names and `SymbolSource`.
+- DPC tools now state when a trace lacks dedicated DPC/Interrupt duration
+  events, distinguish sampling-based module weight from measured DPC time, and
+  recommend the bundled `cpu_dpc_isr` profile for duration analysis.
+- Native symbol loading now falls back to enumerating flat local and UNC PDB
+  directories when DbgHelp's GUID lookup does not return an exact candidate.
+  Candidates are still accepted only after strict GUID + DBI-age validation;
+  exact MSFZ symstore entries remain supported through their folder identity.
+
 ## [0.9.4] - 2026-09-25
 
 ### Fixed

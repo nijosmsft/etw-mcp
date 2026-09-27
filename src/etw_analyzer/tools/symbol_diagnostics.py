@@ -39,12 +39,11 @@ from __future__ import annotations
 
 import ctypes
 import os
-import re
 import shutil
 import struct
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Optional
 
 import pandas as pd
 
@@ -54,6 +53,13 @@ from etw_analyzer.native.pdb_identity import (
     PdbIdentityError,
     classify_pdb_format,
     read_pdb_identity,
+)
+from etw_analyzer.native.symbol_paths import (
+    candidate_pdb_paths,
+    iter_pdb_candidates as _iter_candidates,
+    parse_symbol_path,
+    resolve_file_ptr as _resolve_file_ptr,
+    symstore_folder_identity as _symstore_folder_identity,
 )
 from etw_analyzer.trace_state import require_trace
 from etw_analyzer.tools.trace_mgmt import (
@@ -230,184 +236,6 @@ def read_pdb_signature(pdb_path: Path) -> Optional[tuple[str, int]]:
         return (identity.guid, identity.age)
     except PdbIdentityError:
         return None
-
-
-# ---------------------------------------------------------------------------
-# Symbol path parsing — walk a semicolon-joined search path into the
-# concrete directories where dbghelp will look.
-# ---------------------------------------------------------------------------
-
-
-def parse_symbol_path(sym_path: str) -> list[tuple[str, Path]]:
-    """Return [(kind, dir), ...] for each searchable directory.
-
-    ``kind`` is one of:
-    - ``"symcache"``  - a ``cache*<dir>`` or implicit symstore cache
-    - ``"local"``     - a plain directory
-    - ``"server"``    - the local cache dir of a ``srv*<cache>*...`` entry
-    - ``"store"``     - an upstream filesystem store (UNC or drive-letter
-                        path) from a ``srv*<cache>*<upstream>`` entry;
-                        http(s):// and ``symweb`` upstreams are skipped
-                        since they are not locally globbable.
-
-    Unparseable entries are skipped silently — the caller should treat
-    the absence of an entry as "this part of _NT_SYMBOL_PATH isn't
-    contributing to local search".
-    """
-    out: list[tuple[str, Path]] = []
-    if not sym_path:
-        return out
-    for raw in sym_path.split(";"):
-        entry = raw.strip()
-        if not entry:
-            continue
-        lower = entry.lower()
-        if lower.startswith("srv*") or lower.startswith("symsrv*"):
-            parts = entry.split("*")
-            # srv*<cache>*<upstream1>*<upstream2>...
-            # parts[1] is the local cache dir
-            if len(parts) >= 2 and parts[1]:
-                out.append(("server", Path(parts[1])))
-            # parts[2:] are upstream stores — include filesystem paths
-            # (UNC \\... or drive-letter); skip http(s):// and symweb.
-            for upstream in parts[2:]:
-                if not upstream:
-                    continue
-                up_lower = upstream.lower()
-                if up_lower.startswith("http://") or up_lower.startswith("https://"):
-                    continue
-                if up_lower == "symweb" or up_lower.startswith("symweb/"):
-                    continue
-                out.append(("store", Path(upstream)))
-            continue
-        if lower.startswith("cache*"):
-            parts = entry.split("*", 1)
-            if len(parts) == 2 and parts[1]:
-                out.append(("symcache", Path(parts[1])))
-            continue
-        # Plain directory.
-        out.append(("local", Path(entry)))
-    return out
-
-
-def _resolve_file_ptr(ptr_file: Path) -> Path | None:
-    """Read a symstore file.ptr and return the target PDB path, or None.
-
-    Handles three content forms:
-    - ``PATH:<path>``          : strip the ``PATH:`` prefix
-    - bare relative path       : resolved relative to the GUID+Age folder
-    - bare absolute / UNC path : used as-is
-
-    Returns ``None`` if the file is unreadable, empty, or the resolved
-    target does not exist on disk. Never raises.
-    """
-    try:
-        content = ptr_file.read_text(encoding="utf-8", errors="replace").strip()
-    except OSError:
-        return None
-    if not content:
-        return None
-    if content.upper().startswith("PATH:"):
-        target = Path(content[5:].strip())
-    else:
-        target = Path(content)
-    if not target.is_absolute():
-        # Resolve relative to the GUID+Age folder (ptr_file's parent).
-        target = (ptr_file.parent / target).resolve()
-    try:
-        return target if target.is_file() else None
-    except OSError:
-        return None
-
-
-def _iter_candidates(
-    sym_path: str,
-    module_name: str,
-    pdb_name: str,
-) -> Iterable[tuple[Path, str | None]]:
-    """Yield (pdb_path, redirect_description_or_None) for each candidate PDB.
-
-    ``redirect_description`` is set when the candidate was reached via a
-    ``file.ptr`` redirect; it is ``None`` for direct (literal) matches.
-    """
-    for _kind, dir_path in parse_symbol_path(sym_path):
-        try:
-            if not dir_path.exists():
-                continue
-            # Flat layout
-            flat = dir_path / pdb_name
-            if flat.is_file():
-                yield (flat, None)
-            # Symstore layout: <dir>/<pdb_name>/<GUID+Age>/<pdb_name>
-            sym_root = dir_path / pdb_name
-            if sym_root.is_dir():
-                for sub in sorted(sym_root.iterdir()):
-                    if not sub.is_dir():
-                        continue
-                    # Literal PDB file in the GUID+Age subfolder.
-                    candidate = sub / pdb_name
-                    if candidate.is_file():
-                        yield (candidate, None)
-                    # file.ptr redirect (pointer-indexed symstore).
-                    ptr = sub / "file.ptr"
-                    if ptr.is_file():
-                        target = _resolve_file_ptr(ptr)
-                        if target is not None:
-                            yield (
-                                target,
-                                f"via file.ptr redirect: {ptr} -> {target}",
-                            )
-        except OSError:
-            continue
-
-
-_SYMSTORE_FOLDER_RE = re.compile(r"^[0-9A-Fa-f]{33,}$")
-
-
-def _symstore_folder_identity(cand: Path) -> tuple[str, int] | None:
-    """Derive (GUID32-uppercase, age) from a symstore GUID+Age folder name.
-
-    A symstore PDB lives at ``<dir>/<pdb_name>/<GUID32><hexAge>/<pdb_name>``.
-    The parent folder name encodes the PDB identity (GUID + uppercase hex
-    age) and is readable even when the PDB itself is MSFZ-compressed (which
-    :func:`read_pdb_signature` cannot decode). Returns ``None`` when the
-    parent folder is not a symstore GUID+Age folder.
-    """
-    try:
-        name = cand.parent.name
-    except (OSError, ValueError):
-        return None
-    if not _SYMSTORE_FOLDER_RE.match(name):
-        return None
-    guid32 = name[:32].upper()
-    age_hex = name[32:]
-    try:
-        age = int(age_hex, 16)
-    except ValueError:
-        return None
-    return (guid32, age)
-
-
-def candidate_pdb_paths(
-    sym_path: str,
-    module_name: str,
-    pdb_name: str,
-) -> list[Path]:
-    """Enumerate every PDB path dbghelp would try for ``module_name``.
-
-    For each directory ``D`` in ``_NT_SYMBOL_PATH`` dbghelp tries:
-      - ``D\\<pdb_name>``  (flat layout)
-      - ``D\\<pdb_name>\\<GUID+Age>\\<pdb_name>``  (symstore layout)
-
-    We can't enumerate the GUID+Age subfolders without knowing them
-    ahead of time, so we glob ``D\\<pdb_name>\\*\\<pdb_name>`` for each
-    directory and return whatever exists.
-
-    Also follows ``file.ptr`` redirects written by pointer-indexed
-    symbol stores (``D\\<pdb_name>\\<GUID+Age>\\file.ptr`` whose
-    content resolves to the real PDB path).
-    """
-    return [path for path, _ in _iter_candidates(sym_path, module_name, pdb_name)]
 
 
 # ---------------------------------------------------------------------------

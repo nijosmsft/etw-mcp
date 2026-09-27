@@ -1,12 +1,19 @@
 """Tests for stack butterfly analysis tools."""
 
 from pathlib import Path
+import threading
 
 import pandas as pd
 import pytest
 
 from etw_analyzer.native.event_store import EventStoreTimebase, NativeEventStoreWriter
-from etw_analyzer.trace_state import TraceData, clear_traces, register_trace
+from etw_analyzer.trace_state import (
+    TraceData,
+    clear_traces,
+    get_trace,
+    register_trace,
+)
+from etw_analyzer.tools import stack_analysis
 from etw_analyzer.tools.stack_analysis import (
     butterfly_chain,
     count_stacks,
@@ -234,6 +241,94 @@ def test_butterfly_chain_table_and_csv():
     assert "Denominator (active_cpus)" in table_output
     assert "IppResolveNeighbor" in table_output
     assert csv_output.startswith("Depth,Frame,Frame Hits")
+
+
+def test_stack_data_accessors_do_not_copy_full_frames():
+    _register_stack_trace()
+    trace = get_trace("trace_stack")
+
+    assert stack_analysis._get_stacks_df(trace) is trace.raw_csv["stacks"]
+    assert (
+        stack_analysis._get_callers_df(trace)
+        is trace.raw_csv["stacks_callers"]
+    )
+
+
+def test_butterfly_chain_caps_branching_output():
+    root = ("driver.sys", "Root")
+    child_count = 300
+    stacks = pd.DataFrame({
+        "Module": [root[0]] + ["driver.sys"] * child_count,
+        "Function": [root[1]] + [f"Child{i}" for i in range(child_count)],
+        "Inclusive": [child_count] + [1] * child_count,
+        "Exclusive": [0] * (child_count + 1),
+        "Total %": [100.0] + [100.0 / child_count] * child_count,
+    })
+    callers = pd.DataFrame({
+        "Target_Module": [root[0]] * child_count,
+        "Target_Function": [root[1]] * child_count,
+        "Direction": ["caller"] * child_count,
+        "Caller_Module": ["driver.sys"] * child_count,
+        "Caller_Function": [f"Child{i}" for i in range(child_count)],
+        "Weight": [1] * child_count,
+        "Total %": [100.0 / child_count] * child_count,
+        "Parent %": [100.0 / child_count] * child_count,
+        "Exclusive": [0] * child_count,
+    })
+    register_trace(TraceData(
+        trace_id="trace_wide_stack",
+        etl_path=Path(r"C:\traces\wide.etl"),
+        export_dir=Path(r"C:\traces\.etw-export-wide"),
+        raw_csv={
+            "stacks": stacks,
+            "stacks_callers": callers,
+            "cpu_sampling": pd.DataFrame({"Weight": [child_count]}),
+        },
+        duration_seconds=1.0,
+        cpu_count=1,
+    ))
+
+    output = butterfly_chain(
+        "trace_wide_stack",
+        "Root",
+        target_module="driver.sys",
+        branch_policy="all",
+        max_rows=25,
+        denominator="trace",
+    )
+
+    assert "Output truncated at max_rows=25" in output
+    assert output.count("| driver.sys!Child") == 24
+    assert len(output.encode("utf-8")) < 10_000
+
+
+def test_parallel_stack_queries_fail_fast_when_gate_is_full():
+    _register_stack_trace()
+    trace = get_trace("trace_stack")
+    trace._stack_query_gate = threading.BoundedSemaphore(2)
+    assert trace._stack_query_gate.acquire(blocking=False)
+    assert trace._stack_query_gate.acquire(blocking=False)
+    try:
+        output = butterfly_chain(
+            "trace_stack",
+            "KeAcquireInStackQueuedSpinLock",
+        )
+    finally:
+        trace._stack_query_gate.release()
+        trace._stack_query_gate.release()
+
+    assert "maximum number of stack queries running" in output
+
+
+def test_butterfly_chain_rejects_unbounded_row_request():
+    _register_stack_trace()
+
+    with pytest.raises(ValueError, match="max_rows must be between"):
+        butterfly_chain(
+            "trace_stack",
+            "KeAcquireInStackQueuedSpinLock",
+            max_rows=1001,
+        )
 
 
 def test_get_function_callers_uses_literal_function_filter():

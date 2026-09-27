@@ -19,11 +19,13 @@ EXTRACTING_MARKER = "extracting.json"
 FAILED_MARKER = "failed.json"
 MARKER_SCHEMA_VERSION = 1
 DEFAULT_LOAD_WAIT_SECONDS = 20.0
+DEFAULT_MAX_INLINE_LOAD_WAIT_SECONDS = 20.0
 DEFAULT_STALE_SECONDS = 120.0
 DEFAULT_HEARTBEAT_SECONDS = 1.0
 DEFAULT_EXTRACT_MBPS = 22.0
 
 LOAD_WAIT_ENV = "ETW_MCP_LOAD_WAIT"
+MAX_INLINE_LOAD_WAIT_ENV = "ETW_MCP_MAX_INLINE_LOAD_WAIT"
 STALE_ENV = "ETW_MCP_LOAD_STALE_SECONDS"
 HEARTBEAT_ENV = "ETW_MCP_LOAD_HEARTBEAT_SECONDS"
 EXTRACT_MBPS_ENV = "ETW_MCP_EXTRACT_MBPS"
@@ -65,12 +67,19 @@ def float_env(name: str, default: float) -> float:
 
 
 def load_wait_seconds(value: float | int | None) -> float:
+    maximum = float_env(
+        MAX_INLINE_LOAD_WAIT_ENV,
+        DEFAULT_MAX_INLINE_LOAD_WAIT_SECONDS,
+    )
     if value is not None:
         try:
-            return max(0.0, float(value))
+            return min(maximum, max(0.0, float(value)))
         except (TypeError, ValueError):
-            return DEFAULT_LOAD_WAIT_SECONDS
-    return float_env(LOAD_WAIT_ENV, DEFAULT_LOAD_WAIT_SECONDS)
+            return min(maximum, DEFAULT_LOAD_WAIT_SECONDS)
+    return min(
+        maximum,
+        float_env(LOAD_WAIT_ENV, DEFAULT_LOAD_WAIT_SECONDS),
+    )
 
 
 def stale_seconds() -> float:

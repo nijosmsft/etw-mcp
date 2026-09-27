@@ -2,67 +2,121 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pandas as pd
 
+from etw_analyzer import load_jobs
 from etw_analyzer.app import mcp
-from etw_analyzer.trace_state import TraceData, make_trace_id
-from etw_analyzer.tools.trace_mgmt import (
-    _load_file,
-    _load_from_cache,
-    _write_cache_manifest,
-)
-from etw_analyzer.parsing.wpa_exporter import export_all_profiles, find_xperf, _run_xperf
-from etw_analyzer.parsing.csv_loader import load_csv
-from etw_analyzer.formatting.markdown import format_table, format_pct
-
-import os
+from etw_analyzer.trace_state import TraceData, get_trace, make_trace_id
+from etw_analyzer.tools.trace_mgmt import get_load_status, load_trace
+from etw_analyzer.formatting.markdown import format_table
 
 
-def _load_trace_data(etl_path: str) -> TraceData:
-    """Load a trace into a TraceData object without setting it as current."""
+def _ensure_comparison_trace(
+    etl_path: str,
+    *,
+    load_mode: str,
+    extra_symbol_paths: list[str] | None,
+) -> tuple[TraceData | None, dict]:
+    """Return a loaded trace or start/reuse its standard async load job."""
+
     path = Path(etl_path)
     if not path.exists():
-        raise FileNotFoundError(f"File not found: {etl_path}")
+        return None, {
+            "status": "failed",
+            "etl_path": str(path),
+            "error": f"File not found: {etl_path}",
+        }
 
-    sym_path = os.environ.get("_NT_SYMBOL_PATH")
-    export_dir = path.parent / f".etw-export-{path.stem}"
+    trace_id = make_trace_id(path)
+    active = load_jobs.active_job(trace_id)
+    if active is not None:
+        return None, active.snapshot()
+    prior_job = load_jobs.job_by_id(trace_id)
+    if prior_job is not None and prior_job.status == "failed":
+        return None, prior_job.snapshot()
 
-    # Try cache first
-    cached = _load_from_cache(export_dir, path, mode="xperf")
-    if cached is not None:
-        return TraceData(
-            trace_id=make_trace_id(path),
-            etl_path=path,
-            export_dir=export_dir,
-            symbol_path=sym_path,
-            raw_csv=cached,
-        )
+    trace = get_trace(trace_id)
+    if trace is not None:
+        return trace, {
+            "status": "ready",
+            "trace_id": trace_id,
+            "etl_path": str(path),
+        }
 
-    # Export
-    try:
-        _run_xperf(path, "symcache", ["-build"], symbol_path=sym_path, symbols=True, timeout_seconds=300)
-    except Exception:
-        pass
-
-    file_paths = export_all_profiles(path, export_dir, symbol_path=sym_path, timeout_seconds=300)
-    results: dict[str, pd.DataFrame] = {}
-    for name, fp in file_paths.items():
-        try:
-            results[name] = _load_file(fp)
-        except Exception:
-            pass
-
-    _write_cache_manifest(export_dir, path, "xperf", results, dumper_stems=frozenset())
-
-    return TraceData(
-        trace_id=make_trace_id(path),
-        etl_path=path,
-        export_dir=export_dir,
-        symbol_path=sym_path,
-        raw_csv=results,
+    response = load_trace(
+        etl_path=str(path),
+        mode=load_mode,
+        extra_symbol_paths=extra_symbol_paths,
+        wait_seconds=0,
+        async_load=True,
     )
+    active = load_jobs.active_job(trace_id)
+    if active is not None:
+        return None, active.snapshot()
+    trace = get_trace(trace_id)
+    if trace is not None:
+        return trace, {
+            "status": "ready",
+            "trace_id": trace_id,
+            "etl_path": str(path),
+        }
+
+    try:
+        status = json.loads(get_load_status(etl_path=str(path)))
+    except Exception:
+        status = {
+            "status": "failed",
+            "trace_id": trace_id,
+            "etl_path": str(path),
+            "error": response,
+        }
+    if status.get("status") == "not_found":
+        status["status"] = "failed"
+        status["error"] = response
+    return None, status
+
+
+def _format_comparison_load_status(
+    baseline: dict,
+    test: dict,
+) -> str:
+    """Render non-blocking load state for a comparison request."""
+
+    failed = any(
+        status.get("status") == "failed"
+        for status in (baseline, test)
+    )
+    title = (
+        "**Trace comparison could not load both traces.**"
+        if failed
+        else "**Trace comparison is waiting for background loads.**"
+    )
+    lines = [title, ""]
+    for label, status in (("Baseline", baseline), ("Test", test)):
+        state = status.get("status") or "unknown"
+        pct = float(status.get("pct") or (100 if state == "ready" else 0))
+        phase = status.get("current_phase") or "-"
+        error = status.get("error")
+        lines.append(
+            f"- **{label}:** `{state}` ({pct:.1f}%, phase `{phase}`)"
+        )
+        if error:
+            lines.append(f"  Error: {error}")
+    if failed:
+        lines.extend([
+            "",
+            "Correct the reported load error before retrying `compare_traces`.",
+        ])
+    else:
+        lines.extend([
+            "",
+            "Call `compare_traces` again after both loads report `ready`; "
+            "no duplicate extraction will be started.",
+        ])
+    return "\n".join(lines)
 
 
 @mcp.tool()
@@ -72,15 +126,14 @@ def compare_traces(
     mode: str = "hot_functions",
     modules: str | None = None,
     max_rows: int = 30,
+    load_mode: str = "auto",
+    extra_symbol_paths: list[str] | None = None,
 ) -> str:
     """Compare two traces to find performance differences.
 
-    Loads both traces (using cache if available), computes per-module or
-    per-function CPU weight, and shows the delta between them. Positive
-    delta means the test trace uses MORE CPU than baseline.
-
-    The loaded trace registry is NOT affected — comparison uses separate
-    TraceData objects.
+    Uses the standard asynchronous trace loader. If either ETL is not ready,
+    starts or reuses its background load and returns status immediately.
+    Call this tool again after both traces report ready.
 
     Args:
         baseline_etl: Path to baseline .etl file.
@@ -90,17 +143,26 @@ def compare_traces(
         modules: Comma-separated module filter for hot_functions/modules mode.
                  Use 'all' for no filtering. Default: networking stack.
         max_rows: Maximum rows to show. Default: 30.
+        load_mode: Loader mode for traces not already registered: ``auto``,
+            ``dotnet``, ``native``, or ``xperf``. Default: ``auto``.
+        extra_symbol_paths: Additional symbol paths appended while loading
+            traces that are not already registered.
     """
-    # Load both traces
-    try:
-        baseline = _load_trace_data(baseline_etl)
-    except Exception as e:
-        return f"*Failed to load baseline trace: {e}*"
-
-    try:
-        test = _load_trace_data(test_etl)
-    except Exception as e:
-        return f"*Failed to load test trace: {e}*"
+    baseline, baseline_status = _ensure_comparison_trace(
+        baseline_etl,
+        load_mode=load_mode,
+        extra_symbol_paths=extra_symbol_paths,
+    )
+    test, test_status = _ensure_comparison_trace(
+        test_etl,
+        load_mode=load_mode,
+        extra_symbol_paths=extra_symbol_paths,
+    )
+    if baseline is None or test is None:
+        return _format_comparison_load_status(
+            baseline_status,
+            test_status,
+        )
 
     if mode == "per_cpu":
         return _compare_per_cpu(baseline, test, max_rows)

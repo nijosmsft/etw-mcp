@@ -92,6 +92,42 @@ def test_slow_extraction_reports_extracting_then_ready(monkeypatch, tmp_path):
     assert status["pct"] == 100.0
 
 
+def test_async_cache_probe_is_inside_background_job(monkeypatch, tmp_path):
+    etl = _etl(tmp_path)
+    cache_started = threading.Event()
+    release_cache = threading.Event()
+
+    def slow_cache(*args, **kwargs):
+        cache_started.set()
+        release_cache.wait(1)
+        return None
+
+    monkeypatch.setattr(trace_mgmt, "_load_from_cache", slow_cache)
+    monkeypatch.setattr(
+        trace_mgmt,
+        "_load_trace_blocking",
+        lambda etl_path, **kwargs: (
+            slow_cache() or _summary(Path(etl_path))
+        ),
+    )
+
+    started_at = time.perf_counter()
+    result = _json(trace_mgmt.load_trace(str(etl), wait_seconds=0.001))
+    elapsed = time.perf_counter() - started_at
+
+    assert result["status"] == "extracting"
+    assert elapsed < 0.1
+    assert cache_started.wait(1)
+    release_cache.set()
+
+
+def test_inline_wait_is_capped_below_transport_deadline(monkeypatch):
+    monkeypatch.delenv("ETW_MCP_MAX_INLINE_LOAD_WAIT", raising=False)
+    assert load_jobs.load_wait_seconds(30) == 20.0
+    assert load_jobs.load_wait_seconds(300) == 20.0
+    assert load_jobs.load_wait_seconds(5) == 5.0
+
+
 def test_finalized_cache_fast_returns_ready(monkeypatch, tmp_path):
     etl = _etl(tmp_path)
     export_dir = etl.parent / f".etw-export-{etl.stem}"
@@ -100,8 +136,6 @@ def test_finalized_cache_fast_returns_ready(monkeypatch, tmp_path):
         json.dumps({"complete": True, "finalized": True}),
         encoding="utf-8",
     )
-    called = {"loader": 0}
-
     def fake_cache(cache_dir: Path, path: Path, mode: str = "xperf"):
         manifest = json.loads((cache_dir / "wpr-mcp-cache-manifest.json").read_text())
         if manifest.get("complete") and manifest.get("finalized"):
@@ -111,18 +145,25 @@ def test_finalized_cache_fast_returns_ready(monkeypatch, tmp_path):
     def fake_register(path, export_dir, sym_path, resolved_mode, cached, notices, *, from_cache):
         return _summary(path).replace("**Trace loaded:**", "**Trace loaded (from cache):**")
 
-    def fake_loader(*args, **kwargs):
-        called["loader"] += 1
-        return _summary(etl)
-
     monkeypatch.setattr(trace_mgmt, "_load_from_cache", fake_cache)
     monkeypatch.setattr(trace_mgmt, "_register_cached_trace", fake_register)
-    monkeypatch.setattr(trace_mgmt, "_load_trace_blocking", fake_loader)
 
     result = trace_mgmt.load_trace(str(etl), wait_seconds=0)
 
-    assert "**Trace loaded (from cache):**" in result
-    assert called["loader"] == 0
+    # Cache registration now runs inside the async job so even cache reads are
+    # bounded by wait_seconds. A zero budget may return status before the fast
+    # cache job finishes.
+    if result.startswith("{"):
+        assert _json(result)["status"] == "extracting"
+        deadline = time.time() + 1
+        while time.time() < deadline:
+            status = _json(trace_mgmt.get_load_status(etl_path=str(etl)))
+            if status["status"] == "ready":
+                break
+            time.sleep(0.01)
+        assert status["status"] == "ready"
+    else:
+        assert "**Trace loaded (from cache):**" in result
 
 
 def test_non_finalized_cache_rebuilds(monkeypatch, tmp_path):
