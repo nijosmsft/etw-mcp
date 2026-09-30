@@ -79,6 +79,14 @@ class _MismatchedSymbolizer(_FakeSymbolizer):
         }
 
 
+class _UnexpectedSymbolizer(_FakeSymbolizer):
+    def _find_module_for_address(self, addr):
+        raise AssertionError(f"unexpected module lookup for {addr:#x}")
+
+    def bulk_resolve_with_source(self, addrs):
+        raise AssertionError(f"unexpected symbol resolution for {addrs!r}")
+
+
 def _raw_samples() -> pd.DataFrame:
     # 5 samples in UdpSend range, 3 in UdpRecv range, 2 outside (unknown).
     ips = [_BASE + 0x100] * 5 + [_BASE + 0x9000] * 3 + [0x1234] * 2
@@ -301,6 +309,107 @@ def test_get_cpu_samples_cpu_filter_preserves_function_symbols(tmp_path: Path):
 
     assert "UdpRecv" in out
     assert "UdpSend" not in out
+
+
+def test_get_cpu_samples_process_window_skips_symbol_resolution(tmp_path: Path):
+    trace = _make_trace(tmp_path, with_symbolizer=False, raw_on_disk=False)
+    trace.symbolizer = _UnexpectedSymbolizer()
+    trace.duration_seconds = 10.0
+    trace.dumper_df = _windowed_raw_samples()
+
+    out = cs.get_cpu_samples(
+        "trace_func",
+        group_by="process",
+        start_time=5.0,
+        end_time=7.0,
+        max_rows=10,
+    )
+
+    assert "app.exe" in out
+    assert "Total weight: 3" in out
+
+
+def test_get_cpu_samples_window_uses_cached_samples_without_waiting(tmp_path: Path):
+    trace = _make_trace(tmp_path, with_symbolizer=False, raw_on_disk=True)
+    trace.duration_seconds = 10.0
+
+    def unexpected_wait():
+        raise AssertionError("window query waited for unrelated dumper datasets")
+
+    trace.wait_for_dumper = unexpected_wait
+    out = cs.get_cpu_samples(
+        "trace_func",
+        group_by="process",
+        start_time=0.0,
+        end_time=9.0,
+        max_rows=10,
+    )
+
+    assert "app.exe" in out
+    assert "Total weight: 10" in out
+
+
+def test_get_cpu_samples_window_accepts_cache_without_instruction_pointer(
+    tmp_path: Path,
+):
+    trace = _make_trace(tmp_path, with_symbolizer=False, raw_on_disk=False)
+    trace.duration_seconds = 10.0
+    cached = _windowed_raw_samples().drop(columns=["InstructionPointer"])
+    cached.to_parquet(
+        trace.export_dir / "sampled_profile.parquet",
+        index=False,
+    )
+
+    def unexpected_wait():
+        raise AssertionError("usable timestamped sample cache was rejected")
+
+    trace.wait_for_dumper = unexpected_wait
+    out = cs.get_cpu_samples(
+        "trace_func",
+        group_by="process",
+        start_time=5.0,
+        end_time=7.0,
+        max_rows=10,
+    )
+
+    assert "app.exe" in out
+    assert "Total weight: 3" in out
+
+
+def test_get_cpu_samples_window_hydrates_dotnet_process_attribution(
+    tmp_path: Path,
+):
+    trace = _make_trace(tmp_path, with_symbolizer=False, raw_on_disk=False)
+    trace.mode = "dotnet"
+    trace.duration_seconds = 10.0
+    trace.dumper_df = pd.DataFrame({
+        "TimeStampQpc": [1_000_000],
+        "ProcessId": [-1],
+        "PayloadThreadId": [77],
+        "CPU": [0],
+        "Weight": [1],
+    })
+    pd.DataFrame({
+        "PID": [42],
+        "TID": [77],
+    }).to_parquet(trace.export_dir / "thread_dcend.parquet", index=False)
+    pd.DataFrame({
+        "PID": [42],
+        "ParentPID": [4],
+        "ImageFileName": ["EdgeDnsServer.exe"],
+        "CommandLine": [""],
+    }).to_parquet(trace.export_dir / "process_dcend.parquet", index=False)
+
+    out = cs.get_cpu_samples(
+        "trace_func",
+        group_by="process",
+        start_time=0.0,
+        end_time=2.0,
+        max_rows=10,
+    )
+
+    assert "EdgeDnsServer.exe" in out
+    assert "Unknown" not in out
 
 
 def test_time_window_requires_raw_timestamped_samples(tmp_path: Path):
