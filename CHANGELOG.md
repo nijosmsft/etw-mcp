@@ -4,6 +4,18 @@ All notable changes to etw-mcp are documented here. Format follows [Keep a Chang
 
 ## [Unreleased]
 
+## [0.9.6] - 2026-10-01
+
+### Fixed
+
+- Windowed `get_cpu_samples` process/CPU queries now consume ready timestamped
+  SampledProfile caches without waiting for unrelated dumper datasets or
+  requiring instruction pointers. Process-only grouping skips unnecessary
+  module/function symbol resolution, and dotnet cache reloads restore the
+  Process/Thread attribution needed to name sampled processes. The reported
+  8-second queries now complete in under 1.3 seconds instead of exceeding the
+  MCP request deadline.
+
 ## [0.9.5] - 2026-09-26
 
 ### Fixed

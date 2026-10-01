@@ -6,6 +6,9 @@ from etw_analyzer.app import mcp
 from etw_analyzer.trace_state import TraceData, require_trace
 from etw_analyzer.parsing.aggregator import apply_filters, group_and_sum, parse_cpu_filter
 from etw_analyzer.formatting.markdown import format_table, format_pct
+from etw_analyzer.native.aggregators.profile_detail import (
+    enrich_sampled_profile_attribution,
+)
 from etw_analyzer.tools._symbol_annotation import (
     annotate_export_fallback,
     export_fallback_footnote,
@@ -158,17 +161,57 @@ def _function_col_all_empty(df: pd.DataFrame, function_col: str) -> bool:
     return not values.replace("nan", "").astype(bool).any()
 
 
-def _load_raw_samples(trace: TraceData) -> pd.DataFrame | None:
-    """Return the per-sample SampledProfile frame (with InstructionPointer).
+def _ensure_dotnet_attribution_rows(trace: TraceData) -> None:
+    """Hydrate cached Process/Thread rows needed for SampledProfile names."""
+
+    if getattr(trace, "mode", None) != "dotnet":
+        return
+    raw_csv = getattr(trace, "raw_csv", {}) or {}
+    has_process = any(
+        key in raw_csv
+        for key in ("Process/DCStart", "Process/Start", "Process/DCEnd", "Process/End")
+    )
+    has_thread = any(
+        key in raw_csv
+        for key in ("Thread/DCStart", "Thread/Start", "Thread/DCEnd", "Thread/End")
+    )
+    if has_process and has_thread:
+        return
+
+    from etw_analyzer.native.aggregation_worker import (
+        _load_phase_b_process,
+        _load_phase_b_thread,
+    )
+
+    with trace.lock:
+        warnings: list[str] = []
+        if not has_process:
+            _load_phase_b_process(trace.export_dir, trace, warnings)
+        if not has_thread:
+            _load_phase_b_thread(trace.export_dir, trace, warnings)
+
+
+def _load_raw_samples(
+    trace: TraceData,
+    *,
+    require_instruction_pointer: bool = True,
+) -> pd.DataFrame | None:
+    """Return the per-sample SampledProfile frame.
 
     Prefers an already-materialized ``dumper_df``; otherwise reads the cached
     ``sampled_profile.parquet`` directly from the export dir (it is excluded
-    from the glob cache loader, so it is on disk but not in ``raw_csv``). The
-    raw frame carries ``InstructionPointer`` + ``Weight`` (+ Process Name / CPU)
-    with empty Module/Function — symbolization happens on demand.
+    from the glob cache loader, so it is on disk but not in ``raw_csv``).
+
+    Symbol-oriented callers require ``InstructionPointer`` for deferred
+    resolution. Process/CPU window queries can also use xperf-dumper cache rows
+    that already carry timestamps, process names, and weights but no address.
     """
     df = getattr(trace, "dumper_df", None)
-    if df is not None and not df.empty and "InstructionPointer" in df.columns:
+    if (
+        df is not None
+        and not df.empty
+        and (not require_instruction_pointer or "InstructionPointer" in df.columns)
+    ):
         return df
     export_dir = getattr(trace, "export_dir", None)
     if export_dir is None:
@@ -180,7 +223,11 @@ def _load_raw_samples(trace: TraceData) -> pd.DataFrame | None:
         df = pd.read_parquet(parquet_path)
     except Exception:
         return None
-    if df is None or df.empty or "InstructionPointer" not in df.columns:
+    if (
+        df is None
+        or df.empty
+        or (require_instruction_pointer and "InstructionPointer" not in df.columns)
+    ):
         return None
     return df
 
@@ -397,6 +444,9 @@ def _get_filtered_sampling_df(
     cpu_filter: str | None = None,
     start_time: float | None = None,
     end_time: float | None = None,
+    *,
+    attribute_modules: bool = True,
+    resolve_functions: bool = True,
 ) -> pd.DataFrame:
     """Get filtered, symbolized rows from raw SampledProfile data.
 
@@ -404,7 +454,15 @@ def _get_filtered_sampling_df(
     Filtering happens before symbol resolution so only surviving unique
     instruction pointers pay the DbgHelp cost.
     """
-    dumper_df = trace.wait_for_dumper()
+    # The sidecar/cache loader persists SampledProfile independently from the
+    # all-events background dumper. Prefer that ready dataset so a windowed CPU
+    # query does not block on unrelated AFD/TCP/HTTP extraction.
+    dumper_df = _load_raw_samples(
+        trace,
+        require_instruction_pointer=False,
+    )
+    if dumper_df is None or dumper_df.empty:
+        dumper_df = trace.wait_for_dumper()
 
     if dumper_df is None:
         with trace.lock:
@@ -427,7 +485,10 @@ def _get_filtered_sampling_df(
                     dumper_df.to_parquet(trace.export_dir / "sampled_profile.parquet", index=False)
 
     if dumper_df is None or dumper_df.empty:
-        dumper_df = _load_raw_samples(trace)
+        dumper_df = _load_raw_samples(
+            trace,
+            require_instruction_pointer=False,
+        )
     if dumper_df is None or dumper_df.empty:
         raise ValueError(
             "CPU/time filtering requires raw timestamped SampledProfile "
@@ -459,19 +520,24 @@ def _get_filtered_sampling_df(
 
     if "PID" not in df.columns and "ProcessId" in df.columns:
         df["PID"] = df["ProcessId"]
+    _ensure_dotnet_attribution_rows(trace)
+    df = enrich_sampled_profile_attribution(df, trace.raw_csv)
     process_col = _find_col(df, ["Process Name", "ProcessName", "ImageName"])
     if process_col is not None and process_col != "Process Name":
         df["Process Name"] = df[process_col]
     elif "Process Name" not in df.columns:
         df["Process Name"] = "unknown"
 
-    df = _attribute_modules_from_ranges(trace, df)
-    return _resolve_deferred_instruction_pointers(
-        trace,
-        df,
-        module_col="Module",
-        function_col="Function",
-    )
+    if attribute_modules:
+        df = _attribute_modules_from_ranges(trace, df)
+    if resolve_functions:
+        df = _resolve_deferred_instruction_pointers(
+            trace,
+            df,
+            module_col="Module",
+            function_col="Function",
+        )
+    return df
 
 
 def _get_per_cpu_sampling_df(
@@ -532,12 +598,20 @@ def get_cpu_samples(
         or end_time is not None
     )
     if raw_filter_requested:
+        needs_function = bool(function_filter) or group_by == "function"
+        needs_module = (
+            needs_function
+            or bool(module_filter)
+            or group_by not in {"process", "cpu", "cpu+process"}
+        )
         try:
             df = _get_filtered_sampling_df(
                 trace,
                 cpu_filter=cpu_filter,
                 start_time=start_time,
                 end_time=end_time,
+                attribute_modules=needs_module,
+                resolve_functions=needs_function,
             )
         except ValueError as exc:
             return f"*{exc}*"
@@ -694,6 +768,8 @@ def get_hot_functions(
                 cpu_filter=cpu_filter,
                 start_time=start_time,
                 end_time=end_time,
+                attribute_modules=True,
+                resolve_functions=False,
             )
         except ValueError as exc:
             return f"*{exc}*"
